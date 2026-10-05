@@ -10,6 +10,8 @@ import (
 	"syscall"
 
 	"github.com/redis/go-redis/v9"
+
+	"notifier/internal/model"
 )
 
 func main() {
@@ -23,12 +25,25 @@ func main() {
 	rdb := redis.NewClient(opt)
 	defer rdb.Close()
 
+	// Временно: подписки в памяти. Позже будут читаться из Postgres.
+	subs := []model.Subscription{
+		{ID: 1, ChatID: 0, City: "Minsk", Rooms: model.IntPtr(1), MaxPriceUSD: model.FloatPtr(400)},
+	}
+
 	go func() {
 		sub := rdb.Subscribe(ctx, "listings.new")
 		defer sub.Close()
 		log.Println("subscribed to listings.new")
 		for msg := range sub.Channel() {
-			log.Printf("new listing event: %s", msg.Payload)
+			event, err := model.ParseEvent([]byte(msg.Payload))
+			if err != nil {
+				log.Printf("bad event skipped: %v", err)
+				continue
+			}
+			for _, s := range model.MatchAll(event, subs) {
+				log.Printf("MATCH: subscription %d <- listing %d (%s, $%.0f) %s",
+					s.ID, event.ID, event.City, event.PriceUSD, event.URL)
+			}
 		}
 	}()
 
