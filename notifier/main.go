@@ -11,7 +11,10 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"notifier/internal/bot"
 	"notifier/internal/model"
+	"notifier/internal/store"
+	"notifier/internal/telegram"
 )
 
 func main() {
@@ -25,9 +28,14 @@ func main() {
 	rdb := redis.NewClient(opt)
 	defer rdb.Close()
 
-	// Временно: подписки в памяти. Позже будут читаться из Postgres.
-	subs := []model.Subscription{
-		{ID: 1, ChatID: 0, City: "Minsk", Rooms: model.IntPtr(1), MaxPriceUSD: model.FloatPtr(400)},
+	subStore := store.NewMemory()
+
+	var tgBot *bot.Bot
+	if token := os.Getenv("TELEGRAM_BOT_TOKEN"); token != "" {
+		tgBot = bot.New(telegram.NewClient(token), subStore)
+		go tgBot.Run(ctx)
+	} else {
+		log.Println("TELEGRAM_BOT_TOKEN is empty: matches are only logged, bot is disabled")
 	}
 
 	go func() {
@@ -40,9 +48,12 @@ func main() {
 				log.Printf("bad event skipped: %v", err)
 				continue
 			}
-			for _, s := range model.MatchAll(event, subs) {
-				log.Printf("MATCH: subscription %d <- listing %d (%s, $%.0f) %s",
-					s.ID, event.ID, event.City, event.PriceUSD, event.URL)
+			for _, s := range model.MatchAll(event, subStore.All()) {
+				log.Printf("MATCH: subscription %d (chat %d) <- listing %d (%s, $%.0f) %s",
+					s.ID, s.ChatID, event.ID, event.City, event.PriceUSD, event.URL)
+				if tgBot != nil {
+					go tgBot.Notify(ctx, s.ChatID, event)
+				}
 			}
 		}
 	}()
