@@ -22,7 +22,7 @@ jobs:
                 owner,
                 repo,
                 pull_number: prNumber,
-                reviewers: ['Ruv1c0n', 'Soulnier'],      # <-- вставь логины нужных пользователей (без @)
-                team_reviewers: []                  # <-- можно добавить команды, например: ['my-org/backend-team']
+                reviewers: ['Ruv1c0n', 'Soulnier'],
+                team_reviewers: []
               });
             }
