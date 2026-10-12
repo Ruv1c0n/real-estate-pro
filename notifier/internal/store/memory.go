@@ -8,13 +8,18 @@ import (
 	"notifier/internal/model"
 )
 
+type sentKey struct{ chatID, listingID int64 }
+
 type Memory struct {
 	mu     sync.RWMutex
 	nextID int64
 	subs   []model.Subscription
+	sent   map[sentKey]struct{} // журнал отправленных уведомлений (аналог notifications_log)
 }
 
-func NewMemory() *Memory { return &Memory{nextID: 1} }
+func NewMemory() *Memory {
+	return &Memory{nextID: 1, sent: map[sentKey]struct{}{}}
+}
 
 // Add сохраняет подписку и возвращает её с присвоенным ID.
 func (m *Memory) Add(s model.Subscription) model.Subscription {
@@ -59,4 +64,18 @@ func (m *Memory) All() []model.Subscription {
 	out := make([]model.Subscription, len(m.subs))
 	copy(out, m.subs)
 	return out
+}
+
+// MarkSent атомарно записывает в журнал пару (чат, объявление).
+// Возвращает false, если уведомление уже отправлялось (ФТ-3.5):
+// это защищает от дублей при повторной доставке события из стрима.
+func (m *Memory) MarkSent(chatID, listingID int64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := sentKey{chatID, listingID}
+	if _, ok := m.sent[k]; ok {
+		return false
+	}
+	m.sent[k] = struct{}{}
+	return true
 }

@@ -54,6 +54,7 @@ services:
     ports:
       - "8080:8080"
     environment:
+      DEBUG_KEY: ${DEBUG_KEY:-dev-key}
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql://app:app@postgres:5432/realestate
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}

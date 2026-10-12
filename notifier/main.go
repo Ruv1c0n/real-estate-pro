@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"github.com/redis/go-redis/v9"
@@ -14,8 +15,23 @@ import (
 	"notifier/internal/bot"
 	"notifier/internal/model"
 	"notifier/internal/store"
+	"notifier/internal/stream"
 	"notifier/internal/telegram"
 )
+
+func env(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	if v, err := strconv.Atoi(os.Getenv(key)); err == nil && v > 0 {
+		return v
+	}
+	return def
+}
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -38,23 +54,36 @@ func main() {
 		log.Println("TELEGRAM_BOT_TOKEN is empty: matches are only logged, bot is disabled")
 	}
 
-	go func() {
-		sub := rdb.Subscribe(ctx, "listings.new")
-		defer sub.Close()
-		log.Println("subscribed to listings.new")
-		for msg := range sub.Channel() {
-			event, err := model.ParseEvent([]byte(msg.Payload))
-			if err != nil {
-				log.Printf("bad event skipped: %v", err)
+	// Идемпотентный обработчик: при повторной доставке события из стрима
+	// MarkSent не даст отправить то же объявление тому же чату второй раз.
+	handle := func(ctx context.Context, event model.Event) error {
+		for _, s := range model.MatchAll(event, subStore.All()) {
+			if !subStore.MarkSent(s.ChatID, event.ID) {
 				continue
 			}
-			for _, s := range model.MatchAll(event, subStore.All()) {
-				log.Printf("MATCH: subscription %d (chat %d) <- listing %d (%s, $%.0f) %s",
-					s.ID, s.ChatID, event.ID, event.City, event.PriceUSD, event.URL)
-				if tgBot != nil {
-					go tgBot.Notify(ctx, s.ChatID, event)
-				}
+			log.Printf("MATCH: subscription %d (chat %d) <- listing %d (%s, $%.0f) %s",
+				s.ID, s.ChatID, event.ID, event.City, event.PriceUSD, event.URL)
+			if tgBot != nil {
+				tgBot.Notify(ctx, s.ChatID, event)
 			}
+		}
+		return nil
+	}
+
+	host, _ := os.Hostname()
+	consumer := stream.New(rdb, stream.Config{
+		Stream:   env("STREAM_NAME", "listings.new"),
+		Group:    env("STREAM_GROUP", "notifier"),
+		Consumer: host,
+		Workers:  envInt("WORKERS", 8),
+	}, handle)
+
+	consumerDone := make(chan struct{})
+	go func() {
+		defer close(consumerDone)
+		if err := consumer.Run(ctx); err != nil {
+			log.Printf("stream consumer stopped: %v", err)
+			stop()
 		}
 	}()
 
@@ -70,4 +99,5 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
+	<-consumerDone
 }
