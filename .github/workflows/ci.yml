@@ -1,0 +1,25 @@
+# .github/workflows/ci.yml
+name: ci
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  notifier:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: notifier
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: notifier/go.mod
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "не отформатировано:"; echo "$out"; exit 1; fi
+      - run: go vet ./...
+      - run: go test ./... -race
