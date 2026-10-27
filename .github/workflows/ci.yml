@@ -34,3 +34,13 @@ jobs:
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Ловит ошибки docker-compose/Dockerfile до деплоя (зона сквозной интеграции)
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker compose config
+        run: docker compose config -q
+      - name: docker compose build
+        run: docker compose build
