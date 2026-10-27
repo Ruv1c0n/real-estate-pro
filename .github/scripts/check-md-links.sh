@@ -7,10 +7,11 @@
 # ложные срабатывания на примерах в документации.
 set -uo pipefail
 
+broken=0
 while IFS= read -r f; do
   dir=$(dirname "$f")
   # [текст](цель) и ![alt](цель); grep -o оставляет только ](цель)
-  grep -oE '\]\([^)]+\)' "$f" | sed -E 's/^\]\(//; s/\)$//' | while IFS= read -r tgt; do
+  while IFS= read -r tgt; do
     case "$tgt" in
       http://*|https://*|mailto:*|\#*) continue ;;
     esac
@@ -19,6 +20,10 @@ while IFS= read -r f; do
     path=${path//%20/ }      # URL-декодирование пробелов
     if [ ! -e "$dir/$path" ]; then
       echo "$f: ссылка на несуществующий файл: $tgt"
+      broken=1
     fi
-  done
+  done < <(grep -oE '\]\([^)]+\)' "$f" | sed -E 's/^\]\(//; s/\)$//')
 done < <(git ls-files '*.md')
+# grep выходит с кодом 1 на файлах без ссылок — поэтому код возврата
+# определяем сами: 0 = битых ссылок нет, 1 = есть
+exit $broken
