@@ -23,3 +23,14 @@ jobs:
           if [ -n "$out" ]; then echo "не отформатировано:"; echo "$out"; exit 1; fi
       - run: go vet ./...
       - run: go test ./... -race
+
+  # Правило ТЗ 6.5: секреты только через .env — ловим случайные коммиты токенов
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
