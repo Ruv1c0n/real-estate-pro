@@ -1,0 +1,60 @@
+# .github/workflows/python-ci.yml
+# Проверки Python-сервисов (core-api, collector).
+# Пока сервисы пустые, workflow не срабатывает: триггеры настроены только на
+# изменения в core-api/**, collector/** и на сам этот файл.
+# Ручной запуск для проверки: вкладка Actions → python-ci → Run workflow.
+name: python-ci
+on:
+  pull_request:
+    paths:
+      - core-api/**
+      - collector/**
+      - .github/workflows/python-ci.yml
+  push:
+    branches: [main]
+    paths:
+      - core-api/**
+      - collector/**
+  workflow_dispatch:
+
+jobs:
+  ruff:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [core-api, collector]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - name: ruff check (линтер)
+        run: ruff check ${{ matrix.service }}
+      - name: ruff format --check (форматирование)
+        run: ruff format --check ${{ matrix.service }}
+
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [core-api, collector]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Шаг-заготовка: сам включится, когда в сервисах появятся тесты.
+      # requirements.txt подхватится автоматически, если появится.
+      - name: pytest (если есть тесты)
+        run: |
+          svc="${{ matrix.service }}"
+          if find "$svc" \( -name 'test_*.py' -o -name '*_test.py' \) | grep -q .; then
+            if [ -f "$svc/requirements.txt" ]; then pip install -r "$svc/requirements.txt"; fi
+            pip install pytest
+            cd "$svc" && python -m pytest
+          else
+            echo "В $svc тестов пока нет — шаг пропущен"
+          fi
