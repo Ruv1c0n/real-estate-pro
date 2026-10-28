@@ -32,6 +32,9 @@ services:
     environment:
       DATABASE_URL: postgresql://app:app@postgres:5432/realestate
       REDIS_URL: redis://redis:6379/0
+      CORE_API_APP_NAME: "${CORE_API_APP_NAME:-Real Estate Pro - Core API}"
+      CORE_API_APP_VERSION: "${CORE_API_APP_VERSION:-0.1.0}"
+      CORE_API_LOG_LEVEL: "${CORE_API_LOG_LEVEL:-INFO}"
     depends_on:
       postgres:
         condition: service_healthy
