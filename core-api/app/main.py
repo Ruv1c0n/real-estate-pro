@@ -6,6 +6,7 @@ from fastapi import FastAPI
 
 from app.config import settings
 from app.logging_setup import setup_logging
+from app.error_handlers import register_error_handlers
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+register_error_handlers(app)
 
 @app.get("/")
 async def root() -> dict[str, str]:
