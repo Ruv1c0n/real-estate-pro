@@ -25,6 +25,7 @@ async def check_postgres(engine: AsyncEngine) -> bool:
             "PostgreSQL readiness check failed: %s",
             type(exc).__name__,
         )
+        logger.debug("PostgreSQL readiness check details", exc_info=True)
         return False
 
 
