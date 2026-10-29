@@ -42,7 +42,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql://app:app@postgres:5432/realestate
+      DATABASE_URL: postgresql+asyncpg://app:app@postgres:5432/realestate
       REDIS_URL: redis://redis:6379/0
       CORE_API_APP_NAME: "${CORE_API_APP_NAME:-Real Estate Pro - Core API}"
       CORE_API_APP_VERSION: "${CORE_API_APP_VERSION:-0.1.0}"
