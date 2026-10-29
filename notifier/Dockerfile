@@ -5,6 +5,6 @@ RUN go mod download
 COPY . .
 RUN go mod tidy && CGO_ENABLED=0 go build -o /notifier .
 
-FROM alpine:3.20
+FROM alpine:3.24
 COPY --from=build /notifier /notifier
 CMD ["/notifier"]
