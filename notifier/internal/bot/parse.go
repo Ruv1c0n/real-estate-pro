@@ -59,14 +59,14 @@ func ParseSubscription(args []string) (model.Subscription, error) {
 			}
 			s.Rooms = model.IntPtr(n)
 		case "min", "max":
-			f, err := strconv.ParseFloat(strings.TrimPrefix(v, "$"), 64)
-			if err != nil || f <= 0 {
-				return s, fmt.Errorf("%s: нужна положительная цена в USD", p.key)
+			n, err := strconv.ParseInt(strings.TrimPrefix(v, "$"), 10, 64)
+			if err != nil || n <= 0 {
+				return s, fmt.Errorf("%s: нужна положительная целая цена в USD", p.key)
 			}
 			if p.key == "min" {
-				s.MinPriceUSD = model.FloatPtr(f)
+				s.MinPriceUSD = model.Int64Ptr(n)
 			} else {
-				s.MaxPriceUSD = model.FloatPtr(f)
+				s.MaxPriceUSD = model.Int64Ptr(n)
 			}
 		default:
 			return s, fmt.Errorf("неизвестный параметр %q", p.key)

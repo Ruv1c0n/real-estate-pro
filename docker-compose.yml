@@ -17,8 +17,20 @@ services:
 
   redis:
     image: redis:7
+    # contracts.md §2: volume, AOF appendfsync everysec, noeviction —
+    # необработанные события стрима не теряются и не вытесняются.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory-policy
+      - noeviction
     ports:
       - "6379:6379"
+    volumes:
+      - redisdata:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -59,7 +71,9 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql://app:app@postgres:5432/realestate
+      CORE_API_URL: http://core-api:8000
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      ADMIN_KEY: ${ADMIN_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -68,3 +82,4 @@ services:
 
 volumes:
   pgdata:
+  redisdata:
