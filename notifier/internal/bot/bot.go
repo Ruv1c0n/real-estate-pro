@@ -20,13 +20,23 @@ type API interface {
 	GetUpdates(ctx context.Context, offset int64) ([]telegram.Update, error)
 }
 
-type Bot struct {
-	api  API
-	subs *store.Memory
+// Validator проверяет страну и город подписки по справочникам Core API
+// и приводит их к каноническим значениям (ФТ-3.1, contracts.md §3).
+type Validator interface {
+	Validate(ctx context.Context, country, city string) (canonCountry, canonCity string, err error)
 }
 
-func New(api API, subs *store.Memory) *Bot {
-	return &Bot{api: api, subs: subs}
+// MaxSubscriptionsPerUser — лимит подписок на пользователя (ТЗ 3.6).
+const MaxSubscriptionsPerUser = 10
+
+type Bot struct {
+	api   API
+	subs  store.Store
+	dicts Validator
+}
+
+func New(api API, subs store.Store, dicts Validator) *Bot {
+	return &Bot{api: api, subs: subs, dicts: dicts}
 }
 
 const helpText = `Я присылаю новые объявления о недвижимости под ваши фильтры.
@@ -35,9 +45,10 @@ const helpText = `Я присылаю новые объявления о нед�
   параметры (нужен хотя бы один):
   city — город (латиницей), country — код страны (BY),
   deal — rent или sale, rooms — число комнат или studio,
-  min / max — цена в USD
+  min / max — цена в USD (целое)
 /list — мои подписки
-/unsubscribe <id> — удалить подписку`
+/unsubscribe <id> — удалить подписку
+/stop — удалить меня и все мои подписки`
 
 // Run крутит long polling до отмены контекста.
 func (b *Bot) Run(ctx context.Context) {
@@ -83,11 +94,13 @@ func (b *Bot) handle(ctx context.Context, chatID int64, text string) {
 	case "/start", "/help":
 		reply = helpText
 	case "/subscribe":
-		reply = b.subscribe(chatID, args)
+		reply = b.subscribe(ctx, chatID, args)
 	case "/list":
 		reply = b.list(chatID)
 	case "/unsubscribe":
 		reply = b.unsubscribe(chatID, args)
+	case "/stop":
+		reply = b.stop(chatID)
 	default:
 		if !strings.HasPrefix(cmd, "/") {
 			return
@@ -97,10 +110,17 @@ func (b *Bot) handle(ctx context.Context, chatID int64, text string) {
 	b.send(ctx, chatID, reply)
 }
 
-func (b *Bot) subscribe(chatID int64, args []string) string {
+func (b *Bot) subscribe(ctx context.Context, chatID int64, args []string) string {
+	if n := b.subs.CountForChat(chatID); n >= MaxSubscriptionsPerUser {
+		return fmt.Sprintf("У вас уже %d подписок — это максимум. /list покажет ваши подписки, /unsubscribe удалит лишнюю.", MaxSubscriptionsPerUser)
+	}
 	s, err := ParseSubscription(args)
 	if err != nil {
 		return "Не получилось: " + err.Error() + "\nПример: /subscribe city=Minsk rooms=1 max=400"
+	}
+	s.Country, s.City, err = b.dicts.Validate(ctx, s.Country, s.City)
+	if err != nil {
+		return "Не получилось: " + err.Error()
 	}
 	s.ChatID = chatID
 	s = b.subs.Add(s)
@@ -133,39 +153,43 @@ func (b *Bot) unsubscribe(chatID int64, args []string) string {
 	return fmt.Sprintf("Подписка #%d удалена.", id)
 }
 
+// stop удаляет пользователя и все его данные (ФТ-3.1). Пока удаляются
+// подписки; на этапе 2 (миграции схемы notifier) добавится удаление пользователя.
+func (b *Bot) stop(chatID int64) string {
+	n := b.subs.DeleteAllForChat(chatID)
+	return fmt.Sprintf("Готово: удалено подписок — %d. Вы больше не будете получать уведомления. /subscribe вернёт их в любой момент.", n)
+}
+
 func (b *Bot) send(ctx context.Context, chatID int64, text string) {
 	if err := b.api.SendMessage(ctx, chatID, text); err != nil {
 		log.Printf("telegram send to %d: %v", chatID, err)
 	}
 }
 
-// Notify отправляет уведомление об объявлении в чат.
-func (b *Bot) Notify(ctx context.Context, chatID int64, e model.Event) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	b.send(ctx, chatID, FormatEvent(e))
+// Send доставляет уведомление об объявлении в чат. Используется диспетчером
+// доставки как отправитель; контекст уже ограничен по времени снаружи.
+func (b *Bot) Send(ctx context.Context, chatID int64, e model.Event) error {
+	return b.api.SendMessage(ctx, chatID, FormatEvent(e))
 }
 
-// FormatEvent — текст уведомления.
+// FormatEvent — текст уведомления (ФТ-3.4: цена, адрес, комнатность, ссылка).
 func FormatEvent(e model.Event) string {
 	var sb strings.Builder
 	sb.WriteString("🏠 Новое объявление\n")
-	if e.Title != "" {
-		sb.WriteString(e.Title + "\n")
-	}
 	line := e.City
-	if e.Rooms != nil {
-		if *e.Rooms == 0 {
-			line += ", студия"
-		} else {
-			line += fmt.Sprintf(", %d-к", *e.Rooms)
-		}
+	if e.Rooms == 0 {
+		line += ", студия"
+	} else {
+		line += fmt.Sprintf(", %d-к", e.Rooms)
 	}
-	line += fmt.Sprintf(" · $%.0f", e.PriceUSD)
+	line += fmt.Sprintf(" · $%d", e.PriceUSD)
 	if e.Currency != "" && !strings.EqualFold(e.Currency, "USD") && e.Price > 0 {
 		line += fmt.Sprintf(" (%.0f %s)", e.Price, e.Currency)
 	}
 	sb.WriteString(line + "\n")
+	if e.Address != nil && strings.TrimSpace(*e.Address) != "" {
+		sb.WriteString("📍 " + strings.TrimSpace(*e.Address) + "\n")
+	}
 	sb.WriteString(e.URL)
 	return sb.String()
 }
@@ -193,10 +217,10 @@ func Describe(s model.Subscription) string {
 		}
 	}
 	if s.MinPriceUSD != nil {
-		parts = append(parts, fmt.Sprintf("от $%.0f", *s.MinPriceUSD))
+		parts = append(parts, fmt.Sprintf("от $%d", *s.MinPriceUSD))
 	}
 	if s.MaxPriceUSD != nil {
-		parts = append(parts, fmt.Sprintf("до $%.0f", *s.MaxPriceUSD))
+		parts = append(parts, fmt.Sprintf("до $%d", *s.MaxPriceUSD))
 	}
 	return strings.Join(parts, ", ")
 }
