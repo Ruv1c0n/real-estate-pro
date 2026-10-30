@@ -10,9 +10,7 @@ on:
       - .github/workflows/python-ci.yml
   push:
     branches:
-      - main
-      - feature/core-api-foundation
-      - "task/core-api-*"
+      - "**"
     paths:
       - core-api/**
       - collector/**
