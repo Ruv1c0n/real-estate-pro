@@ -42,8 +42,9 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql://app:app@postgres:5432/realestate
+      DATABASE_URL: postgresql+asyncpg://app:app@postgres:5432/realestate
       REDIS_URL: redis://redis:6379/0
+      CORE_API_LOG_LEVEL: "${CORE_API_LOG_LEVEL:-INFO}"
     depends_on:
       postgres:
         condition: service_healthy
