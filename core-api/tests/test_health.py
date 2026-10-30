@@ -45,6 +45,38 @@ def test_live_does_not_access_dependencies(health_client):
 
 
 @pytest.mark.parametrize(
+    ("postgres_ok", "redis_ok", "code", "status"),
+    [
+        (True, True, 200, "ready"),
+        (True, False, 200, "degraded"),
+        (False, True, 503, "unavailable"),
+        (False, False, 503, "unavailable"),
+    ],
+)
+def test_health_summary(health_client, postgres_ok, redis_ok, code, status):
+    client, engine, redis_client = health_client
+
+    if not postgres_ok:
+        engine.connect.return_value.__aenter__.side_effect = OSError(
+            "Connection failed"
+        )
+    redis_client.ping.return_value = redis_ok
+
+    response = client.get("/health", follow_redirects=False)
+
+    assert response.status_code == code
+    assert response.json() == {
+        "status": status,
+        "checks": {
+            "postgres": "ok" if postgres_ok else "unavailable",
+            "redis": "ok" if redis_ok else "unavailable",
+        },
+    }
+    engine.connect.assert_called_once()
+    redis_client.ping.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
     ("postgres_available", "redis_available"),
     [
         (True, True),

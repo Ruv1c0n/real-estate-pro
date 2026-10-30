@@ -42,6 +42,37 @@ async def check_redis(client: Redis) -> bool:
         return False
 
 
+async def check_dependencies(request: Request) -> tuple[bool, bool]:
+    postgres_ok, redis_ok = await asyncio.gather(
+        check_postgres(request.app.state.db_engine),
+        check_redis(request.app.state.redis),
+    )
+    return postgres_ok, redis_ok
+
+
+@router.get("", responses={503: {"description": "PostgreSQL недоступен"}})
+async def health_summary(request: Request) -> JSONResponse:
+    postgres_ok, redis_ok = await check_dependencies(request)
+
+    if not postgres_ok:
+        status = "unavailable"
+    elif not redis_ok:
+        status = "degraded"
+    else:
+        status = "ready"
+
+    return JSONResponse(
+        status_code=200 if postgres_ok else 503,
+        content={
+            "status": status,
+            "checks": {
+                "postgres": "ok" if postgres_ok else "unavailable",
+                "redis": "ok" if redis_ok else "unavailable",
+            },
+        },
+    )
+
+
 @router.get("/live")
 async def live() -> dict[str, str]:
     return {"status": "alive"}
@@ -52,10 +83,7 @@ async def live() -> dict[str, str]:
     responses={503: {"description": "Зависимости недоступны"}},
 )
 async def ready(request: Request) -> JSONResponse:
-    postgres_ok, redis_ok = await asyncio.gather(
-        check_postgres(request.app.state.db_engine),
-        check_redis(request.app.state.redis),
-    )
+    postgres_ok, redis_ok = await check_dependencies(request)
 
     if not (postgres_ok and redis_ok):
         return JSONResponse(
