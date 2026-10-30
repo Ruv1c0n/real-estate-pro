@@ -1,8 +1,7 @@
 import pytest
+from app.error_handlers import register_error_handlers
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-
-from app.error_handlers import register_error_handlers
 
 
 @pytest.fixture

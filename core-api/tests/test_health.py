@@ -1,17 +1,16 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-import asyncio
-
+from app import health
+from app.health import router
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from redis.asyncio import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from app.health import router
-from app import health
 
 @pytest.fixture
 def health_client():

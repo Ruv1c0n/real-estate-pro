@@ -5,12 +5,11 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from fastapi import FastAPI
 
 from app.config import settings
-from app.logging_setup import setup_logging
-from app.error_handlers import register_error_handlers
 from app.database import create_db_engine
-from app.redis_client import create_redis_client
+from app.error_handlers import register_error_handlers
 from app.health import router as health_router
-
+from app.logging_setup import setup_logging
+from app.redis_client import create_redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +45,7 @@ app = FastAPI(
 
 register_error_handlers(app)
 app.include_router(health_router)
+
 
 @app.get("/")
 async def root() -> dict[str, str]:

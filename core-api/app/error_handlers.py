@@ -25,11 +25,7 @@ async def http_error_handler(
     request: Request,
     exc: HTTPException,
 ) -> JSONResponse:
-    message = (
-        exc.detail
-        if isinstance(exc.detail, str)
-        else "Ошибка запроса"
-    )
+    message = exc.detail if isinstance(exc.detail, str) else "Ошибка запроса"
 
     if exc.status_code == 404 and message == "Not Found":
         message = "Ресурс не найден"

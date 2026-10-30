@@ -2,9 +2,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi.testclient import TestClient
-
 from app import main
+from fastapi.testclient import TestClient
 
 
 @pytest.fixture
@@ -48,9 +47,11 @@ def test_db_closed_when_redis_initialization_fails(clients):
     engine, redis_client, db_factory, redis_factory = clients
     redis_factory.side_effect = RuntimeError("Redis initialization failed")
 
-    with pytest.raises(RuntimeError, match="Redis initialization failed"):
-        with TestClient(main.app):
-            pytest.fail("Application must not start")
+    with (
+        pytest.raises(RuntimeError, match="Redis initialization failed"),
+        TestClient(main.app),
+    ):
+        pytest.fail("Application must not start")
 
     db_factory.assert_called_once()
     redis_factory.assert_called_once()
@@ -62,9 +63,11 @@ def test_db_closed_when_redis_cleanup_fails(clients):
     engine, redis_client, _, _ = clients
     redis_client.aclose.side_effect = RuntimeError("Redis cleanup failed")
 
-    with pytest.raises(RuntimeError, match="Redis cleanup failed"):
-        with TestClient(main.app):
-            engine.dispose.assert_not_awaited()
+    with (
+        pytest.raises(RuntimeError, match="Redis cleanup failed"),
+        TestClient(main.app),
+    ):
+        engine.dispose.assert_not_awaited()
 
     redis_client.aclose.assert_awaited_once()
     engine.dispose.assert_awaited_once()
