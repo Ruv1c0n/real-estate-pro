@@ -1,0 +1,51 @@
+# .github/workflows/migrations.yml
+# Smoke-проверка миграций: накат SQL-миграций notifier с нуля на чистой Postgres.
+# Миграции готовит Илья, применение при деплое — зона Даниила; эта проверка ловит
+# ошибки в SQL до деплоя.
+# Каталог миграций: notifier/migrations/*.sql (если Илья выберет другой путь —
+# поправить paths ниже и команду в шаге).
+# TODO: когда в core-api появятся Alembic-миграции схемы core — добавить вторую
+# джобу с 'pip install alembic && alembic upgrade head' на такой же services.postgres.
+name: migrations
+on:
+  pull_request:
+    paths:
+      - notifier/migrations/**
+      - .github/workflows/migrations.yml
+  push:
+    branches: [main]
+    paths:
+      - notifier/migrations/**
+  workflow_dispatch:
+
+jobs:
+  notifier-sql:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: realestate
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U app -d realestate"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Накатить SQL-миграции notifier на чистую базу
+        run: |
+          set -euo pipefail
+          if ! ls notifier/migrations/*.sql >/dev/null 2>&1; then
+            echo "notifier/migrations пуст — миграций пока нет, пропуск"
+            exit 0
+          fi
+          for f in $(ls notifier/migrations/*.sql | sort); do
+            echo "== применяю $f"
+            PGPASSWORD=app psql -h localhost -U app -d realestate -v ON_ERROR_STOP=1 -f "$f"
+          done
+          echo "Все миграции применены успешно"
