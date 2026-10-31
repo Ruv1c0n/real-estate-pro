@@ -1,0 +1,26 @@
+# Добавить в .github/dependabot.yml в updates:
+  - package-ecosystem: pip
+    directory: /collector
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(collector)"
+    labels: [dependencies]
+
+  - package-ecosystem: pip
+    directory: /ui
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(ui)"
+    labels: [dependencies]
+
+  - package-ecosystem: docker
+    directory: /ui
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "chore(ui)"
+    labels: [dependencies]

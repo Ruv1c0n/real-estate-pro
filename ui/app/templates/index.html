@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="layout">
+  <form class="filters" method="get" action="/">
+    <h2>Фильтры</h2>
+    <label>Страна
+      <select name="country">
+        <option value="">Любая</option>
+        {% for code, name in [("BY","Беларусь"),("RU","Россия"),("KZ","Казахстан"),("DE","Германия"),("PL","Польша"),("GE","Грузия"),("TR","Турция"),("AE","ОАЭ")] %}
+        <option value="{{ code }}" {{ "selected" if filters.get("country") == code }}>{{ name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Город
+      <input type="text" name="city" value="{{ filters.get('city', '') }}" placeholder="Например, Минск">
+    </label>
+    <label>Сделка
+      <select name="deal_type">
+        <option value="">Любая</option>
+        <option value="rent" {{ "selected" if filters.get("deal_type") == "rent" }}>Аренда</option>
+        <option value="sale" {{ "selected" if filters.get("deal_type") == "sale" }}>Покупка</option>
+      </select>
+    </label>
+    <label>Комнат
+      <select name="rooms">
+        <option value="">Любое</option>
+        <option value="0" {{ "selected" if filters.get("rooms") == 0 }}>Студия</option>
+        {% for n in [1,2,3,4] %}
+        <option value="{{ n }}" {{ "selected" if filters.get("rooms") == n }}>{{ n }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Цена до, $
+      <input type="number" name="price_max" min="0" step="50" value="{{ filters.get('price_max', '') }}">
+    </label>
+    <button type="submit">Показать</button>
+    {% if filters %}<a class="reset" href="/">Сбросить</a>{% endif %}
+  </form>
+
+  <section class="results">
+    {% if error %}
+      <p class="notice error">{{ error }}</p>
+    {% else %}
+      <p class="count">Найдено: <strong>{{ total }}</strong></p>
+    {% endif %}
+
+    {% if not items and not error %}
+      <p class="notice">Ничего не нашлось. Увеличьте цену или уберите часть фильтров.</p>
+    {% endif %}
+
+    <ul class="cards">
+      {% for it in items %}
+      <li class="card">
+        <div class="rooms">{{ it.rooms | rooms }}</div>
+        <div class="body">
+          <a class="title" href="/listing/{{ it.id }}">{{ it.title }}</a>
+          <p class="where">{{ it.city }}{% if it.address %}, {{ it.address }}{% endif %}</p>
+          <p class="meta">
+            {% if it.area_m2 %}{{ it.area_m2 }} м²{% endif %}
+            {% if it.floor %}{{ "&ensp;" | safe }}{{ it.floor }}{% if it.floors_total %}/{{ it.floors_total }}{% endif %} этаж{% endif %}
+          </p>
+        </div>
+        <div class="price">
+          <strong>{{ it.price_usd | money("USD") }}{% if it.deal_type == "rent" %}<small>/мес</small>{% endif %}</strong>
+          {% if it.currency != "USD" %}<span>{{ it.price | money(it.currency) }}</span>{% endif %}
+          <a class="src" href="{{ it.url }}" target="_blank" rel="noopener noreferrer">Открыть на {{ it.source }}</a>
+        </div>
+      </li>
+      {% endfor %}
+    </ul>
+
+    {% if pages > 1 %}
+    <nav class="pager">
+      {% if page > 1 %}<a href="/?{{ base_qs }}&page={{ page - 1 }}">Назад</a>{% endif %}
+      <span>Страница {{ page }} из {{ pages }}</span>
+      {% if page < pages %}<a href="/?{{ base_qs }}&page={{ page + 1 }}">Дальше</a>{% endif %}
+    </nav>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

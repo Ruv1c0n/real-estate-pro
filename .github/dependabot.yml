@@ -20,7 +20,7 @@ updates:
       prefix: "chore(notifier)"
     labels: [dependencies]
 
-  # заглушки core-api/collector: пока образы тривиальные, обновления редкие
+  # заглушка core-api: пока образ тривиальный, обновления редкие
   - package-ecosystem: docker
     directory: /core-api
     schedule:
@@ -35,6 +35,32 @@ updates:
       interval: monthly
     commit-message:
       prefix: "chore(collector)"
+    labels: [dependencies]
+
+  - package-ecosystem: pip
+    directory: /collector
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(collector)"
+    labels: [dependencies]
+
+  - package-ecosystem: docker
+    directory: /ui
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "chore(ui)"
+    labels: [dependencies]
+
+  - package-ecosystem: pip
+    directory: /ui
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(ui)"
     labels: [dependencies]
 
   - package-ecosystem: github-actions

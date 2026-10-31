@@ -1,0 +1,20 @@
+# Фрагмент для общего docker-compose.yml (ведёт Даниил)
+  collector:
+    build: ./collector
+    environment:
+      MOCK_MODE: "true"
+      CORE_API_URL: http://core-api:8000
+      MOCK_DATA_PATH: /srv/data/listings.json
+      COLLECT_INTERVAL_SEC: "300"
+    depends_on:
+      - core-api
+    restart: unless-stopped
+
+  ui:
+    build: ./ui
+    environment:
+      CORE_API_URL: http://core-api:8000
+    ports:
+      - "8080:8080"
+    depends_on:
+      - core-api

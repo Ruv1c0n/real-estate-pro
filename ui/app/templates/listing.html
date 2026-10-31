@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}{{ item.title }}{% endblock %}
+{% block content %}
+<article class="detail">
+  <a class="back" href="javascript:history.back()">Назад к списку</a>
+  <h1>{{ item.title }}</h1>
+  <p class="where">{{ item.city }}{% if item.address %}, {{ item.address }}{% endif %}</p>
+
+  <div class="detail-price">
+    <strong>{{ item.price_usd | money("USD") }}{% if item.deal_type == "rent" %}<small>/мес</small>{% endif %}</strong>
+    {% if item.currency != "USD" %}<span>{{ item.price | money(item.currency) }}</span>{% endif %}
+  </div>
+
+  <dl class="facts">
+    <div><dt>Сделка</dt><dd>{{ "Аренда" if item.deal_type == "rent" else "Покупка" }}</dd></div>
+    <div><dt>Комнат</dt><dd>{{ item.rooms | rooms }}</dd></div>
+    {% if item.area_m2 %}<div><dt>Площадь</dt><dd>{{ item.area_m2 }} м²</dd></div>{% endif %}
+    {% if item.floor %}<div><dt>Этаж</dt><dd>{{ item.floor }}{% if item.floors_total %} из {{ item.floors_total }}{% endif %}</dd></div>{% endif %}
+    <div><dt>Страна</dt><dd>{{ item.country }}</dd></div>
+    <div><dt>Источник</dt><dd>{{ item.source }}</dd></div>
+  </dl>
+
+  {% if item.description %}<p class="desc">{{ item.description }}</p>{% endif %}
+
+  <a class="cta" href="{{ item.url }}" target="_blank" rel="noopener noreferrer">Открыть оригинал на {{ item.source }}</a>
+</article>
+{% endblock %}
