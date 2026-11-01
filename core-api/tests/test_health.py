@@ -166,3 +166,83 @@ def test_dependency_check_timeout(monkeypatch, dependency):
             context.__aexit__.assert_awaited_once()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, AttributeError])
+@pytest.mark.parametrize(
+    ("path", "expected_code", "expected_body"),
+    [
+        (
+            "/health",
+            200,
+            {
+                "status": "degraded",
+                "checks": {
+                    "postgres": "ok",
+                    "redis": "unavailable",
+                },
+            },
+        ),
+        (
+            "/health/ready",
+            503,
+            {
+                "error": "dependency_unavailable",
+                "message": "Сервис временно не готов к работе",
+            },
+        ),
+    ],
+)
+def test_redis_unexpected_exception_is_reported(
+    health_client, caplog, error_type, path, expected_code, expected_body
+):
+    client, _, redis_client = health_client
+    redis_client.ping.side_effect = error_type("probe failed")
+
+    with caplog.at_level("WARNING", logger="app.health"):
+        response = client.get(path)
+
+    assert response.status_code == expected_code
+    assert response.json() == expected_body
+    assert "probe failed" not in response.text
+    assert any(
+        record.name == "app.health"
+        and record.levelname == "WARNING"
+        and error_type.__name__ in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("dependency", ["postgres", "redis"])
+def test_probe_external_cancellation_propagates(dependency):
+    async def scenario():
+        started = asyncio.Event()
+
+        async def hanging_operation(*args, **kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        if dependency == "postgres":
+            connection = SimpleNamespace(
+                scalar=AsyncMock(side_effect=hanging_operation),
+            )
+            engine = MagicMock(spec=AsyncEngine)
+            engine.connect.return_value.__aenter__.return_value = connection
+            probe = health.check_postgres(engine)
+        else:
+            redis_client = MagicMock(spec=Redis)
+            redis_client.ping = AsyncMock(side_effect=hanging_operation)
+            probe = health.check_redis(redis_client)
+
+        task = asyncio.create_task(probe)
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1)
+            task.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())

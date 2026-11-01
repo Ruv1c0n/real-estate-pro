@@ -4,7 +4,6 @@ import logging
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
-from redis.exceptions import RedisError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -34,11 +33,12 @@ async def check_redis(client: Redis) -> bool:
     try:
         async with asyncio.timeout(CHECK_TIMEOUT):
             return bool(await client.ping())
-    except (RedisError, TimeoutError, OSError) as exc:
+    except Exception as exc:
         logger.warning(
             "Redis readiness check failed: %s",
             type(exc).__name__,
         )
+        logger.debug("Redis readiness check details", exc_info=True)
         return False
 
 
