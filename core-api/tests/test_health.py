@@ -246,3 +246,66 @@ def test_probe_external_cancellation_propagates(dependency):
             await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(scenario())
+
+
+def test_health_openapi_response_contracts(health_client):
+    client, _, _ = health_client
+
+    response = client.get("/openapi.json")
+    assert response.status_code == 200
+    schema = response.json()
+
+    expected_models = [
+        ("/health", "200", "HealthReport"),
+        ("/health", "503", "HealthReport"),
+        ("/health/ready", "200", "ReadyReport"),
+        ("/health/ready", "503", "ReadinessError"),
+        ("/health/live", "200", "LiveReport"),
+    ]
+
+    for path, status_code, model_name in expected_models:
+        description = schema["paths"][path]["get"]["responses"][status_code]
+        response_schema = (
+            description.get("content", {}).get("application/json", {}).get("schema", {})
+        )
+
+        assert response_schema.get("$ref") == (f"#/components/schemas/{model_name}"), (
+            f"Не описана модель {model_name} для {path}: {status_code}"
+        )
+
+    models = schema["components"]["schemas"]
+
+    assert set(models["ServiceStatus"]["enum"]) == {
+        "ready",
+        "degraded",
+        "unavailable",
+    }
+    assert set(models["DependencyState"]["enum"]) == {
+        "ok",
+        "unavailable",
+    }
+
+    checks = models["HealthChecks"]
+    assert set(checks["required"]) == {"postgres", "redis"}
+
+    for dependency in ("postgres", "redis"):
+        assert checks["properties"][dependency]["$ref"] == (
+            "#/components/schemas/DependencyState"
+        )
+
+    report = models["HealthReport"]
+    assert set(report["required"]) == {"status", "checks"}
+    assert report["properties"]["status"]["$ref"] == (
+        "#/components/schemas/ServiceStatus"
+    )
+    assert report["properties"]["checks"]["$ref"] == (
+        "#/components/schemas/HealthChecks"
+    )
+
+    assert models["LiveReport"]["properties"]["status"]["const"] == "alive"
+    assert models["ReadyReport"]["properties"]["status"]["const"] == "ready"
+    assert models["ReadinessError"]["properties"]["error"]["const"] == (
+        "dependency_unavailable"
+    )
+    assert set(models["ReadinessError"]["required"]) == {"error", "message"}
+    assert models["ReadinessError"]["properties"]["message"]["type"] == "string"

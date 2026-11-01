@@ -7,6 +7,16 @@ from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.health_models import (
+    DependencyState,
+    HealthChecks,
+    HealthReport,
+    LiveReport,
+    ReadinessError,
+    ReadyReport,
+    ServiceStatus,
+)
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/health", tags=["Health"])
@@ -50,57 +60,78 @@ async def check_dependencies(request: Request) -> tuple[bool, bool]:
     return postgres_ok, redis_ok
 
 
-@router.get("", responses={503: {"description": "PostgreSQL недоступен"}})
+@router.get(
+    "",
+    response_model=HealthReport,
+    responses={
+        503: {
+            "model": HealthReport,
+            "description": "PostgreSQL недоступен",
+        },
+    },
+)
 async def health_summary(request: Request) -> JSONResponse:
     postgres_ok, redis_ok = await check_dependencies(request)
 
     if not postgres_ok:
-        status = "unavailable"
+        status = ServiceStatus.UNAVAILABLE
     elif not redis_ok:
-        status = "degraded"
+        status = ServiceStatus.DEGRADED
     else:
-        status = "ready"
+        status = ServiceStatus.READY
+
+    report = HealthReport(
+        status=status,
+        checks=HealthChecks(
+            postgres=(
+                DependencyState.OK if postgres_ok else DependencyState.UNAVAILABLE
+            ),
+            redis=DependencyState.OK if redis_ok else DependencyState.UNAVAILABLE,
+        ),
+    )
 
     return JSONResponse(
         status_code=200 if postgres_ok else 503,
-        content={
-            "status": status,
-            "checks": {
-                "postgres": "ok" if postgres_ok else "unavailable",
-                "redis": "ok" if redis_ok else "unavailable",
-            },
-        },
+        content=report.model_dump(mode="json"),
     )
 
 
-@router.get("/live")
-async def live() -> dict[str, str]:
-    return {"status": "alive"}
+@router.get("/live", response_model=LiveReport)
+async def live() -> LiveReport:
+    return LiveReport(status="alive")
 
 
 @router.get(
     "/ready",
-    responses={503: {"description": "Зависимости недоступны"}},
+    response_model=ReadyReport,
+    responses={
+        503: {
+            "model": ReadinessError,
+            "description": "Зависимости недоступны",
+        },
+    },
 )
 async def ready(request: Request) -> JSONResponse:
     postgres_ok, redis_ok = await check_dependencies(request)
 
     if not (postgres_ok and redis_ok):
+        error = ReadinessError(
+            error="dependency_unavailable",
+            message="Сервис временно не готов к работе",
+        )
         return JSONResponse(
             status_code=503,
-            content={
-                "error": "dependency_unavailable",
-                "message": "Сервис временно не готов к работе",
-            },
+            content=error.model_dump(mode="json"),
         )
 
+    report = ReadyReport(
+        status=ServiceStatus.READY,
+        checks=HealthChecks(
+            postgres=DependencyState.OK,
+            redis=DependencyState.OK,
+        ),
+    )
     return JSONResponse(
         status_code=200,
-        content={
-            "status": "ready",
-            "checks": {
-                "postgres": "ok",
-                "redis": "ok",
-            },
-        },
+        content=report.model_dump(mode="json"),
     )
