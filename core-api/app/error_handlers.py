@@ -50,8 +50,17 @@ async def validation_error_handler(
     message = "Некорректные входные данные"
 
     if errors:
-        field = ".".join(str(part) for part in errors[0]["loc"])
-        message = f"Некорректное значение поля: {field}"
+        first_error = errors[0]
+
+        if first_error["type"] in {
+            "price_range_invalid",
+            "area_range_invalid",
+            "city_country_required",
+        }:
+            message = first_error["msg"]
+        else:
+            field = ".".join(str(part) for part in first_error["loc"])
+            message = f"Некорректное значение поля: {field}"
 
     return JSONResponse(
         status_code=422,
