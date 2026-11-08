@@ -16,6 +16,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"notifier/internal/bot"
+	"notifier/internal/db"
 	"notifier/internal/dicts"
 	"notifier/internal/model"
 	"notifier/internal/notify"
@@ -35,6 +36,13 @@ const (
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Пул БД создаётся первым и передаётся компонентам по мере перевода
+	// хранилищ на Postgres (issue #31, этап 2).
+	pool, err := db.Connect(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	opt, err := redis.ParseURL(env("REDIS_URL", "redis://localhost:6379/0"))
 	if err != nil {
@@ -95,6 +103,9 @@ func main() {
 	srv.Shutdown(shutdownCtx)
 	<-consumerDone
 	dispatcher.Flush(shutdownCtx)
+	if pool != nil {
+		pool.Close()
+	}
 	log.Println("stopped")
 }
 
