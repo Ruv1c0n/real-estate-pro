@@ -51,16 +51,21 @@ func main() {
 	defer redisClient.Close()
 
 	subs := store.NewMemory()
-	limiter := notify.NewMemoryLimiter(notificationsPerHour, time.Hour)
 	dictsClient := dicts.New(env("CORE_API_URL", "http://localhost:8000"))
 
-	// Журнал: в Postgres, когда БД доступна (постоянный дедуп, ФТ-3.5),
-	// иначе in-memory для режима без БД.
+	// Хранилища: в Postgres, когда БД доступна (журнал, лимит 30/час и
+	// очередь отложенных — ФТ-3.5, ТЗ 3.6), иначе in-memory для режима без БД.
 	var journal notify.Journal
+	var limiter notify.Limiter
+	var queue notify.DeferredQueue
 	if pool != nil {
 		journal = notify.NewPgJournal(pool)
+		limiter = notify.NewPgLimiter(pool, notificationsPerHour)
+		queue = notify.NewPgQueue(pool)
 	} else {
 		journal = notify.NewMemoryJournal()
+		limiter = notify.NewMemoryLimiter(notificationsPerHour, time.Hour)
+		queue = notify.NewMemoryQueue()
 	}
 
 	var sender notify.Sender
@@ -81,7 +86,7 @@ func main() {
 		}
 	}
 
-	dispatcher := notify.NewDispatcher(subs, journal, limiter, mode, sender)
+	dispatcher := notify.NewDispatcher(subs, journal, limiter, queue, mode, sender)
 	go dispatcher.RunFlusher(ctx, flushInterval)
 
 	// Ошибка создания consumer group делает сервис слепым — это фатально.

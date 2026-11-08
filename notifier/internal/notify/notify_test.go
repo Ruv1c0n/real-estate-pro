@@ -51,16 +51,17 @@ func (s *recordingSender) sent() []string {
 	return append([]string(nil), s.calls...)
 }
 
-func newTestDispatcher(limit int) (*Dispatcher, *recordingSender, *store.Memory, *MemoryLimiter) {
+func newTestDispatcher(limit int) (*Dispatcher, *recordingSender, *store.Memory, *MemoryLimiter, *MemoryQueue) {
 	sender := &recordingSender{}
 	subs := store.NewMemory()
 	journal := NewMemoryJournal()
 	limiter := NewMemoryLimiter(limit, time.Hour)
-	return NewDispatcher(subs, journal, limiter, ModeLog, sender.send), sender, subs, limiter
+	queue := NewMemoryQueue()
+	return NewDispatcher(subs, journal, limiter, queue, ModeLog, sender.send), sender, subs, limiter, queue
 }
 
 func TestHandleSendsOncePerChat(t *testing.T) {
-	d, sender, subs, _ := newTestDispatcher(1000)
+	d, sender, subs, _, _ := newTestDispatcher(1000)
 	subs.Add(model.Subscription{ChatID: 10, City: "Minsk"})
 	subs.Add(model.Subscription{ChatID: 10, Rooms: model.IntPtr(1)}) // тот же чат
 	subs.Add(model.Subscription{ChatID: 20, City: "Brest"})          // не совпал
@@ -74,7 +75,7 @@ func TestHandleSendsOncePerChat(t *testing.T) {
 }
 
 func TestHandleRedeliveryDeduplicated(t *testing.T) {
-	d, sender, subs, _ := newTestDispatcher(1000)
+	d, sender, subs, _, _ := newTestDispatcher(1000)
 	subs.Add(model.Subscription{ChatID: 10})
 
 	e := testEvent(1)
@@ -88,19 +89,19 @@ func TestHandleRedeliveryDeduplicated(t *testing.T) {
 
 func TestHandleDeferWhenLimitReached(t *testing.T) {
 	base := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
-	d, sender, subs, limiter := newTestDispatcher(2)
+	d, sender, subs, limiter, _ := newTestDispatcher(2)
 	limiter.nowFunc = func() time.Time { return base }
 	subs.Add(model.Subscription{ChatID: 10})
 
 	d.Handle(context.Background(), testEvent(1))
 	d.Handle(context.Background(), testEvent(2))
-	d.Handle(context.Background(), testEvent(3)) // сверх лимита — в отложенные
+	d.Handle(context.Background(), testEvent(3)) // сверх лимита — в очередь отложенных
 
 	if got := sender.sent(); len(got) != 2 {
 		t.Fatalf("sent = %v, want 2 немедленных", got)
 	}
 
-	// Окно освобождается — отложенное уходит.
+	// Окно освобождается — флешер доставляет отложенное.
 	limiter.nowFunc = func() time.Time { return base.Add(61 * time.Minute) }
 	d.Flush(context.Background())
 
@@ -110,7 +111,7 @@ func TestHandleDeferWhenLimitReached(t *testing.T) {
 }
 
 func TestHandleDifferentChatsHaveOwnLimits(t *testing.T) {
-	d, sender, subs, _ := newTestDispatcher(1)
+	d, sender, subs, _, _ := newTestDispatcher(1)
 	subs.Add(model.Subscription{ChatID: 10})
 	subs.Add(model.Subscription{ChatID: 20})
 
@@ -122,27 +123,30 @@ func TestHandleDifferentChatsHaveOwnLimits(t *testing.T) {
 	}
 }
 
-func TestLimiterSlidingWindow(t *testing.T) {
+func TestMemoryLimiterSlidingWindow(t *testing.T) {
 	base := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
 	l := NewMemoryLimiter(2, time.Hour)
 	l.nowFunc = func() time.Time { return base }
+	ctx := context.Background()
 
-	if !l.Allow(1) || !l.Allow(1) {
-		t.Fatal("первые два уведомления должны пройти")
+	if ok, err := l.Allow(ctx, 1, ModeLog); err != nil || !ok {
+		t.Fatalf("первое уведомление: %v, %v; want true", ok, err)
 	}
-	if l.Allow(1) {
+	if ok, _ := l.Allow(ctx, 1, ModeLog); !ok {
+		t.Fatal("второе уведомление должно пройти")
+	}
+	if ok, _ := l.Allow(ctx, 1, ModeLog); ok {
 		t.Fatal("третье за час не должно пройти")
 	}
 
+	// Режимы доставки считаются раздельно (contracts.md §2).
+	if ok, _ := l.Allow(ctx, 1, ModeTelegram); !ok {
+		t.Fatal("окно telegram не должно затрагиваться окном log")
+	}
+
 	l.nowFunc = func() time.Time { return base.Add(61 * time.Minute) }
-	if !l.Allow(1) {
+	if ok, _ := l.Allow(ctx, 1, ModeLog); !ok {
 		t.Fatal("после истечения окна слот должен освободиться")
-	}
-	if !l.Allow(1) {
-		t.Fatal("в новом окне второй слот ещё свободен")
-	}
-	if l.Allow(1) {
-		t.Fatal("в новом окне снова максимум два")
 	}
 }
 
@@ -198,6 +202,140 @@ func (m *mockJournal) Record(_ context.Context, chatID, listingID int64, _ strin
 	return nil
 }
 
+// mockLimiter — Limiter с управляемым ответом и ошибкой.
+type mockLimiter struct {
+	allowed bool
+	err     error
+}
+
+func (m *mockLimiter) Allow(context.Context, int64, string) (bool, error) {
+	return m.allowed, m.err
+}
+
+// mockQueue — DeferredQueue, записывающий вызовы.
+type mockQueue struct {
+	postponed   []DeferredJob
+	marks       []string // "chatID:listingID=status"
+	postponeErr error
+	popErr      error
+	markErr     error
+	popResult   []DeferredJob
+}
+
+func (m *mockQueue) Postpone(_ context.Context, chatID int64, e model.Event, _ string) error {
+	if m.postponeErr != nil {
+		return m.postponeErr
+	}
+	m.postponed = append(m.postponed, DeferredJob{ChatID: chatID, Event: e})
+	return nil
+}
+
+func (m *mockQueue) PopBatch(context.Context, int) ([]DeferredJob, error) {
+	if m.popErr != nil {
+		return nil, m.popErr
+	}
+	return m.popResult, nil
+}
+
+func (m *mockQueue) Mark(_ context.Context, job DeferredJob, _, status string) error {
+	if m.markErr != nil {
+		return m.markErr
+	}
+	m.marks = append(m.marks, fmt.Sprintf("%d:%d=%s", job.ChatID, job.Event.ID, status))
+	return nil
+}
+
+func TestHandlePostponesWhenLimitReached(t *testing.T) {
+	sender := &recordingSender{}
+	subs := store.NewMemory()
+	subs.Add(model.Subscription{ChatID: 10})
+	queue := &mockQueue{}
+	d := NewDispatcher(subs, newMockJournal(), &mockLimiter{allowed: false}, queue, ModeLog, sender.send)
+
+	d.Handle(context.Background(), testEvent(1))
+
+	if got := sender.sent(); len(got) != 0 {
+		t.Fatalf("sent = %v, want 0 (лимит исчерпан)", got)
+	}
+	if len(queue.postponed) != 1 || queue.postponed[0].ChatID != 10 || queue.postponed[0].Event.ID != 1 {
+		t.Fatalf("postponed = %+v, want одно задание 10:1", queue.postponed)
+	}
+}
+
+func TestHandleLimiterErrorPostpones(t *testing.T) {
+	// Ошибка лимитера трактуется как «слот занят»: задание откладывается,
+	// уведомление не теряется; Dispatcher не паникует.
+	sender := &recordingSender{}
+	subs := store.NewMemory()
+	subs.Add(model.Subscription{ChatID: 10})
+	queue := &mockQueue{}
+	d := NewDispatcher(subs, newMockJournal(), &mockLimiter{err: errors.New("db down")}, queue, ModeLog, sender.send)
+
+	d.Handle(context.Background(), testEvent(1))
+
+	if got := sender.sent(); len(got) != 0 {
+		t.Fatalf("sent = %v, want 0", got)
+	}
+	if len(queue.postponed) != 1 {
+		t.Fatalf("postponed = %+v, want одно задание в очереди", queue.postponed)
+	}
+}
+
+func TestFlushDeliversAndMarksSent(t *testing.T) {
+	e := testEvent(1)
+	queue := &mockQueue{popResult: []DeferredJob{{ChatID: 10, Event: e}}}
+	journal := newMockJournal()
+	sender := &recordingSender{}
+	subs := store.NewMemory()
+	d := NewDispatcher(subs, journal, &mockLimiter{allowed: true}, queue, ModeTelegram, sender.send)
+
+	d.Flush(context.Background())
+
+	if got := sender.sent(); len(got) != 1 || got[0] != "10:1" {
+		t.Fatalf("sent = %v, want 10:1", got)
+	}
+	if len(queue.marks) != 1 || queue.marks[0] != "10:1=sent" {
+		t.Fatalf("marks = %v, want [10:1=sent]", queue.marks)
+	}
+	if n := journal.records["sent/telegram"]; n != 1 {
+		t.Fatalf("записей журнала sent/telegram = %d, want 1", n)
+	}
+}
+
+func TestFlushRetriesWhenLimitReached(t *testing.T) {
+	e := testEvent(1)
+	queue := &mockQueue{popResult: []DeferredJob{{ChatID: 10, Event: e}}}
+	sender := &recordingSender{}
+	subs := store.NewMemory()
+	d := NewDispatcher(subs, newMockJournal(), &mockLimiter{allowed: false}, queue, ModeLog, sender.send)
+
+	d.Flush(context.Background())
+
+	if got := sender.sent(); len(got) != 0 {
+		t.Fatalf("sent = %v, want 0 (окно всё ещё полно)", got)
+	}
+	if len(queue.marks) != 1 || queue.marks[0] != "10:1=retry" {
+		t.Fatalf("marks = %v, want [10:1=retry]", queue.marks)
+	}
+}
+
+func TestFlushPopErrorNoPanic(t *testing.T) {
+	// Очередь недоступна: логируем и выходим, доставки и пометок нет.
+	queue := &mockQueue{popErr: errors.New("db down")}
+	sender := &recordingSender{}
+	subs := store.NewMemory()
+	d := NewDispatcher(subs, newMockJournal(), &mockLimiter{allowed: true}, queue, ModeLog, sender.send)
+
+	d.Flush(context.Background())
+
+	if got := sender.sent(); len(got) != 0 {
+		t.Fatalf("sent = %v, want 0", got)
+	}
+	if len(queue.marks) != 0 {
+		t.Fatalf("marks = %v, want пусто", queue.marks)
+	}
+}
+
 func TestHandleSentErrorStillDelivers(t *testing.T) {
 	// Журнал недоступен (Sent падает): Dispatcher не паникует, доставка
 	// продолжается — at-least-once допускает повтор (contracts.md §2).
@@ -205,7 +343,7 @@ func TestHandleSentErrorStillDelivers(t *testing.T) {
 	subs := store.NewMemory()
 	journal := newMockJournal()
 	journal.sentErr = errors.New("db down")
-	d := NewDispatcher(subs, journal, NewMemoryLimiter(10, time.Hour), ModeLog, sender.send)
+	d := NewDispatcher(subs, journal, &mockLimiter{allowed: true}, NewMemoryQueue(), ModeLog, sender.send)
 	subs.Add(model.Subscription{ChatID: 10})
 
 	d.Handle(context.Background(), testEvent(1))
@@ -222,7 +360,7 @@ func TestHandleRecordErrorNoPanic(t *testing.T) {
 	subs := store.NewMemory()
 	journal := newMockJournal()
 	journal.recordErr = errors.New("db down")
-	d := NewDispatcher(subs, journal, NewMemoryLimiter(10, time.Hour), ModeLog, sender.send)
+	d := NewDispatcher(subs, journal, &mockLimiter{allowed: true}, NewMemoryQueue(), ModeLog, sender.send)
 	subs.Add(model.Subscription{ChatID: 10})
 
 	d.Handle(context.Background(), testEvent(1))
@@ -239,7 +377,7 @@ func TestHandleRecordsStatusAndMode(t *testing.T) {
 	sender := &recordingSender{}
 	subs := store.NewMemory()
 	journal := newMockJournal()
-	d := NewDispatcher(subs, journal, NewMemoryLimiter(10, time.Hour), ModeTelegram, sender.send)
+	d := NewDispatcher(subs, journal, &mockLimiter{allowed: true}, NewMemoryQueue(), ModeTelegram, sender.send)
 	subs.Add(model.Subscription{ChatID: 10})
 
 	d.Handle(context.Background(), testEvent(1))
@@ -255,26 +393,5 @@ func TestHandleRecordsStatusAndMode(t *testing.T) {
 
 	if n := journal.records["unknown/telegram"]; n != 1 {
 		t.Fatalf("записей unknown/telegram = %d, want 1", n)
-	}
-}
-
-func TestFlushDropsAlreadySent(t *testing.T) {
-	d, sender, subs, _ := newTestDispatcher(1)
-	subs.Add(model.Subscription{ChatID: 10})
-
-	d.Handle(context.Background(), testEvent(1))
-	d.Handle(context.Background(), testEvent(2)) // отложено
-
-	// Событие 2 успело уйти другим путём — в журнале.
-	e2 := testEvent(2)
-	if err := d.journal.Record(context.Background(), 10, 2, e2.EventID, e2, StatusSent, ModeLog); err != nil {
-		t.Fatalf("Record: %v", err)
-	}
-	d.Flush(context.Background())
-
-	for _, c := range sender.sent() {
-		if c == "10:2" {
-			t.Fatal("отложенное задание, уже отправленное другим путём, должно быть снято")
-		}
 	}
 }
