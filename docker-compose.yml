@@ -60,7 +60,14 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/${POSTGRES_DB:-realestate}
+      # Данные для подключения передаются отдельными переменными:
+      # core-api сам собирает адрес и экранирует спецсимволы пароля,
+      # поэтому знак @ и другие в POSTGRES_PASSWORD не ломают URL.
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: "${POSTGRES_USER:-app}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-app}"
+      POSTGRES_DB: "${POSTGRES_DB:-realestate}"
       REDIS_URL: redis://redis:6379/0
       CORE_API_LOG_LEVEL: "${CORE_API_LOG_LEVEL:-INFO}"
     depends_on:
@@ -68,11 +75,13 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    # В образе python-slim нет wget/curl — проверяем /health/live
-    # средствами python. Liveness-эндпоинт всегда отвечает 200, поэтому
-    # healthcheck означает «процесс и uvicorn живы», а не «зависимости ок».
+    # В образе python-slim нет wget/curl — проверяем /health/ready
+    # средствами python. Эндпоинт отвечает 200, только когда доступны
+    # Postgres и Redis, иначе 503 (urlopen падает — контейнер unhealthy).
+    # Так «healthy» означает полную готовность, а не живой процесс,
+    # что важно для depends_on у collector и notifier.
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://127.0.0.1:8000/health/live', timeout=2)\""]
+      test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)\""]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -102,7 +111,14 @@ services:
       - "8080:8080"
     environment:
       REDIS_URL: redis://redis:6379/0
-      DATABASE_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/${POSTGRES_DB:-realestate}
+      # notifier пока не работает с Postgres (этап 2 issue #31);
+      # данные переданы заранее, как у core-api — отдельными
+      # переменными, чтобы спецсимволы пароля не ломали подключение.
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: "${POSTGRES_USER:-app}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-app}"
+      POSTGRES_DB: "${POSTGRES_DB:-realestate}"
       CORE_API_URL: http://core-api:8000
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       ADMIN_KEY: ${ADMIN_KEY:-}
