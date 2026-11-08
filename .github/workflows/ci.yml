@@ -29,6 +29,52 @@ jobs:
       - run: go vet ./...
       - run: go test ./... -race
 
+  # Интеграционные Pg-тесты notifier (ФТ-3.5, 3.6): Journal/Queue/Limiter,
+  # store.Postgres, раннер миграций и /health/ready в db-режиме. Без
+  # NOTIFIER_TEST_DSN/NOTIFIER_TEST_REDIS_ADDR они в job notifier скипаются,
+  # поэтому зелёный CI не означал, что Pg-код проверен. Здесь поднимаем
+  # Postgres и Redis теми же образами и кредами, что в docker-compose.yml
+  # (дефолты ${POSTGRES_USER:-app} и т.д.), DSN — keyword-value, как его
+  # собирает internal/db и ждут TestMain в *_test.go.
+  notifier-pg-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: notifier
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: realestate
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U app -d realestate"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: notifier/go.mod
+      - name: go test -race (с живыми Postgres и Redis)
+        env:
+          NOTIFIER_TEST_DSN: "host=127.0.0.1 port=5432 user=app password=app dbname=realestate sslmode=disable"
+          NOTIFIER_TEST_REDIS_ADDR: 127.0.0.1:6379
+        run: go test -race ./...
+
   # Правило ТЗ 6.5: секреты только через .env — ловим случайные коммиты токенов
   gitleaks:
     runs-on: ubuntu-latest
