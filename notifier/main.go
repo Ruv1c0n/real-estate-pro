@@ -62,15 +62,17 @@ func main() {
 	redisClient := redis.NewClient(opt)
 	defer redisClient.Close()
 
-	subs := store.NewMemory()
+	var subs store.Store = store.NewMemory()
 	dictsClient := dicts.New(env("CORE_API_URL", "http://localhost:8000"))
 
-	// Хранилища: в Postgres, когда БД доступна (журнал, лимит 30/час и
-	// очередь отложенных — ФТ-3.5, ТЗ 3.6), иначе in-memory для режима без БД.
+	// Хранилища: в Postgres, когда БД доступна (подписки и users — ФТ-3.1,
+	// ФТ-3.2; журнал, лимит 30/час и очередь отложенных — ФТ-3.5, ТЗ 3.6),
+	// иначе in-memory для режима без БД.
 	var journal notify.Journal
 	var limiter notify.Limiter
 	var queue notify.DeferredQueue
 	if pool != nil {
+		subs = store.NewPostgres(pool)
 		journal = notify.NewPgJournal(pool)
 		limiter = notify.NewPgLimiter(pool, notificationsPerHour)
 		queue = notify.NewPgQueue(pool)
