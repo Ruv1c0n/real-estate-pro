@@ -6,6 +6,11 @@ on:
   push:
     branches: [main]
 
+# Новый пуш в ту же ветку отменяет устаревший прогон — экономия минут
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   notifier:
     runs-on: ubuntu-latest
