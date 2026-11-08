@@ -8,6 +8,11 @@ def clean_settings_env(monkeypatch):
     names = [
         "DATABASE_URL",
         "REDIS_URL",
+        "POSTGRES_USER",
+        "POSTGRES_PASSWORD",
+        "POSTGRES_HOST",
+        "POSTGRES_PORT",
+        "POSTGRES_DB",
         "CORE_API_DATABASE_URL",
         "CORE_API_REDIS_URL",
         "CORE_API_APP_NAME",
@@ -25,6 +30,28 @@ def test_database_url_accepts_asyncpg(monkeypatch):
     settings = Settings(_env_file=None)
 
     assert settings.database_url == url
+
+
+def test_database_url_built_from_parts_escapes_special_characters(monkeypatch):
+    monkeypatch.setenv("POSTGRES_USER", "app")
+    monkeypatch.setenv("POSTGRES_PASSWORD", "p@ss:word/s pace")
+    monkeypatch.setenv("POSTGRES_HOST", "postgres")
+    monkeypatch.setenv("POSTGRES_DB", "realestate")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.database_url == (
+        "postgresql+asyncpg://app:p%40ss%3Aword%2Fs%20pace@postgres:5432/realestate"
+    )
+
+
+def test_database_url_takes_priority_over_parts(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://app:app@localhost:5433/x")
+    monkeypatch.setenv("POSTGRES_HOST", "postgres")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.database_url == "postgresql+asyncpg://app:app@localhost:5433/x"
 
 
 @pytest.mark.parametrize(
