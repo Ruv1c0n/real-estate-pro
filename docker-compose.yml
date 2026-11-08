@@ -1,22 +1,37 @@
+# Единая ротация логов: stream-режим collector'а и воркеры notifier
+# на демо-прогоне могут надуть логи до гигабайт.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   postgres:
     image: postgres:16
+    restart: unless-stopped
+    logging: *default-logging
     environment:
-      POSTGRES_USER: app
-      POSTGRES_PASSWORD: app
-      POSTGRES_DB: realestate
+      POSTGRES_USER: "${POSTGRES_USER:-app}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-app}"
+      POSTGRES_DB: "${POSTGRES_DB:-realestate}"
     ports:
-      - "5432:5432"
+      # 127.0.0.1 — база нужна на хосте только для отладки, наружу в LAN
+      # её не светим; сервисы ходят через docker-сеть.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app -d realestate"]
+      # $$ — переменные вычисляются внутри контейнера, а не compose-интерполяцией.
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
       timeout: 3s
       retries: 10
 
   redis:
     image: redis:7
+    restart: unless-stopped
+    logging: *default-logging
     # contracts.md §2: volume, AOF appendfsync everysec, noeviction —
     # необработанные события стрима не теряются и не вытесняются.
     command:
@@ -28,7 +43,8 @@ services:
       - --maxmemory-policy
       - noeviction
     ports:
-      - "6379:6379"
+      # 127.0.0.1 — как у postgres: отладка с хоста, без доступа из LAN.
+      - "127.0.0.1:6379:6379"
     volumes:
       - redisdata:/data
     healthcheck:
@@ -39,10 +55,12 @@ services:
 
   core-api:
     build: ./core-api
+    restart: unless-stopped
+    logging: *default-logging
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql+asyncpg://app:app@postgres:5432/realestate
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/${POSTGRES_DB:-realestate}
       REDIS_URL: redis://redis:6379/0
       CORE_API_LOG_LEVEL: "${CORE_API_LOG_LEVEL:-INFO}"
     depends_on:
@@ -50,9 +68,20 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # В образе python-slim нет wget/curl — проверяем /health/live
+    # средствами python. Liveness-эндпоинт всегда отвечает 200, поэтому
+    # healthcheck означает «процесс и uvicorn живы», а не «зависимости ок».
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://127.0.0.1:8000/health/live', timeout=2)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
 
   collector:
     build: ./collector
+    restart: unless-stopped
+    logging: *default-logging
     ports:
       - "8001:8001"
     environment:
@@ -60,15 +89,20 @@ services:
       REDIS_URL: redis://redis:6379/0
       MOCK_MODE: "true"
     depends_on:
-      - core-api
+      core-api:
+        condition: service_healthy
+    # TODO(#17): healthcheck добавим вместе с реализацией collector
+    # (сейчас в образе только Dockerfile-заглушка — проверять нечего).
 
   notifier:
     build: ./notifier
+    restart: unless-stopped
+    logging: *default-logging
     ports:
       - "8080:8080"
     environment:
       REDIS_URL: redis://redis:6379/0
-      DATABASE_URL: postgresql://app:app@postgres:5432/realestate
+      DATABASE_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/${POSTGRES_DB:-realestate}
       CORE_API_URL: http://core-api:8000
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       ADMIN_KEY: ${ADMIN_KEY:-}
@@ -77,6 +111,17 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      # notifier ходит в справочники Core API — ждём его готовности.
+      core-api:
+        condition: service_healthy
+    # alpine содержит busybox wget. GET /health всегда отвечает 200
+    # (degraded отражается только в теле), так что проверяется живость процесса.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
 volumes:
   pgdata:
