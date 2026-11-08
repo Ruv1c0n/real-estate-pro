@@ -18,6 +18,7 @@ import (
 	"notifier/internal/bot"
 	"notifier/internal/db"
 	"notifier/internal/dicts"
+	"notifier/internal/migrate"
 	"notifier/internal/model"
 	"notifier/internal/notify"
 	"notifier/internal/store"
@@ -42,6 +43,16 @@ func main() {
 	pool, err := db.Connect(ctx)
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	// Миграции накатываются до всего остального: consumer, бот и HTTP-сервер
+	// не должны прочесть пустые таблицы. Ошибка применения фатальна — без
+	// схемы notifier работать не может (применение при деплое — зона
+	// Даниила, раннер схему не меняет).
+	if pool != nil {
+		if err := migrate.Apply(ctx, pool); err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	opt, err := redis.ParseURL(env("REDIS_URL", "redis://localhost:6379/0"))
