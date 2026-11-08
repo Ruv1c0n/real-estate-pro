@@ -1,0 +1,47 @@
+# .github/dependabot.yml
+# Еженедельные обновления зависимостей; PR от Dependabot проходят тот же CI
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /notifier
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(notifier)"
+    labels: [dependencies]
+
+  - package-ecosystem: docker
+    directory: /notifier
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(notifier)"
+    labels: [dependencies]
+
+  # заглушки core-api/collector: пока образы тривиальные, обновления редкие
+  - package-ecosystem: docker
+    directory: /core-api
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "chore(core-api)"
+    labels: [dependencies]
+
+  - package-ecosystem: docker
+    directory: /collector
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "chore(collector)"
+    labels: [dependencies]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(ci)"
+    labels: [dependencies]
