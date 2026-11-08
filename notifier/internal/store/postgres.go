@@ -42,6 +42,15 @@ func (p *Postgres) Add(s model.Subscription) model.Subscription {
 }
 
 func (p *Postgres) add(ctx context.Context, s model.Subscription) (model.Subscription, error) {
+	// FK subscriptions.chat_id → users.chat_id: пользователь должен существовать.
+	// Создаём запись сами (ON CONFLICT DO NOTHING — идемпотентно), чтобы
+	// /subscribe работал и без предварительного /start.
+	if _, err := p.pool.Exec(ctx,
+		`INSERT INTO notifier.users (chat_id) VALUES ($1) ON CONFLICT (chat_id) DO NOTHING`,
+		s.ChatID); err != nil {
+		return model.Subscription{}, fmt.Errorf("ensure user: %w", err)
+	}
+
 	// NULLIF превращает пустую строку модели в NULL («любое значение»);
 	// nil-указатели pgx записывает как NULL без преобразований.
 	row := p.pool.QueryRow(ctx, `
@@ -151,6 +160,34 @@ func (p *Postgres) all(ctx context.Context) ([]model.Subscription, error) {
 		return nil, fmt.Errorf("select all subscriptions: %w", err)
 	}
 	return collectSubscriptions(rows)
+}
+
+// EnsureUser создаёт запись пользователя (/start, ФТ-3.1); повторный вызов —
+// no-op, без ошибки.
+func (p *Postgres) EnsureUser(chatID int64) error {
+	_, err := p.pool.Exec(context.Background(),
+		`INSERT INTO notifier.users (chat_id) VALUES ($1) ON CONFLICT (chat_id) DO NOTHING`,
+		chatID)
+	if err != nil {
+		return fmt.Errorf("ensure user: %w", err)
+	}
+	return nil
+}
+
+// DeleteUser удаляет пользователя (/stop, ФТ-3.1): БД каскадом чистит его
+// подписки и журнал (ON DELETE CASCADE). Число подписок считаем ДО удаления —
+// каскад их сотрёт, а боту нужен ответ «удалено подписок — N».
+func (p *Postgres) DeleteUser(chatID int64) (int, error) {
+	ctx := context.Background()
+	n, err := p.countForChat(ctx, chatID)
+	if err != nil {
+		return 0, fmt.Errorf("count subscriptions before delete user: %w", err)
+	}
+	if _, err := p.pool.Exec(ctx,
+		`DELETE FROM notifier.users WHERE chat_id = $1`, chatID); err != nil {
+		return 0, fmt.Errorf("delete user: %w", err)
+	}
+	return n, nil
 }
 
 // collectSubscriptions дочитывает выборку подписок в порядке ORDER BY.
