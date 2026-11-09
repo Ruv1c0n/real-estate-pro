@@ -58,10 +58,13 @@ def test_pagination_beyond_limits():
 
 
 def test_sorted_by_published_desc():
+    from datetime import datetime
+
     items = client.get("/search/listings", params={"size": 100}).json()["items"]
-    dates = [it["published_at"] for it in items]
+    dates = [datetime.fromisoformat(it["published_at"]) for it in items]  # смещения разные — сравниваем datetime
     assert dates == sorted(dates, reverse=True)
-    assert all(ISO_OFFSET.match(d) for d in dates)
+    raw = [it["published_at"] for it in items]
+    assert all(ISO_OFFSET.match(d) for d in raw)
 
 
 def test_filters():

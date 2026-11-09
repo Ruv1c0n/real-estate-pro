@@ -79,7 +79,8 @@ def _place(rng: random.Random) -> Place:
     return Place(c["code"], rng.choice(c["cities"]), c["currency"], c["offset"])
 
 
-def _make_item(rng: random.Random, seq: int, now: datetime) -> dict:
+def _make_item(rng: random.Random, seq: int, now: datetime, prefix: str = "seed",
+               fresh: bool = False) -> dict:
     place = _place(rng)
     deal_type = rng.choice(["rent", "sale"])
 
@@ -96,10 +97,11 @@ def _make_item(rng: random.Random, seq: int, now: datetime) -> dict:
     wrap = rng.choice(HTML_WRAPS)
     description = wrap.format(", ".join(parts))
 
-    published = now - timedelta(seconds=rng.uniform(0, 90 * 24 * 3600))
+    # fresh — «только что опубликовано» (stream-режим); иначе разброс за 90 дней.
+    published = now if fresh else now - timedelta(seconds=rng.uniform(0, 90 * 24 * 3600))
 
     return {
-        "id": f"seed-{seq:06d}",
+        "id": f"{prefix}-{seq:06d}",
         "deal_type": deal_type,
         "title": (
             f"Студия, {area} м², {floor}/{floors} эт."
@@ -116,11 +118,11 @@ def _make_item(rng: random.Random, seq: int, now: datetime) -> dict:
         "floor": floor,
         "description": description,
         "images": [
-            f"http://mock-avito:8002/img/{seq:06d}_{k}.jpg"
+            f"http://mock-avito:8002/img/{prefix}-{seq:06d}_{k}.jpg"
             for k in range(1, rng.randint(1, 3) + 1)
         ],
         "published_at": published.isoformat(timespec="seconds").replace("+00:00", place.offset),
-        "url": f"http://mock-avito:8002/item/{seq:06d}",
+        "url": f"http://mock-avito:8002/item/{prefix}-{seq:06d}",
         "seller": {"name": rng.choice(SELLERS), "rating": round(rng.uniform(3.5, 5.0), 1)},
     }
 
@@ -130,3 +132,11 @@ def generate_batch(count: int, seed: int) -> list[dict]:
     rng = random.Random(seed)
     now = datetime.now(timezone.utc)
     return [_make_item(rng, i, now) for i in range(1, count + 1)]
+
+
+def generate_stream_item(seq: int, rng: random.Random) -> dict:
+    """Новое объявление с уникальным ID (MOCK_PUBLISH_MODE=stream).
+
+    published_at — текущий момент: объявление «только что опубликовано».
+    """
+    return _make_item(rng, seq, datetime.now(timezone.utc), prefix="gen", fresh=True)
