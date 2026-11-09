@@ -21,12 +21,16 @@ def stream_app():
     # Перезагружаем модуль в stream-режиме с ускоренным интервалом публикации.
     import os
 
+    from app.state import state as st
+
     os.environ["MOCK_PUBLISH_MODE"] = "stream"
     os.environ["MOCK_STREAM_MIN_SEC"] = "0.01"
     os.environ["MOCK_STREAM_MAX_SEC"] = "0.03"
     reloaded = importlib.reload(main_mod)
+    st["mode"] = "stream"  # mode живёт в state-словаре, reload его не меняет
     with TestClient(reloaded.app) as c:  # контекст запускает фоновую публикацию
         yield c
+    st["mode"] = "batch"
     os.environ["MOCK_PUBLISH_MODE"] = "batch"
     os.environ.pop("MOCK_STREAM_MIN_SEC", None)
     os.environ.pop("MOCK_STREAM_MAX_SEC", None)

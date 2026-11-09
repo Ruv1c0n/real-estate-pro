@@ -140,3 +140,26 @@ def generate_stream_item(seq: int, rng: random.Random) -> dict:
     published_at — текущий момент: объявление «только что опубликовано».
     """
     return _make_item(rng, seq, datetime.now(timezone.utc), prefix="gen", fresh=True)
+
+
+DEFECTS = {
+    "price": lambda it: it.update({"price": 0}),                # цена >0 — 422
+    "city": lambda it: it.update({"city": "Atlantis"}),         # неизвестный город
+    "deal_type": lambda it: it.update({"deal_type": "exchange"}),  # вне rent/sale
+    "rooms": lambda it: it.update({"rooms": -1}),               # комнаты <0
+}
+
+
+def make_broken(item: dict) -> dict:
+    """Ломает одно поле объявления — для проверки 422-ветки (ТЗ 3.1)."""
+    broken = dict(item)
+    rng = random.Random(item["id"])
+    rng.choice(list(DEFECTS.values()))(broken)
+    return broken
+
+
+def mix_broken(items: list[dict], rate: float) -> list[dict]:
+    """Подмешивает долю rate ломаных объявлений в набор."""
+    if rate <= 0:
+        return items
+    return [make_broken(it) if random.random() < rate else it for it in items]

@@ -3,8 +3,8 @@
 import pytest
 from fastapi.testclient import TestClient
 
-import app.main as main_mod
 from app.main import app
+from app.state import state as st
 
 client = TestClient(app)
 
@@ -12,9 +12,9 @@ client = TestClient(app)
 @pytest.fixture(autouse=True)
 def _reset_chaos():
     # Серии хаоса не должны перетекать между тестами.
-    main_mod.chaos_left.clear()
+    st["chaos_left"].clear()
     yield
-    main_mod.chaos_left.clear()
+    st["chaos_left"].clear()
 
 
 def test_chaos_429_then_success():

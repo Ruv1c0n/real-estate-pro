@@ -117,6 +117,8 @@ services:
     environment:
       MOCK_PUBLISH_MODE: "${MOCK_PUBLISH_MODE:-batch}"
       MOCK_SEED: "${MOCK_SEED:-42}"
+      # Пустое значение выключает /admin (консоль и ручки управления).
+      MOCK_ADMIN_KEY: "${MOCK_ADMIN_KEY:-mock-admin}"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://127.0.0.1:8002/health', timeout=2)\""]
       interval: 10s
