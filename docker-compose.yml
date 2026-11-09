@@ -112,8 +112,10 @@ services:
     logging: *default-logging
     profiles:
       - mock
+    # Мок нужен только с локальной машины, а дефолтный ключ лежит в репо —
+    # наружу (LAN) порт не публикуем.
     ports:
-      - "8002:8002"
+      - "127.0.0.1:8002:8002"
     environment:
       MOCK_PUBLISH_MODE: "${MOCK_PUBLISH_MODE:-batch}"
       MOCK_SEED: "${MOCK_SEED:-42}"

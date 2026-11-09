@@ -11,6 +11,7 @@ from __future__ import annotations
 import hmac
 import time
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
@@ -26,8 +27,13 @@ router = APIRouter(prefix="/admin")
 def require_admin(request: Request) -> None:
     key = admin_key()
     if not key:
-        raise HTTPException(status_code=404, detail="admin is disabled (MOCK_ADMIN_KEY is empty)")
-    if not hmac.compare_digest(request.headers.get("x-admin-key", ""), key):
+        raise HTTPException(
+            status_code=404, detail="admin is disabled (MOCK_ADMIN_KEY is empty)"
+        )
+    # Сравниваем байты: h11 пропускает не-ASCII (latin-1) в заголовках, а
+    # compare_digest на таких строках падает TypeError и даёт 500 вместо 403.
+    supplied = request.headers.get("x-admin-key", "").encode("utf-8", "replace")
+    if not hmac.compare_digest(supplied, key.encode("utf-8", "replace")):
         raise HTTPException(status_code=403, detail="invalid X-Admin-Key")
 
 
@@ -36,7 +42,7 @@ class ModeBody(BaseModel):
 
 
 class ChaosBody(BaseModel):
-    code: int = Field(0)
+    code: Literal[0, 429, 500] = Field(0)
     every: int = Field(5, ge=1, le=100)
 
 
@@ -96,8 +102,6 @@ def admin_mode(request: Request, body: ModeBody):
 
 @router.post("/chaos", dependencies=[Depends(require_admin)])
 def admin_chaos(request: Request, body: ChaosBody):
-    if body.code not in (0, 429, 500):
-        raise HTTPException(status_code=422, detail="code must be 0, 429 or 500")
     state["chaos_code"] = body.code
     state["chaos_every"] = body.every
     state["chaos_counter"] = 0
@@ -128,7 +132,9 @@ def admin_reset(request: Request, body: ResetBody):
     from .main import reset_items
 
     reset_items(body.seed if body.seed is not None else state["seed"])
-    return _respond(request, {"ok": True, "seed": state["seed"], "total": _snapshot()["total"]})
+    return _respond(
+        request, {"ok": True, "seed": state["seed"], "total": _snapshot()["total"]}
+    )
 
 
 def _fmt_uptime(seconds: int) -> str:

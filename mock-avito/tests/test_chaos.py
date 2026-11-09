@@ -1,10 +1,9 @@
 """Хаос-режим для проверки ретраев collector'а (contracts.md, раздел 4)."""
 
 import pytest
-from fastapi.testclient import TestClient
-
 from app.main import app
 from app.state import state as st
+from fastapi.testclient import TestClient
 
 client = TestClient(app)
 
@@ -47,7 +46,17 @@ def test_chaos_independent_per_code():
     r2 = client.get("/search/listings", params={"fail": 500, "fail_times": 2})
     assert r1.status_code == 429 and r2.status_code == 500
     # у каждой серии остался один сбой
-    assert client.get("/search/listings", params={"fail": 500, "fail_times": 2}).status_code == 500
-    assert client.get("/search/listings", params={"fail": 429, "fail_times": 2}).status_code == 429
+    assert (
+        client.get(
+            "/search/listings", params={"fail": 500, "fail_times": 2}
+        ).status_code
+        == 500
+    )
+    assert (
+        client.get(
+            "/search/listings", params={"fail": 429, "fail_times": 2}
+        ).status_code
+        == 429
+    )
     # после исчерпания обе серии — успехи
     assert client.get("/search/listings").status_code == 200

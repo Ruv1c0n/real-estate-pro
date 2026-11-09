@@ -7,11 +7,10 @@ MOCK_PUBLISH_MODE=stream, поэтому идёт последним (после
 import importlib
 import time
 
+import app.generator as generator_mod
+import app.main as main_mod
 import pytest
 from fastapi.testclient import TestClient
-
-import app.main as main_mod
-import app.generator as generator_mod
 
 client = TestClient(main_mod.app)
 

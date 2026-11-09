@@ -19,17 +19,17 @@ import os
 import random
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError, StarletteHTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from .state import state
 from .admin import router as admin_router
-from .generator import generate_batch, generate_stream_item, make_broken, mix_broken  # noqa: F401 (mix_broken — для app.admin)
+from .generator import generate_batch, generate_stream_item, make_broken, mix_broken
+from .state import state
 
 MOCK_COUNT = int(os.getenv("MOCK_COUNT", "520"))
 # Интервал публикации в stream-режиме; сужается тестами, контракт — 5–30 с.
@@ -71,7 +71,7 @@ def reset_items(seed: int) -> None:
     batch = generate_batch(MOCK_COUNT, seed)
     bad = state["bad_data"]
     if bad["enabled"]:
-        batch = mix_broken(batch, bad["rate"])
+        batch = mix_broken(batch, bad["rate"], seed)
     items.clear()
     items.extend(batch)
     items_by_id.clear()
@@ -85,7 +85,9 @@ def reset_items(seed: int) -> None:
 async def _publish_loop() -> None:
     # Живёт всегда; публикует только в режиме stream.
     while True:
-        await asyncio.sleep(stream_rng.uniform(MOCK_STREAM_MIN_SEC, MOCK_STREAM_MAX_SEC))
+        await asyncio.sleep(
+            stream_rng.uniform(MOCK_STREAM_MIN_SEC, MOCK_STREAM_MAX_SEC)
+        )
         if state["mode"] == "stream":
             _publish_one()
 
@@ -99,7 +101,9 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="mock-avito", version="0.2.0", lifespan=lifespan)
 
-app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
+app.mount(
+    "/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static"
+)
 app.include_router(admin_router)
 
 LIMITED_PATHS = {"/search/listings", "/item"}
@@ -109,10 +113,16 @@ def _fail_response(fail: int) -> JSONResponse:
     if fail == 429:
         return JSONResponse(
             status_code=429,
-            content={"error": "rate_limited", "message": "mock-avito: too many requests"},
+            content={
+                "error": "rate_limited",
+                "message": "mock-avito: too many requests",
+            },
             headers={"Retry-After": "2"},
         )
-    return JSONResponse(status_code=500, content={"error": "internal_error", "message": "mock-avito chaos"})
+    return JSONResponse(
+        status_code=500,
+        content={"error": "internal_error", "message": "mock-avito chaos"},
+    )
 
 
 @app.middleware("http")
@@ -141,7 +151,10 @@ async def ops_middleware(request: Request, call_next):
             retry = max(1, int(60 - (now - state["rate_window"][0])) + 1)
             return JSONResponse(
                 status_code=429,
-                content={"error": "rate_limited", "message": "mock-avito: rate limit exceeded"},
+                content={
+                    "error": "rate_limited",
+                    "message": "mock-avito: rate limit exceeded",
+                },
                 headers={"Retry-After": str(retry)},
             )
         state["rate_window"].append(now)
@@ -156,11 +169,15 @@ async def ops_middleware(request: Request, call_next):
 
 
 def json_error(status: int, error: str, message: str) -> JSONResponse:
-    return JSONResponse(status_code=status, content={"error": error, "message": message})
+    return JSONResponse(
+        status_code=status, content={"error": error, "message": message}
+    )
 
 
 @app.exception_handler(RequestValidationError)
-async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+async def validation_error_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
     # Формат ошибок JSON API — {error, message}, как в contracts.md.
     details = "; ".join(
         f"{'.'.join(map(str, e['loc'][1:]))}: {e['msg']}" for e in exc.errors()[:3]
@@ -169,9 +186,18 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 
 
 @app.exception_handler(StarletteHTTPException)
-async def http_error_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
-    names = {404: "not_found", 403: "forbidden", 401: "unauthorized", 503: "unavailable"}
-    return json_error(exc.status_code, names.get(exc.status_code, "error"), str(exc.detail))
+async def http_error_handler(
+    request: Request, exc: StarletteHTTPException
+) -> JSONResponse:
+    names = {
+        404: "not_found",
+        403: "forbidden",
+        401: "unauthorized",
+        503: "unavailable",
+    }
+    return json_error(
+        exc.status_code, names.get(exc.status_code, "error"), str(exc.detail)
+    )
 
 
 @app.get("/health")
@@ -227,7 +253,9 @@ def search_listings(
     # Свежие объявления первыми — как на источниках публикаций.
     # published_at в данных со смещениями (+03:00 и др.): строковая
     # сортировка перепутала бы порядки, сравниваем как datetime.
-    found = sorted(found, key=lambda it: datetime.fromisoformat(it["published_at"]), reverse=True)
+    found = sorted(
+        found, key=lambda it: datetime.fromisoformat(it["published_at"]), reverse=True
+    )
     start = (page - 1) * size
     return {
         "items": found[start : start + size],
@@ -243,3 +271,19 @@ def get_item(item_id: str):
     if item is None:
         raise HTTPException(status_code=404, detail="not found")
     return item
+
+
+# Поля images ссылаются на /img/... — отдаём SVG-заглушку, чтобы ссылки
+# из данных не вели на 404 (боевые картинки не имитируются).
+_PLACEHOLDER_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="320" height="240">'
+    '<rect width="100%" height="100%" fill="#2b3038"/>'
+    '<text x="50%" y="50%" fill="#8b949e" font-family="sans-serif" font-size="16" '
+    'text-anchor="middle" dominant-baseline="middle">mock image</text>'
+    "</svg>"
+)
+
+
+@app.get("/img/{name}")
+def image(name: str):
+    return Response(content=_PLACEHOLDER_SVG, media_type="image/svg+xml")

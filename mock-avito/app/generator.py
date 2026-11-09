@@ -9,21 +9,36 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 # Страна: (код ISO alpha-2, валюта, смещение UTC для published_at, города).
 # Смещения — зимние; данные синтетические, точность таймзон не требуется.
 COUNTRIES: list[dict] = [
-    {"code": "BY", "currency": "BYN", "offset": "+03:00",
-     "cities": ["Minsk", "Brest", "Grodno"]},
-    {"code": "RU", "currency": "RUB", "offset": "+03:00",
-     "cities": ["Moscow", "Saint Petersburg", "Kazan"]},
-    {"code": "PL", "currency": "PLN", "offset": "+01:00",
-     "cities": ["Warsaw", "Krakow", "Gdansk"]},
-    {"code": "UA", "currency": "UAH", "offset": "+02:00",
-     "cities": ["Kyiv", "Lviv"]},
-    {"code": "KZ", "currency": "KZT", "offset": "+05:00",
-     "cities": ["Almaty", "Astana"]},
+    {
+        "code": "BY",
+        "currency": "BYN",
+        "offset": "+03:00",
+        "cities": ["Minsk", "Brest", "Grodno"],
+    },
+    {
+        "code": "RU",
+        "currency": "RUB",
+        "offset": "+03:00",
+        "cities": ["Moscow", "Saint Petersburg", "Kazan"],
+    },
+    {
+        "code": "PL",
+        "currency": "PLN",
+        "offset": "+01:00",
+        "cities": ["Warsaw", "Krakow", "Gdansk"],
+    },
+    {"code": "UA", "currency": "UAH", "offset": "+02:00", "cities": ["Kyiv", "Lviv"]},
+    {
+        "code": "KZ",
+        "currency": "KZT",
+        "offset": "+05:00",
+        "cities": ["Almaty", "Astana"],
+    },
 ]
 
 # Диапазоны цен (rent, sale) в валюте страны и шаг округления.
@@ -36,17 +51,33 @@ PRICE_RANGES: dict[str, tuple[tuple[int, int], tuple[int, int], int]] = {
 }
 
 STREETS = [
-    "Притыцкого", "Независимости", "Советская", "Пушкина", "Ленина",
-    "Гагарина", "Космонавтов", "Мира", "Зелёная", "Садовая",
+    "Притыцкого",
+    "Независимости",
+    "Советская",
+    "Пушкина",
+    "Ленина",
+    "Гагарина",
+    "Космонавтов",
+    "Мира",
+    "Зелёная",
+    "Садовая",
 ]
 
 # Локальное написание города для address (city в данных — каноническое латинское).
 CITY_LOCAL = {
-    "Minsk": "Минск", "Brest": "Брест", "Grodno": "Гродно",
-    "Moscow": "Москва", "Saint Petersburg": "Санкт-Петербург", "Kazan": "Казань",
-    "Warsaw": "Варшава", "Krakow": "Краков", "Gdansk": "Гданьск",
-    "Kyiv": "Киев", "Lviv": "Львов",
-    "Almaty": "Алматы", "Astana": "Астана",
+    "Minsk": "Минск",
+    "Brest": "Брест",
+    "Grodno": "Гродно",
+    "Moscow": "Москва",
+    "Saint Petersburg": "Санкт-Петербург",
+    "Kazan": "Казань",
+    "Warsaw": "Варшава",
+    "Krakow": "Краков",
+    "Gdansk": "Гданьск",
+    "Kyiv": "Киев",
+    "Lviv": "Львов",
+    "Almaty": "Алматы",
+    "Astana": "Астана",
 }
 
 SELLERS = ["Иван", "Мария", "Алексей", "Ольга", "Дмитрий", "Анна", "Сергей", "Елена"]
@@ -63,7 +94,7 @@ DESCRIPTION_PARTS = [
 ]
 
 # Обёртки описания: иногда с HTML-фрагментами — для проверки очистки у адаптера.
-HTML_WRAPS = ["<b>{}</b>", "<i>{}</i>", "<span style=\"color:red\">{}</span>", "{}"]
+HTML_WRAPS = ["<b>{}</b>", "<i>{}</i>", '<span style="color:red">{}</span>', "{}"]
 
 
 @dataclass(frozen=True)
@@ -79,8 +110,13 @@ def _place(rng: random.Random) -> Place:
     return Place(c["code"], rng.choice(c["cities"]), c["currency"], c["offset"])
 
 
-def _make_item(rng: random.Random, seq: int, now: datetime, prefix: str = "seed",
-               fresh: bool = False) -> dict:
+def _make_item(
+    rng: random.Random,
+    seq: int,
+    now: datetime,
+    prefix: str = "seed",
+    fresh: bool = False,
+) -> dict:
     place = _place(rng)
     deal_type = rng.choice(["rent", "sale"])
 
@@ -98,7 +134,9 @@ def _make_item(rng: random.Random, seq: int, now: datetime, prefix: str = "seed"
     description = wrap.format(", ".join(parts))
 
     # fresh — «только что опубликовано» (stream-режим); иначе разброс за 90 дней.
-    published = now if fresh else now - timedelta(seconds=rng.uniform(0, 90 * 24 * 3600))
+    published = (
+        now if fresh else now - timedelta(seconds=rng.uniform(0, 90 * 24 * 3600))
+    )
 
     return {
         "id": f"{prefix}-{seq:06d}",
@@ -121,16 +159,21 @@ def _make_item(rng: random.Random, seq: int, now: datetime, prefix: str = "seed"
             f"http://mock-avito:8002/img/{prefix}-{seq:06d}_{k}.jpg"
             for k in range(1, rng.randint(1, 3) + 1)
         ],
-        "published_at": published.isoformat(timespec="seconds").replace("+00:00", place.offset),
+        "published_at": published.isoformat(timespec="seconds").replace(
+            "+00:00", place.offset
+        ),
         "url": f"http://mock-avito:8002/item/{prefix}-{seq:06d}",
-        "seller": {"name": rng.choice(SELLERS), "rating": round(rng.uniform(3.5, 5.0), 1)},
+        "seller": {
+            "name": rng.choice(SELLERS),
+            "rating": round(rng.uniform(3.5, 5.0), 1),
+        },
     }
 
 
 def generate_batch(count: int, seed: int) -> list[dict]:
     """Полный набор с постоянными ID (MOCK_PUBLISH_MODE=batch)."""
     rng = random.Random(seed)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return [_make_item(rng, i, now) for i in range(1, count + 1)]
 
 
@@ -139,14 +182,14 @@ def generate_stream_item(seq: int, rng: random.Random) -> dict:
 
     published_at — текущий момент: объявление «только что опубликовано».
     """
-    return _make_item(rng, seq, datetime.now(timezone.utc), prefix="gen", fresh=True)
+    return _make_item(rng, seq, datetime.now(UTC), prefix="gen", fresh=True)
 
 
 DEFECTS = {
-    "price": lambda it: it.update({"price": 0}),                # цена >0 — 422
-    "city": lambda it: it.update({"city": "Atlantis"}),         # неизвестный город
+    "price": lambda it: it.update({"price": 0}),  # цена >0 — 422
+    "city": lambda it: it.update({"city": "Atlantis"}),  # неизвестный город
     "deal_type": lambda it: it.update({"deal_type": "exchange"}),  # вне rent/sale
-    "rooms": lambda it: it.update({"rooms": -1}),               # комнаты <0
+    "rooms": lambda it: it.update({"rooms": -1}),  # комнаты <0
 }
 
 
@@ -158,8 +201,13 @@ def make_broken(item: dict) -> dict:
     return broken
 
 
-def mix_broken(items: list[dict], rate: float) -> list[dict]:
-    """Подмешивает долю rate ломаных объявлений в набор."""
+def mix_broken(items: list[dict], rate: float, seed: int) -> list[dict]:
+    """Подмешивает долю rate ломаных объявлений в набор — детерминированно по seed.
+
+    Глобальный random не годится: обещание «рестарт пересоздаёт набор
+    из фиксированного seed» должно выполняться и для bad-data.
+    """
     if rate <= 0:
         return items
-    return [make_broken(it) if random.random() < rate else it for it in items]
+    rng = random.Random(f"mix-{seed}")
+    return [make_broken(it) if rng.random() < rate else it for it in items]
