@@ -456,3 +456,28 @@ func TestFormatEventTruncatesGiantURL(t *testing.T) {
 		t.Error("гигантский url должен быть усечён")
 	}
 }
+
+// TestFormatEventGiantCurrencyUnconditionalTier — безусловный последний
+// ярус усечения: гигантское не-адресное поле (currency из стрима) раздувает
+// шапку сверх лимита, город усечь нельзя — итог гарантированно вписывается
+// в лимит (повторный гейт R8: ветка не была покрыта тестом).
+func TestFormatEventGiantCurrencyUnconditionalTier(t *testing.T) {
+	e := model.Event{
+		DealType: model.DealRent, City: "Minsk", Rooms: 1,
+		PriceUSD: 350, Price: 380, Currency: strings.Repeat("R", 5000),
+		URL: "https://example.com/1",
+	}
+	text := FormatEvent(e)
+
+	if n := utf8.RuneCountInString(text); n > maxMessageLen {
+		t.Fatalf("длина сообщения %d рун > %d — инвариант «всегда ≤ лимита» сломан", n, maxMessageLen)
+	}
+	for _, want := range []string{"Minsk", "1-к", "$350"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("в уведомлении нет %q: %q", want, text)
+		}
+	}
+	if !strings.HasSuffix(text, "…") {
+		t.Errorf("сообщение должно заканчиваться многоточием последнего яруса: %q", text)
+	}
+}
