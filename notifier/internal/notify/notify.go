@@ -279,9 +279,9 @@ func (d *Dispatcher) deliverRecipient(ctx context.Context, chatID int64, e model
 // должны мешать — иначе отложенная строка не запишется, не останется ни
 // записи в журнале, ни задания в очереди, и уведомление будет потеряно
 // молча после XACK. Отложенная строка — единственная гарантия at-least-once
-// через флешер. Дедлайн при этом остаётся (НФТ-9: без него «чёрная дыра»
-// сети до БД подвесила бы воркер навсегда) — WithoutCancel снимает отмену,
-// но не дедлайн, поэтому бюджет задаётся заново.
+// через флешер. БезCancel снимает отмену и отбрасывает дедлайн родителя,
+// поэтому свежий дедлайн задаётся заново (НФТ-9: без него «чёрная дыра»
+// сети до БД подвесила бы воркер навсегда).
 func (d *Dispatcher) postpone(ctx context.Context, chatID int64, e model.Event) error {
 	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), d.perRecipient)
 	defer cancel()

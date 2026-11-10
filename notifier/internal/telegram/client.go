@@ -130,13 +130,6 @@ func (c *Client) call(ctx context.Context, method string, payload, out any) erro
 	if decodeErr != nil {
 		return fmt.Errorf("telegram %s: bad response (HTTP %d)", method, resp.StatusCode)
 	}
-	// 429 — явный отказ с рекомендованной паузой (ТЗ 4.3): отдаём
-	// типизированную ошибку, чтобы доставка вернула задание в очередь
-	// отложенных, а не фиксировала терминальный unknown (contracts.md §2).
-	// Сигнатура Sender не меняется: RateLimitError возвращается как error.
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return &RateLimitError{RetryAfter: retryAfterOf(&r)}
-	}
 	if !r.OK {
 		return fmt.Errorf("telegram %s: %s", method, r.Description)
 	}

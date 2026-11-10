@@ -607,7 +607,9 @@ func TestFlushRateLimitedRetries(t *testing.T) {
 	journal := newMockJournal()
 	sender := &recordingSender{}
 	sender.mu.Lock()
-	sender.err = &telegram.RateLimitError{RetryAfter: 5 * time.Second}
+	// RetryAfter крошечный: Flush выдерживает паузу Retry-After, не надо
+	// делать тест пяти­секундным (потолок паузы проверяется отдельно).
+	sender.err = &telegram.RateLimitError{RetryAfter: 10 * time.Millisecond}
 	sender.mu.Unlock()
 	subs := store.NewMemory()
 	d := NewDispatcher(subs, journal, &mockLimiter{allowed: true}, queue, ModeTelegram, sender.send)
