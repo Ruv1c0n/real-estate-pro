@@ -1,6 +1,7 @@
-// Тесты сборки DSN из окружения. Полный набор dsn-кейсов — карточка R7;
-// здесь минимальный табличный тест dsnFromEnv: пустое окружение, sslmode
-// из POSTGRES_SSLMODE и дефолт disable.
+// Тесты сборки DSN из окружения (карточка R7). Табличный тест dsnFromEnv:
+// пустое окружение, дефолты частей при частичной конфигурации, passthrough
+// DATABASE_URL, экранирование спецсимволов quoteValue, sslmode из
+// POSTGRES_SSLMODE и дефолт disable.
 package db
 
 import (
@@ -37,6 +38,43 @@ func TestDsnFromEnv(t *testing.T) {
 			name:    "sslmode не задан — дефолт disable",
 			env:     map[string]string{"POSTGRES_HOST": "db"},
 			wantSub: "sslmode=disable",
+		},
+		{
+			name: "только POSTGRES_DB задан — остальные части из дефолтов",
+			env:  map[string]string{"POSTGRES_DB": "realestatetest"},
+			want: "host=127.0.0.1 port=5432 user=app password=app dbname=realestatetest sslmode=disable",
+		},
+		{
+			name: "все POSTGRES_* заданы — значения без дефолтов и без кавычек",
+			env: map[string]string{
+				"POSTGRES_HOST":     "db",
+				"POSTGRES_PORT":     "6543",
+				"POSTGRES_USER":     "notifier",
+				"POSTGRES_PASSWORD": "secret",
+				"POSTGRES_DB":       "notifier",
+				"POSTGRES_SSLMODE":  "require",
+			},
+			want: "host=db port=6543 user=notifier password=secret dbname=notifier sslmode=require",
+		},
+		{
+			name: "DATABASE_URL задан — passthrough как есть, части не разбираются",
+			env:  map[string]string{"DATABASE_URL": "postgres://u:p@db:5432/x?sslmode=require"},
+			want: "postgres://u:p@db:5432/x?sslmode=require",
+		},
+		{
+			name: "DATABASE_URL пуст, POSTGRES_* нет — БД не сконфигурирована",
+			env:  map[string]string{"DATABASE_URL": ""},
+			want: "",
+		},
+		{
+			name: "пароль с пробелом, кавычкой, обратным слэшем и @ — экранирование quoteValue",
+			env:  map[string]string{"POSTGRES_PASSWORD": `pa ss"w'rd\@`},
+			want: `host=127.0.0.1 port=5432 user=app password='pa ss\"w\'rd\\@' dbname=realestate sslmode=disable`,
+		},
+		{
+			name: "пароль только с @ — без кавычек: keyword-value формат его не ломает",
+			env:  map[string]string{"POSTGRES_PASSWORD": `p@ss`},
+			want: `host=127.0.0.1 port=5432 user=app password=p@ss dbname=realestate sslmode=disable`,
 		},
 	}
 

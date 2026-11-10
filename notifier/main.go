@@ -73,25 +73,9 @@ func main() {
 	redisClient := redis.NewClient(opt)
 	defer redisClient.Close()
 
-	var subs store.Store = store.NewMemory()
 	dictsClient := dicts.New(env("CORE_API_URL", "http://localhost:8000"))
 
-	// Хранилища: в Postgres, когда БД доступна (подписки и users — ФТ-3.1,
-	// ФТ-3.2; журнал, лимит 30/час и очередь отложенных — ФТ-3.5, ТЗ 3.6),
-	// иначе in-memory для режима без БД.
-	var journal notify.Journal
-	var limiter notify.Limiter
-	var queue notify.DeferredQueue
-	if pool != nil {
-		subs = store.NewPostgres(pool)
-		journal = notify.NewPgJournal(pool)
-		limiter = notify.NewPgLimiter(pool, notificationsPerHour)
-		queue = notify.NewPgQueue(pool)
-	} else {
-		journal = notify.NewMemoryJournal()
-		limiter = notify.NewMemoryLimiter(notificationsPerHour, time.Hour)
-		queue = notify.NewMemoryQueue()
-	}
+	subs, journal, limiter, queue := buildStores(pool)
 
 	var sender notify.Sender
 	var mode string
@@ -171,6 +155,30 @@ func main() {
 		log.Fatal(fatalErr)
 	}
 	log.Println("stopped")
+}
+
+// buildStores — точка wiring хранилищ: db-режим (pool != nil) обязан
+// использовать Pg-стек (подписки и users — ФТ-3.1, ФТ-3.2; журнал, лимит
+// 30/час и очередь отложенных — ФТ-3.5, ТЗ 3.6), memory-режим — in-memory
+// реализации. Класс бага #51: wiring в main разъезжается с ветками db/memory,
+// и db-режим молча работает in-memory — уехало на e2e-прогоне. Вынесено из
+// main, чтобы обе ветки wiring проверялись тестами напрямую.
+func buildStores(pool *pgxpool.Pool) (
+	subs store.Store,
+	journal notify.Journal,
+	limiter notify.Limiter,
+	queue notify.DeferredQueue,
+) {
+	if pool != nil {
+		return store.NewPostgres(pool),
+			notify.NewPgJournal(pool),
+			notify.NewPgLimiter(pool, notificationsPerHour),
+			notify.NewPgQueue(pool)
+	}
+	return store.NewMemory(),
+		notify.NewMemoryJournal(),
+		notify.NewMemoryLimiter(notificationsPerHour, time.Hour),
+		notify.NewMemoryQueue()
 }
 
 // probeResult — снимок состояния зависимостей для тела health-ответов.

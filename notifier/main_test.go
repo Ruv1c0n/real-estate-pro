@@ -22,6 +22,7 @@ import (
 
 	"notifier/internal/dicts"
 	"notifier/internal/notify"
+	"notifier/internal/store"
 )
 
 // newDictsFake поднимает HTTP-заглушку Core API: GET /api/v1/countries
@@ -182,7 +183,29 @@ func TestHealthReadyDbModeOk(t *testing.T) {
 	}
 }
 
-// /health/ready: Redis недоступен → 503 (тест не зависит от Redis).
+// /health/ready в db-режиме при недоступной БД: 503, status degraded, db:false.
+// Пул закрывается сразу после создания: ping по закрытому пулу падает
+// детерминированно и без второй БД — случай «Postgres умер после старта».
+func TestHealthReadyDbDown(t *testing.T) {
+	rdb := testRedisAddr(t)
+	dictsClient := newDictsFake(t)
+	pool := testPool(t)
+	pool.Close()
+
+	mux := newMux(rdb, dictsClient, pool, notify.ModeLog)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("/health/ready при закрытом пуле БД вернул %d, ожидается 503", rec.Code)
+	}
+	if body := decodeHealth(t, rec); body["db"] != false || body["status"] != "degraded" {
+		t.Fatalf("неожиданное тело /health/ready при db down: %v", body)
+	}
+}
+
+// /health/ready: Redis недоступен → 503; /health на том же mux — 200 со
+// статусом degraded в теле (тест не зависит от Redis).
 func TestHealthReadyRedisDown(t *testing.T) {
 	dictsClient := newDictsFake(t)
 
@@ -199,5 +222,62 @@ func TestHealthReadyRedisDown(t *testing.T) {
 	}
 	if body := decodeHealth(t, rec); body["redis"] != false || body["status"] != "degraded" {
 		t.Fatalf("неожиданное тело /health/ready при Redis down: %v", body)
+	}
+
+	// Liveness на том же mux: код всегда 200, но статус отражает деградацию.
+	// Кэши ready/live раздельные — результат readiness не подмешивается к
+	// liveness, повторный probe выполняется заново.
+	recLive := httptest.NewRecorder()
+	mux.ServeHTTP(recLive, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	if recLive.Code != http.StatusOK {
+		t.Fatalf("/health при недоступном Redis вернул %d, ожидается 200 (liveness)", recLive.Code)
+	}
+	if body := decodeHealth(t, recLive); body["status"] != "degraded" || body["redis"] != false {
+		t.Fatalf("неожиданное тело /health при Redis down: %v", body)
+	}
+}
+
+// buildStores в memory-режиме (pool == nil): все четыре реализации — memory-*.
+// Полностью офлайн, живая БД не нужна.
+func TestBuildStoresMemoryMode(t *testing.T) {
+	subs, journal, limiter, queue := buildStores(nil)
+
+	if _, ok := subs.(*store.Memory); !ok {
+		t.Fatalf("subs в memory-режиме: %T, ожидается *store.Memory", subs)
+	}
+	if _, ok := journal.(*notify.MemoryJournal); !ok {
+		t.Fatalf("journal в memory-режиме: %T, ожидается *notify.MemoryJournal", journal)
+	}
+	if _, ok := limiter.(*notify.MemoryLimiter); !ok {
+		t.Fatalf("limiter в memory-режиме: %T, ожидается *notify.MemoryLimiter", limiter)
+	}
+	if _, ok := queue.(*notify.MemoryQueue); !ok {
+		t.Fatalf("queue в memory-режиме: %T, ожидается *notify.MemoryQueue", queue)
+	}
+}
+
+// buildStores в db-режиме обязан вернуть Pg-стек по всем четырём точкам:
+// wiring «memory-реализации при живом пуле» — класс бага #51, уехавшего на
+// e2e-прогоне T8. pgxpool.Pool — конкретный тип без реализации, фейковый пул
+// построить нельзя, поэтому Pg-ветка проверяется против живого Postgres из
+// NOTIFIER_TEST_DSN (в CI без DSN скипается — это норма).
+func TestBuildStoresDbModePgStack(t *testing.T) {
+	pool := testPool(t)
+	defer pool.Close()
+
+	subs, journal, limiter, queue := buildStores(pool)
+
+	if _, ok := subs.(*store.Postgres); !ok {
+		t.Fatalf("subs в db-режиме: %T, ожидается *store.Postgres", subs)
+	}
+	if _, ok := journal.(*notify.PgJournal); !ok {
+		t.Fatalf("journal в db-режиме: %T, ожидается *notify.PgJournal", journal)
+	}
+	if _, ok := limiter.(*notify.PgLimiter); !ok {
+		t.Fatalf("limiter в db-режиме: %T, ожидается *notify.PgLimiter", limiter)
+	}
+	if _, ok := queue.(*notify.PgQueue); !ok {
+		t.Fatalf("queue в db-режиме: %T, ожидается *notify.PgQueue", queue)
 	}
 }
