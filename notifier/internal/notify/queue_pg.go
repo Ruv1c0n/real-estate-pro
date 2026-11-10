@@ -114,11 +114,9 @@ func (q *PgQueue) PopBatch(ctx context.Context, limit int) ([]DeferredJob, error
 	// Карантин битых строк: в той же транзакции, которая держит на них
 	// FOR UPDATE, — автономный UPDATE из другого соединения упёрся бы в
 	// собственную блокировку (самодедлок). Коммит произойдёт вместе с
-	// батчем при первом Mark; если валидных заданий нет, транзакция
-	// остаётся открытой до следующего Mark — на выборку 'deferred'
-	// карантиненные строки уже не попадают. sent_at для 'failed' может быть
-	// NULL (CHECK требует его только для sent/unknown), но задаём now()
-	// сразу: статус финальный, sent_at служит меткой времени карантина.
+	// батчем при первом Mark. sent_at для 'failed' может быть NULL (CHECK
+	// требует его только для sent/unknown), но задаём now() сразу: статус
+	// финальный, sent_at служит меткой времени карантина.
 	for _, id := range badIDs {
 		if _, err := q.tx.Exec(ctx, `
 			UPDATE notifier.notifications_log
@@ -127,6 +125,16 @@ func (q *PgQueue) PopBatch(ctx context.Context, limit int) ([]DeferredJob, error
 			q.rollbackTx(ctx)
 			return nil, fmt.Errorf("queue quarantine: %w", err)
 		}
+	}
+	// Батч без валидных заданий Mark не дождётся никогда — коммитим
+	// карантинную транзакцию сразу: иначе она с блокировками строк осталась
+	// бы открытой (idle-in-transaction) до ближайшего Mark.
+	if len(jobs) == 0 {
+		if err := q.tx.Commit(ctx); err != nil {
+			q.tx = nil
+			return nil, fmt.Errorf("queue commit: %w", err)
+		}
+		q.tx = nil
 	}
 	return jobs, nil
 }

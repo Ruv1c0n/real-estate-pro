@@ -212,8 +212,11 @@ func TestPgQueuePopBatchSkipsDelivered(t *testing.T) {
 	if len(jobs) != 0 {
 		t.Fatalf("PopBatch = %+v, want пусто (уже доставлено)", jobs)
 	}
-	// Транзакция открыта даже при пустом батче — откат.
-	q.rollbackTx(ctx)
+	// Пустой батч коммитится сразу (нечего карантинить — или всё уже
+	// закарантинено): открытой транзакции не остаётся.
+	if q.tx != nil {
+		t.Fatal("после пустого PopBatch транзакция не закрыта")
+	}
 }
 
 // TestPgQueuePopBatchQuarantinesBadRow — строка с битым payload не должна
@@ -272,8 +275,11 @@ func TestPgQueuePopBatchQuarantinesBadRow(t *testing.T) {
 	if len(jobs) != 0 {
 		t.Errorf("повторный PopBatch = %+v, want пусто", jobs)
 	}
-	// Транзакция открыта даже при пустом батче — откат.
-	q.rollbackTx(ctx)
+	// Пустой батч коммитится сразу (нечего карантинить — или всё уже
+	// закарантинено): открытой транзакции не остаётся.
+	if q.tx != nil {
+		t.Fatal("после пустого PopBatch транзакция не закрыта")
+	}
 }
 
 // TestPgThirtyPerHourScenario — критерий приёмки T5: сценарий ТЗ 3.6 целиком
