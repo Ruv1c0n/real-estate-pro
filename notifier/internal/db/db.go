@@ -3,6 +3,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"strings"
@@ -20,11 +21,17 @@ const (
 	defaultDB       = "realestate"
 )
 
+// pingAttempts — число попыток пинга при старте (задержки 1s, 2s между ними).
+const pingAttempts = 3
+
 // Connect открывает пул соединений с Postgres.
 //
-// Если ни одной переменной POSTGRES_* не задано или пинг не прошёл при старте,
-// возвращает (nil, nil) и не падает: сервис продолжает работать на in-memory
-// хранилище — так живут CI и локальные тесты без Docker.
+// (nil, nil) возвращается только когда БД не сконфигурирована (ни одной
+// переменной POSTGRES_*): сервис продолжает работать на in-memory хранилище —
+// так живут CI и локальные тесты без Docker. Сконфигурированная, но
+// недоступная БД — ошибка старта (fail-fast, main.go делает log.Fatal):
+// тихий уход в memory-режим маскировал бы проблему окружения весь аптайм.
+// Переподключение в процессе работы обеспечивает сам pgxpool.
 func Connect(ctx context.Context) (*pgxpool.Pool, error) {
 	dsn := dsnFromEnv()
 	if dsn == "" {
@@ -38,18 +45,37 @@ func Connect(ctx context.Context) (*pgxpool.Pool, error) {
 	}
 	cfg.MaxConns = 5
 
-	// Пинг с таймаутом: недоступная база не должна блокировать старт.
-	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	// Пинг с ограниченными ретраями: до 3 попыток с задержкой 1s, 2s между
+	// ними — Postgres при одновременном старте docker compose может ещё
+	// подниматься. Общий бюджет 10s ограничивает блокировку старта сверху:
+	// при исчерпании попыток или бюджета — ошибка (fail-fast), а не ожидание.
+	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	pool, err := pgxpool.NewWithConfig(pingCtx, cfg)
 	if err != nil {
 		return nil, err
 	}
-	if err := pool.Ping(pingCtx); err != nil {
+
+	var pingErr error
+	for attempt := 1; ; attempt++ {
+		if pingErr = pool.Ping(pingCtx); pingErr == nil {
+			break
+		}
+		// Попытки или бюджет (отмена ctx) исчерпаны — отдаём ошибку наверх.
+		if attempt == pingAttempts || pingCtx.Err() != nil {
+			break
+		}
+		// Пауза между попытками (1s, 2s); досрочный выход — при отмене
+		// контекста или исчерпании бюджета.
+		select {
+		case <-pingCtx.Done():
+		case <-time.After(time.Duration(attempt) * time.Second):
+		}
+	}
+	if pingErr != nil {
 		pool.Close()
-		log.Printf("DB disabled: running in memory mode (ping: %v)", err)
-		return nil, nil
+		return nil, fmt.Errorf("db: ping: %w", pingErr)
 	}
 
 	log.Println("DB connected")
