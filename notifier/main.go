@@ -5,11 +5,13 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,6 +34,15 @@ const (
 	notificationsPerHour = 30
 	flushInterval        = 30 * time.Second
 	debugBodyLimit       = 1 << 20 // 1 МБ на демо-событие
+)
+
+// Тайминги health-проверок: у каждой проверки свой дедлайн, сбор результатов
+// ограничен общим бюджетом, а результат кэшируется против шторма повторных
+// healthcheck-запросов (анти-усиление).
+const (
+	probeCheckTimeout = 1 * time.Second // дедлайн одной проверки
+	probeBudget       = 2 * time.Second // общий бюджет probe
+	probeCacheTTL     = 4 * time.Second // кэш результата probe
 )
 
 func main() {
@@ -103,16 +114,24 @@ func main() {
 	dispatcher := notify.NewDispatcher(subs, journal, limiter, queue, mode, sender)
 	go dispatcher.RunFlusher(ctx, flushInterval)
 
-	// Ошибка создания consumer group делает сервис слепым — это фатально.
+	// Ошибка создания consumer group делает сервис слепым — это фатально,
+	// но log.Fatal в горуте убивал бы процесс в обход defer (пул и redis
+	// остались бы незакрытыми): ошибка уходит в main по каналу, main делает
+	// корректный graceful shutdown и только потом выходит с кодом 1.
 	consumerDone := make(chan struct{})
+	consumerErr := make(chan error, 1)
 	go func() {
 		defer close(consumerDone)
 		if err := stream.NewConsumer(redisClient, stream.ConsumerName(), dispatcher.Handle).Run(ctx); err != nil {
-			log.Fatalf("stream consumer: %v", err)
+			consumerErr <- err
 		}
 	}()
 
-	srv := &http.Server{Addr: ":8080", Handler: newMux(redisClient, dictsClient, pool, tgBot != nil)}
+	srv := &http.Server{
+		Addr:              ":8080",
+		Handler:           newMux(redisClient, dictsClient, pool, mode),
+		ReadHeaderTimeout: 5 * time.Second, // медленные заголовки не держат коннект (slowloris)
+	}
 	srvErr := make(chan error, 1)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -120,13 +139,20 @@ func main() {
 		}
 	}()
 
+	// fatalErr — фатальная ошибка старта (HTTP-сервер или consumer group):
+	// выходим кодом 1 уже после корректной остановки всех компонентов.
+	var fatalErr error
 	select {
 	case <-ctx.Done():
 	case err := <-srvErr:
-		log.Fatal(err)
+		fatalErr = err
+	case err := <-consumerErr:
+		fatalErr = fmt.Errorf("stream consumer: %w", err)
 	}
 
-	// Порядок остановки: HTTP → консьюмер → сброс отложенных уведомлений.
+	// Порядок остановки: отмена ctx → HTTP → консьюмер → сброс отложенных
+	// уведомлений → закрытие пула и redis.
+	stop() // отменяем ctx: консьюмер и флашер завершают циклы
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	srv.Shutdown(shutdownCtx)
@@ -135,49 +161,174 @@ func main() {
 	if pool != nil {
 		pool.Close()
 	}
+	// redisClient.Close() дублируется с defer: log.Fatal ниже обходит defer,
+	// поэтому при фатальном выходе закрываем клиент явно.
+	redisClient.Close()
+	if fatalErr != nil {
+		log.Fatal(fatalErr)
+	}
 	log.Println("stopped")
 }
 
+// probeResult — снимок состояния зависимостей для тела health-ответов.
+type probeResult struct {
+	status  string
+	redisOK bool
+	dictsOK bool
+	dbOK    bool
+}
+
+// healthProber проверяет зависимости notifier и кэширует результаты:
+// ready() — полный probe с сетевой проверкой справочников (readiness),
+// live() — локальный probe без сети к Core API (liveness). Кэши раздельные,
+// чтобы результат liveness не подмешивался к readiness и наоборот.
+type healthProber struct {
+	rdb   *redis.Client
+	dicts *dicts.Client
+	pool  *pgxpool.Pool
+
+	mu       sync.Mutex
+	readyRes probeResult
+	readyAt  time.Time
+	liveRes  probeResult
+	liveAt   time.Time
+}
+
+// ready — полный probe (redis, dicts по сети, db) с кэшем на probeCacheTTL.
+// Readiness обязан проверять справочники сетевым вызовом (ФТ-3.7, НФТ-9).
+func (p *healthProber) ready(ctx context.Context) probeResult {
+	p.mu.Lock()
+	res, cached := p.readyRes, time.Since(p.readyAt) < probeCacheTTL
+	p.mu.Unlock()
+	if cached {
+		return res
+	}
+	res = p.run(ctx, true)
+	p.mu.Lock()
+	p.readyRes, p.readyAt = res, time.Now()
+	p.mu.Unlock()
+	return res
+}
+
+// live — liveness-проверка с кэшем на probeCacheTTL: справочники берутся
+// из кэша клиента (CachedHealthy) БЕЗ сетевого вызова, поэтому /health
+// остаётся быстрым даже при деградации Core API (compose бьёт сюда wget'ом).
+func (p *healthProber) live(ctx context.Context) probeResult {
+	p.mu.Lock()
+	res, cached := p.liveRes, time.Since(p.liveAt) < probeCacheTTL
+	p.mu.Unlock()
+	if cached {
+		return res
+	}
+	res = p.run(ctx, false)
+	p.mu.Lock()
+	p.liveRes, p.liveAt = res, time.Now()
+	p.mu.Unlock()
+	return res
+}
+
+// run выполняет три проверки параллельно: у каждой свой дедлайн
+// probeCheckTimeout, сбор ограничен бюджетом probeBudget. При dictsByNetwork
+// справочники проверяются сетевым вызовом (Healthy), иначе — по кэшу клиента
+// без сети (CachedHealthy). pool == nil — memory-режим: проверка db не
+// выполняется, поле db остаётся false, но деградацией не считается.
+func (p *healthProber) run(ctx context.Context, dictsByNetwork bool) probeResult {
+	dictsCheck := func(ctx context.Context) bool { return p.dicts.Healthy(ctx) }
+	if !dictsByNetwork {
+		dictsCheck = func(context.Context) bool { return p.dicts.CachedHealthy() }
+	}
+
+	results := parallelProbe(ctx, []func(context.Context) bool{
+		p.redisCheck,
+		dictsCheck,
+		p.dbCheck,
+	})
+
+	res := probeResult{
+		redisOK: results[0],
+		dictsOK: results[1],
+		dbOK:    results[2],
+	}
+	res.status = "ok"
+	if !res.redisOK || !res.dictsOK || (p.pool != nil && !res.dbOK) {
+		res.status = "degraded"
+	}
+	return res
+}
+
+// redisCheck пингует Redis.
+func (p *healthProber) redisCheck(ctx context.Context) bool {
+	return p.rdb.Ping(ctx).Err() == nil
+}
+
+// dbCheck пингует Postgres; в memory-режиме (pool == nil) проверки нет.
+func (p *healthProber) dbCheck(ctx context.Context) bool {
+	if p.pool == nil {
+		return false
+	}
+	return p.pool.Ping(ctx) == nil
+}
+
+// checkResult — результат одной проверки в канале результатов.
+type checkResult struct {
+	idx int
+	ok  bool
+}
+
+// parallelProbe запускает проверки параллельно и собирает результаты.
+// Канал результатов буферизован: горутины не блокируются и не дают гонок,
+// если сборщик вышел по общему бюджету раньше их завершения — поздние
+// результаты остаются в канале и игнорируются (недождавшаяся проверка
+// учитывается как false).
+func parallelProbe(ctx context.Context, checks []func(context.Context) bool) []bool {
+	results := make([]bool, len(checks))
+	ch := make(chan checkResult, len(checks))
+
+	var wg sync.WaitGroup
+	for i, check := range checks {
+		wg.Add(1)
+		go func(i int, check func(context.Context) bool) {
+			defer wg.Done()
+			cctx, cancel := context.WithTimeout(ctx, probeCheckTimeout)
+			defer cancel()
+			ch <- checkResult{i, check(cctx)}
+		}(i, check)
+	}
+
+	deadline := time.After(probeBudget)
+	for i := 0; i < len(checks); i++ {
+		select {
+		case r := <-ch:
+			results[r.idx] = r.ok
+		case <-deadline:
+			return results
+		}
+	}
+	return results
+}
+
 // newMux собирает HTTP-обработчики: /health и /health/ready (ФТ-3.7) и
-// /debug/event (НФТ-3).
-func newMux(rdb *redis.Client, dictsClient *dicts.Client, pool *pgxpool.Pool, botEnabled bool) *http.ServeMux {
+// /debug/event (НФТ-3). mode — режим доставки (notify.ModeLog / ModeTelegram),
+// вычисленный в main.
+func newMux(rdb *redis.Client, dictsClient *dicts.Client, pool *pgxpool.Pool, mode string) *http.ServeMux {
 	adminKey := os.Getenv("ADMIN_KEY")
 
-	// probe проверяет все зависимости и возвращает карту для тела ответа.
-	// db: pool == nil означает memory-режим (сервис без БД) — в нём db
-	// всегда false, но /health/ready не считает это деградацией (см. ниже).
-	probe := func(ctx context.Context) (status string, redisOK, dictsOK, dbOK bool) {
-		pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		defer cancel()
-		redisOK = rdb.Ping(pctx).Err() == nil
-		dictsOK = dictsClient.Healthy(pctx)
-		dbOK = false
-		if pool != nil {
-			dbOK = pool.Ping(pctx) == nil
-		}
-		status = "ok"
-		if !redisOK || !dictsOK || (pool != nil && !dbOK) {
-			status = "degraded"
-		}
-		return status, redisOK, dictsOK, dbOK
-	}
-
-	mode := "log"
-	if botEnabled {
-		mode = "telegram"
-	}
+	prober := &healthProber{rdb: rdb, dicts: dictsClient, pool: pool}
 
 	mux := http.NewServeMux()
 
 	// GET /health — liveness: всегда 200, детали деградации видны в теле.
+	// dicts — из кэша клиента без сетевого вызова к Core API: liveness не
+	// должен зависеть от его доступности и усиливать нагрузку штормом
+	// healthcheck'ов.
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		status, redisOK, dictsOK, dbOK := probe(r.Context())
+		res := prober.live(r.Context())
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"status": status,
-			"redis":  redisOK,
-			"dicts":  dictsOK,
-			"db":     dbOK,
+			"status": res.status,
+			"redis":  res.redisOK,
+			"dicts":  res.dictsOK,
+			"db":     res.dbOK,
 			"mode":   mode,
 		})
 	})
@@ -185,10 +336,10 @@ func newMux(rdb *redis.Client, dictsClient *dicts.Client, pool *pgxpool.Pool, bo
 	// GET /health/ready — readiness: 200 только когда сервис готов работать.
 	// В db-режиме требуются redis, dicts и db; в memory-режиме (pool == nil)
 	// БД не сконфигурирована и её отсутствие — не деградация: проверяются
-	// только redis и dicts.
+	// только redis и dicts. dicts проверяется ПО СЕТИ (ФТ-3.7, НФТ-9).
 	mux.HandleFunc("/health/ready", func(w http.ResponseWriter, r *http.Request) {
-		status, redisOK, dictsOK, dbOK := probe(r.Context())
-		ready := redisOK && dictsOK && (pool != nil && dbOK || pool == nil)
+		res := prober.ready(r.Context())
+		ready := res.redisOK && res.dictsOK && (pool != nil && res.dbOK || pool == nil)
 		code := http.StatusOK
 		if !ready {
 			code = http.StatusServiceUnavailable
@@ -196,10 +347,10 @@ func newMux(rdb *redis.Client, dictsClient *dicts.Client, pool *pgxpool.Pool, bo
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(code)
 		json.NewEncoder(w).Encode(map[string]any{
-			"status": status,
-			"redis":  redisOK,
-			"dicts":  dictsOK,
-			"db":     dbOK,
+			"status": res.status,
+			"redis":  res.redisOK,
+			"dicts":  res.dictsOK,
+			"db":     res.dbOK,
 			"mode":   mode,
 		})
 	})
