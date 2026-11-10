@@ -17,12 +17,21 @@ func NewMemoryQueue() *MemoryQueue {
 	return &MemoryQueue{}
 }
 
-// Postpone добавляет задание в конец очереди. Дедуп, как в Pg-версии
-// (ON CONFLICT DO NOTHING), не нужен: повторная публикация события
-// отсекается проверкой журнала в Handle до вызова Postpone.
+// Postpone добавляет задание в конец очереди. Повторная публикация события
+// (ТЗ 4.3, at-least-once) может прийти, пока задание ещё лежит в очереди:
+// журнал отметит доставку только после Flush, так что проверка журнала
+// в Handle дубль не отсечёт. Дедуп по паре (chatID, listing) — паритет
+// с UNIQUE (chat_id, listing_id) db-режима (PgQueue, ON CONFLICT DO NOTHING):
+// без него повтор даёт двойную доставку; очередь короткоживущая, линейный
+// O(n) скан приемлем.
 func (q *MemoryQueue) Postpone(_ context.Context, chatID int64, e model.Event, _ string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	for _, job := range q.jobs {
+		if job.ChatID == chatID && job.Event.ID == e.ID {
+			return nil // дубль: задание уже в очереди, второе не создаём
+		}
+	}
 	q.jobs = append(q.jobs, DeferredJob{ChatID: chatID, Event: e})
 	return nil
 }
