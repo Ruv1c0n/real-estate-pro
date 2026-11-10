@@ -78,13 +78,19 @@ type apiResponseParameters struct {
 }
 
 // retryAfterOf извлекает parameters.retry_after (секунды); если поле
-// отсутствует или нулевое — defaultRetryAfter.
+// отсутствует или нулевое — defaultRetryAfter. Значение ограничено сверху
+// maxRetryAfter: гигантское значение от прокси не должно замораживать
+// доставку на дни.
 func retryAfterOf(r *apiResponse) time.Duration {
 	if r.Parameters != nil && r.Parameters.RetryAfter > 0 {
-		return time.Duration(r.Parameters.RetryAfter) * time.Second
+		return min(time.Duration(r.Parameters.RetryAfter)*time.Second, maxRetryAfter)
 	}
 	return defaultRetryAfter
 }
+
+// maxRetryAfter — потолок доверия Retry-After от Telegram (он не присылает
+// больше часа); всё, что больше, — артефакт промежуточного прокси.
+const maxRetryAfter = time.Hour
 
 func (c *Client) call(ctx context.Context, method string, payload, out any) error {
 	body, err := json.Marshal(payload)
@@ -110,7 +116,18 @@ func (c *Client) call(ctx context.Context, method string, payload, out any) erro
 	defer resp.Body.Close()
 
 	var r apiResponse
-	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+	decodeErr := json.NewDecoder(resp.Body).Decode(&r)
+	// 429 — явный отказ с Retry-After (ТЗ 4.3) независимо от разбираемости
+	// тела: прокси/CDN могут вернуть HTML или пустое тело, и тогда без этой
+	// ветки отказ ушёл бы в терминальный unknown вместо повторной очереди.
+	// retry_after достаём, если тело разобралось, иначе — дефолт.
+	if resp.StatusCode == http.StatusTooManyRequests {
+		if decodeErr == nil {
+			return &RateLimitError{RetryAfter: retryAfterOf(&r)}
+		}
+		return &RateLimitError{RetryAfter: defaultRetryAfter}
+	}
+	if decodeErr != nil {
 		return fmt.Errorf("telegram %s: bad response (HTTP %d)", method, resp.StatusCode)
 	}
 	// 429 — явный отказ с рекомендованной паузой (ТЗ 4.3): отдаём

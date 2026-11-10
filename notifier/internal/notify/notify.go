@@ -196,6 +196,15 @@ func NewDispatcher(subs store.Store, journal Journal, limiter Limiter, queue Def
 // deferredBatchSize — сколько отложенных заданий флешер забирает за один проход.
 const deferredBatchSize = 100
 
+// eventBudget — потолок времени на одно событие. Он обязан быть меньше
+// minIdle XAUTOCLAIM (30с в stream): при обработке дольше порога живого
+// воркера перезабирает claimLoop под тем же consumer-именем — конкурентный
+// повтор и дубль доставки (ТЗ 4.3: «владение продлевается или порог
+// увеличивается»; продление владения в стрим-клиенте не реализовано, поэтому
+// выбираем «укладываться в порог»). Остаток получателей при исчерпании
+// бюджета уходит в deferred-очередь — потери нет, доставит флешер.
+const eventBudget = 25 * time.Second
+
 // Handle обрабатывает одно событие из стрима: находит получателей
 // (уникальные чаты, ФТ-3.4), пропускает повторную доставку по журналу,
 // отправляет сразу или откладывает при исчерпании лимита.
@@ -211,8 +220,19 @@ func (d *Dispatcher) Handle(ctx context.Context, e model.Event) {
 		log.Printf("dispatch: list subscriptions: %v", err)
 		return
 	}
+	ectx, cancel := context.WithTimeout(ctx, eventBudget)
+	defer cancel()
 	for _, chatID := range model.Recipients(e, recipients) {
-		d.deliverRecipient(ctx, chatID, e)
+		if ectx.Err() != nil {
+			// Бюджет события исчерпан — остаток получателей в очередь:
+			// продолжать доставку значило бы выйти за eventBudget, и живой
+			// воркер был бы перезабран XAUTOCLAIM (см. eventBudget).
+			if perr := d.postpone(ectx, chatID, e); perr != nil {
+				log.Printf("postpone listing %d chat %d: %v", e.ID, chatID, perr)
+			}
+			continue
+		}
+		d.deliverRecipient(ectx, chatID, e)
 	}
 }
 
@@ -254,15 +274,18 @@ func (d *Dispatcher) deliverRecipient(ctx context.Context, chatID int64, e model
 }
 
 // postpone возвращает уведомление в очередь отложенных. Запись идёт на
-// контексте без отмены (context.WithoutCancel): истёкший пер-получательский
-// дедлайн или отмена родителя (например, shutdown) не должны мешать — иначе
-// отложенная строка не запишется, не останется ни записи в журнале, ни
-// задания в очереди, и уведомление будет потеряно молча после XACK.
-// Отложенная строка — единственная гарантия at-least-once через флешер,
-// поэтому она важнее дедлайна. Риск «зависшей» записи без дедлайна осознан
-// и зеркалит XACK в consumer.process (тот же context.WithoutCancel).
+// контексте без отмены родителя (context.WithoutCancel): истёкший
+// пер-получательский дедлайн или отмена родителя (например, shutdown) не
+// должны мешать — иначе отложенная строка не запишется, не останется ни
+// записи в журнале, ни задания в очереди, и уведомление будет потеряно
+// молча после XACK. Отложенная строка — единственная гарантия at-least-once
+// через флешер. Дедлайн при этом остаётся (НФТ-9: без него «чёрная дыра»
+// сети до БД подвесила бы воркер навсегда) — WithoutCancel снимает отмену,
+// но не дедлайн, поэтому бюджет задаётся заново.
 func (d *Dispatcher) postpone(ctx context.Context, chatID int64, e model.Event) error {
-	return d.queue.Postpone(context.WithoutCancel(ctx), chatID, e, d.mode)
+	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), d.perRecipient)
+	defer cancel()
+	return d.queue.Postpone(pctx, chatID, e, d.mode)
 }
 
 // logRateLimited логирует отказ 429 с рекомендованной паузой из ответа
@@ -275,6 +298,31 @@ func logRateLimited(err error, listingID, chatID int64) {
 		return
 	}
 	log.Printf("dispatch: rate limited: listing %d chat %d", listingID, chatID)
+}
+
+// flushRateLimitPause — потолок паузы между 429-повторами во Flush: больше
+// этого флешер на одном задании не ждёт, даже если Telegram попросил час
+// (задание остаётся deferred, следующий проход повторит попытку).
+const flushRateLimitPause = 10 * time.Second
+
+// pauseRateLimited выдерживает паузу Retry-After (ТЗ 4.3 «Для 429
+// учитывается Retry-After») с потолком flushRateLimitPause. Прерывается
+// по ctx (shutdown): задание остаётся deferred, повтор — следующим проходом.
+func (d *Dispatcher) pauseRateLimited(ctx context.Context, err error) {
+	var rle *telegram.RateLimitError
+	pause := flushRateLimitPause
+	if errors.As(err, &rle) {
+		pause = min(rle.RetryAfter, flushRateLimitPause)
+	}
+	if pause <= 0 {
+		return
+	}
+	t := time.NewTimer(pause)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
 }
 
 func (d *Dispatcher) deliver(ctx context.Context, chatID int64, e model.Event) {
@@ -353,6 +401,11 @@ func (d *Dispatcher) Flush(ctx context.Context) {
 				if merr := d.queue.Mark(ctx, job, d.mode, StatusRetry); merr != nil {
 					log.Printf("mark retry listing %d chat %d: %v", job.Event.ID, job.ChatID, merr)
 				}
+				// Mark(retry) коммитит транзакцию — блокировок на неотмеченные
+				// задания батча больше нет, пауза безопасна. Без неё пачка
+				// одному чату сама провоцирует следующий 429 (~1 сообщ/с на
+				// чат) и дренаж идёт циклами 429-повторов.
+				d.pauseRateLimited(ctx, err)
 				continue
 			}
 			// contracts.md §2: ошибка отправки — статус unknown, без повтора.
