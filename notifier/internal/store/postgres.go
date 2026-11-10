@@ -9,7 +9,6 @@ package store
 import (
 	"context"
 	"fmt"
-	"log"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -27,28 +26,16 @@ var _ Store = (*Postgres)(nil)
 // NewPostgres принимает открытый пул соединений (internal/db.Connect).
 func NewPostgres(pool *pgxpool.Pool) *Postgres { return &Postgres{pool: pool} }
 
-// Интерфейс Store контекст не принимает и ошибок не возвращает — менять его
-// нельзя (issue #31, этап 2). Контекст и ошибка живут в парных методах ниже;
-// интерфейсные обёртки вызывают их с context.Background() и логируют ошибку
-// вместо паники.
-
-func (p *Postgres) Add(s model.Subscription) model.Subscription {
-	added, err := p.add(context.Background(), s)
-	if err != nil {
-		log.Printf("store: добавить подписку (chat %d): %v", s.ChatID, err)
-		return s // ID остаётся нулевым: строка не вставлена
-	}
-	return added
-}
-
-func (p *Postgres) add(ctx context.Context, s model.Subscription) (model.Subscription, error) {
+// Add сохраняет подписку и возвращает её с реальным ID из БД. Ошибка означает,
+// что строка не вставлена — вызывающий обязан отличить это от успеха.
+func (p *Postgres) Add(ctx context.Context, s model.Subscription) (model.Subscription, error) {
 	// FK subscriptions.chat_id → users.chat_id: пользователь должен существовать.
 	// Создаём запись сами (ON CONFLICT DO NOTHING — идемпотентно), чтобы
 	// /subscribe работал и без предварительного /start.
 	if _, err := p.pool.Exec(ctx,
 		`INSERT INTO notifier.users (chat_id) VALUES ($1) ON CONFLICT (chat_id) DO NOTHING`,
 		s.ChatID); err != nil {
-		return model.Subscription{}, fmt.Errorf("ensure user: %w", err)
+		return model.Subscription{}, fmt.Errorf("store: add subscription (chat %d): ensure user: %w", s.ChatID, err)
 	}
 
 	// NULLIF превращает пустую строку модели в NULL («любое значение»);
@@ -60,116 +47,71 @@ func (p *Postgres) add(ctx context.Context, s model.Subscription) (model.Subscri
 		RETURNING id`,
 		s.ChatID, s.DealType, s.Country, s.City, s.Rooms, s.MinPriceUSD, s.MaxPriceUSD)
 	if err := row.Scan(&s.ID); err != nil {
-		return model.Subscription{}, fmt.Errorf("insert subscription: %w", err)
+		return model.Subscription{}, fmt.Errorf("store: add subscription (chat %d): insert: %w", s.ChatID, err)
 	}
 	return s, nil
 }
 
-func (p *Postgres) ByChat(chatID int64) []model.Subscription {
-	subs, err := p.byChat(context.Background(), chatID)
-	if err != nil {
-		log.Printf("store: подписки чата %d: %v", chatID, err)
-		return nil
-	}
-	return subs
-}
-
-func (p *Postgres) byChat(ctx context.Context, chatID int64) ([]model.Subscription, error) {
+func (p *Postgres) ByChat(ctx context.Context, chatID int64) ([]model.Subscription, error) {
 	rows, err := p.pool.Query(ctx, `
 		SELECT id, chat_id, deal_type, country, city, rooms, min_price_usd, max_price_usd
 		FROM notifier.subscriptions
 		WHERE chat_id = $1
 		ORDER BY id`, chatID)
 	if err != nil {
-		return nil, fmt.Errorf("select subscriptions: %w", err)
+		return nil, fmt.Errorf("store: list subscriptions (chat %d): %w", chatID, err)
 	}
 	return collectSubscriptions(rows)
 }
 
-func (p *Postgres) Delete(chatID, id int64) bool {
-	deleted, err := p.delete(context.Background(), chatID, id)
-	if err != nil {
-		log.Printf("store: удалить подписку %d (chat %d): %v", id, chatID, err)
-		return false
-	}
-	return deleted
-}
-
-func (p *Postgres) delete(ctx context.Context, chatID, id int64) (bool, error) {
+// Delete удаляет подписку чата; false — у чата нет подписки с таким ID.
+func (p *Postgres) Delete(ctx context.Context, chatID, id int64) (bool, error) {
 	ct, err := p.pool.Exec(ctx,
 		`DELETE FROM notifier.subscriptions WHERE id = $1 AND chat_id = $2`, id, chatID)
 	if err != nil {
-		return false, fmt.Errorf("delete subscription: %w", err)
+		return false, fmt.Errorf("store: delete subscription %d (chat %d): %w", id, chatID, err)
 	}
 	return ct.RowsAffected() == 1, nil
 }
 
-func (p *Postgres) DeleteAllForChat(chatID int64) int {
-	n, err := p.deleteAllForChat(context.Background(), chatID)
-	if err != nil {
-		log.Printf("store: удалить подписки чата %d: %v", chatID, err)
-		return 0
-	}
-	return n
-}
-
-func (p *Postgres) deleteAllForChat(ctx context.Context, chatID int64) (int, error) {
+func (p *Postgres) DeleteAllForChat(ctx context.Context, chatID int64) (int, error) {
 	ct, err := p.pool.Exec(ctx,
 		`DELETE FROM notifier.subscriptions WHERE chat_id = $1`, chatID)
 	if err != nil {
-		return 0, fmt.Errorf("delete chat subscriptions: %w", err)
+		return 0, fmt.Errorf("store: delete subscriptions (chat %d): %w", chatID, err)
 	}
 	return int(ct.RowsAffected()), nil
 }
 
-func (p *Postgres) CountForChat(chatID int64) int {
-	n, err := p.countForChat(context.Background(), chatID)
-	if err != nil {
-		log.Printf("store: число подписок чата %d: %v", chatID, err)
-		return 0
-	}
-	return n
-}
-
-func (p *Postgres) countForChat(ctx context.Context, chatID int64) (int, error) {
+func (p *Postgres) CountForChat(ctx context.Context, chatID int64) (int, error) {
 	var n int
 	err := p.pool.QueryRow(ctx,
 		`SELECT count(*) FROM notifier.subscriptions WHERE chat_id = $1`, chatID).
 		Scan(&n)
 	if err != nil {
-		return 0, fmt.Errorf("count subscriptions: %w", err)
+		return 0, fmt.Errorf("store: count subscriptions (chat %d): %w", chatID, err)
 	}
 	return n, nil
 }
 
-func (p *Postgres) All() []model.Subscription {
-	subs, err := p.all(context.Background())
-	if err != nil {
-		log.Printf("store: все подписки: %v", err)
-		return nil
-	}
-	return subs
-}
-
-func (p *Postgres) all(ctx context.Context) ([]model.Subscription, error) {
+func (p *Postgres) All(ctx context.Context) ([]model.Subscription, error) {
 	rows, err := p.pool.Query(ctx, `
 		SELECT id, chat_id, deal_type, country, city, rooms, min_price_usd, max_price_usd
 		FROM notifier.subscriptions
 		ORDER BY id`)
 	if err != nil {
-		return nil, fmt.Errorf("select all subscriptions: %w", err)
+		return nil, fmt.Errorf("store: list all subscriptions: %w", err)
 	}
 	return collectSubscriptions(rows)
 }
 
 // EnsureUser создаёт запись пользователя (/start, ФТ-3.1); повторный вызов —
 // no-op, без ошибки.
-func (p *Postgres) EnsureUser(chatID int64) error {
-	_, err := p.pool.Exec(context.Background(),
+func (p *Postgres) EnsureUser(ctx context.Context, chatID int64) error {
+	if _, err := p.pool.Exec(ctx,
 		`INSERT INTO notifier.users (chat_id) VALUES ($1) ON CONFLICT (chat_id) DO NOTHING`,
-		chatID)
-	if err != nil {
-		return fmt.Errorf("ensure user: %w", err)
+		chatID); err != nil {
+		return fmt.Errorf("store: ensure user (chat %d): %w", chatID, err)
 	}
 	return nil
 }
@@ -177,15 +119,16 @@ func (p *Postgres) EnsureUser(chatID int64) error {
 // DeleteUser удаляет пользователя (/stop, ФТ-3.1): БД каскадом чистит его
 // подписки и журнал (ON DELETE CASCADE). Число подписок считаем ДО удаления —
 // каскад их сотрёт, а боту нужен ответ «удалено подписок — N».
-func (p *Postgres) DeleteUser(chatID int64) (int, error) {
-	ctx := context.Background()
-	n, err := p.countForChat(ctx, chatID)
+func (p *Postgres) DeleteUser(ctx context.Context, chatID int64) (int, error) {
+	n, err := p.CountForChat(ctx, chatID)
 	if err != nil {
-		return 0, fmt.Errorf("count subscriptions before delete user: %w", err)
+		// Ошибка уже обёрнута с префиксом «store:» в CountForChat —
+		// пробрасываем как есть, чтобы не дублировать префикс.
+		return 0, err
 	}
 	if _, err := p.pool.Exec(ctx,
 		`DELETE FROM notifier.users WHERE chat_id = $1`, chatID); err != nil {
-		return 0, fmt.Errorf("delete user: %w", err)
+		return 0, fmt.Errorf("store: delete user (chat %d): %w", chatID, err)
 	}
 	return n, nil
 }
