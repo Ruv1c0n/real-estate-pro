@@ -31,11 +31,10 @@ func NewPostgres(pool *pgxpool.Pool) *Postgres { return &Postgres{pool: pool} }
 func (p *Postgres) Add(ctx context.Context, s model.Subscription) (model.Subscription, error) {
 	// FK subscriptions.chat_id → users.chat_id: пользователь должен существовать.
 	// Создаём запись сами (ON CONFLICT DO NOTHING — идемпотентно), чтобы
-	// /subscribe работал и без предварительного /start.
-	if _, err := p.pool.Exec(ctx,
-		`INSERT INTO notifier.users (chat_id) VALUES ($1) ON CONFLICT (chat_id) DO NOTHING`,
-		s.ChatID); err != nil {
-		return model.Subscription{}, fmt.Errorf("store: add subscription (chat %d): ensure user: %w", s.ChatID, err)
+	// /subscribe работал и без предварительного /start — тот же SQL, что и
+	// в EnsureUser (единая точка вставки, без дублирования).
+	if err := p.ensureUser(ctx, s.ChatID); err != nil {
+		return model.Subscription{}, fmt.Errorf("store: add subscription (chat %d): %w", s.ChatID, err)
 	}
 
 	// NULLIF превращает пустую строку модели в NULL («любое значение»);
@@ -61,7 +60,11 @@ func (p *Postgres) ByChat(ctx context.Context, chatID int64) ([]model.Subscripti
 	if err != nil {
 		return nil, fmt.Errorf("store: list subscriptions (chat %d): %w", chatID, err)
 	}
-	return collectSubscriptions(rows)
+	subs, err := collectSubscriptions(rows)
+	if err != nil {
+		return nil, fmt.Errorf("store: list subscriptions (chat %d): %w", chatID, err)
+	}
+	return subs, nil
 }
 
 // Delete удаляет подписку чата; false — у чата нет подписки с таким ID.
@@ -102,16 +105,30 @@ func (p *Postgres) All(ctx context.Context) ([]model.Subscription, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: list all subscriptions: %w", err)
 	}
-	return collectSubscriptions(rows)
+	subs, err := collectSubscriptions(rows)
+	if err != nil {
+		return nil, fmt.Errorf("store: list all subscriptions: %w", err)
+	}
+	return subs, nil
 }
 
 // EnsureUser создаёт запись пользователя (/start, ФТ-3.1); повторный вызов —
 // no-op, без ошибки.
 func (p *Postgres) EnsureUser(ctx context.Context, chatID int64) error {
+	if err := p.ensureUser(ctx, chatID); err != nil {
+		return fmt.Errorf("store: ensure user (chat %d): %w", chatID, err)
+	}
+	return nil
+}
+
+// ensureUser — общая вставка пользователя для Add и EnsureUser. Без
+// префикса источника: его добавляют вызывающие, чтобы сообщение показывало
+// операцию, в которой случился сбой.
+func (p *Postgres) ensureUser(ctx context.Context, chatID int64) error {
 	if _, err := p.pool.Exec(ctx,
 		`INSERT INTO notifier.users (chat_id) VALUES ($1) ON CONFLICT (chat_id) DO NOTHING`,
 		chatID); err != nil {
-		return fmt.Errorf("store: ensure user (chat %d): %w", chatID, err)
+		return fmt.Errorf("ensure user (chat %d): %w", chatID, err)
 	}
 	return nil
 }
