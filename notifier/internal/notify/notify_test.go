@@ -10,6 +10,7 @@ import (
 
 	"notifier/internal/model"
 	"notifier/internal/store"
+	"notifier/internal/telegram"
 )
 
 const testUUID = "550e8400-e29b-41d4-a716-446655440000"
@@ -542,5 +543,84 @@ func TestHandleRecipientTimeoutDoesNotAffectOthers(t *testing.T) {
 	}
 	if elapsed > 2*time.Second {
 		t.Fatalf("Handle занял %s, want <2с (пер-получательский дедлайн срезает зависшего)", elapsed)
+	}
+}
+
+func TestHandleRateLimitedReturnsToQueue(t *testing.T) {
+	// 429 — явный отказ Telegram (ТЗ 4.3), а не неопределённый исход:
+	// терминального unknown в журнале быть не должно, уведомление
+	// возвращается в очередь отложенных и будет повторено флешером.
+	sender := &recordingSender{}
+	sender.mu.Lock()
+	sender.err = fmt.Errorf("telegram sendMessage: %w", &telegram.RateLimitError{RetryAfter: 3 * time.Second})
+	sender.mu.Unlock()
+	subs := store.NewMemory()
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
+	journal := newMockJournal()
+	queue := &mockQueue{}
+	d := NewDispatcher(subs, journal, &mockLimiter{allowed: true}, queue, ModeLog, sender.send)
+
+	d.Handle(context.Background(), testEvent(1))
+
+	if got := sender.sent(); len(got) != 1 {
+		t.Fatalf("send вызовов = %v, want 1", got)
+	}
+	if n := journal.records["unknown/log"]; n != 0 {
+		t.Fatalf("unknown/log = %d, want 0 (429 — не терминальный исход)", n)
+	}
+	if n := journal.records["sent/log"]; n != 0 {
+		t.Fatalf("sent/log = %d, want 0", n)
+	}
+	if len(queue.postponed) != 1 || queue.postponed[0].ChatID != 10 || queue.postponed[0].Event.ID != 1 {
+		t.Fatalf("postponed = %+v, want задание 10:1 в очереди отложенных", queue.postponed)
+	}
+}
+
+func TestHandleRateLimitedSentinelWithoutWrapper(t *testing.T) {
+	// Сырая дозорная telegram.ErrRateLimited без обёртки с паузой
+	// распознаётся так же: задание откладывается, unknown не пишется.
+	sender := &recordingSender{}
+	sender.mu.Lock()
+	sender.err = telegram.ErrRateLimited
+	sender.mu.Unlock()
+	subs := store.NewMemory()
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
+	journal := newMockJournal()
+	queue := &mockQueue{}
+	d := NewDispatcher(subs, journal, &mockLimiter{allowed: true}, queue, ModeLog, sender.send)
+
+	d.Handle(context.Background(), testEvent(1))
+
+	if n := journal.records["unknown/log"]; n != 0 {
+		t.Fatalf("unknown/log = %d, want 0", n)
+	}
+	if len(queue.postponed) != 1 {
+		t.Fatalf("postponed = %+v, want одно задание в очереди", queue.postponed)
+	}
+}
+
+func TestFlushRateLimitedRetries(t *testing.T) {
+	// 429 при доставке отложенного задания возвращает его в очередь (retry):
+	// терминальный unknown прервал бы цепочку повторов (ТЗ 4.3).
+	e := testEvent(1)
+	queue := &mockQueue{popResult: []DeferredJob{{ChatID: 10, Event: e}}}
+	journal := newMockJournal()
+	sender := &recordingSender{}
+	sender.mu.Lock()
+	sender.err = &telegram.RateLimitError{RetryAfter: 5 * time.Second}
+	sender.mu.Unlock()
+	subs := store.NewMemory()
+	d := NewDispatcher(subs, journal, &mockLimiter{allowed: true}, queue, ModeTelegram, sender.send)
+
+	d.Flush(context.Background())
+
+	if got := sender.sent(); len(got) != 1 {
+		t.Fatalf("send вызовов = %v, want 1", got)
+	}
+	if len(queue.marks) != 1 || queue.marks[0] != "10:1=retry" {
+		t.Fatalf("marks = %v, want [10:1=retry]", queue.marks)
+	}
+	if n := journal.records["unknown/telegram"]; n != 0 {
+		t.Fatalf("unknown/telegram = %d, want 0", n)
 	}
 }

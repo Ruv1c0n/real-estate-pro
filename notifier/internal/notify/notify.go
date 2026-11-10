@@ -5,12 +5,14 @@ package notify
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sync"
 	"time"
 
 	"notifier/internal/model"
 	"notifier/internal/store"
+	"notifier/internal/telegram"
 )
 
 // Sender доставляет уведомление одному пользователю. В режиме бота это
@@ -263,9 +265,35 @@ func (d *Dispatcher) postpone(ctx context.Context, chatID int64, e model.Event) 
 	return d.queue.Postpone(context.WithoutCancel(ctx), chatID, e, d.mode)
 }
 
+// logRateLimited логирует отказ 429 с рекомендованной паузой из ответа
+// Telegram (RateLimitError.RetryAfter); обёртки может не быть — дозорная
+// ошибка ErrRateLimited распознаётся и без неё.
+func logRateLimited(err error, listingID, chatID int64) {
+	var rle *telegram.RateLimitError
+	if errors.As(err, &rle) {
+		log.Printf("dispatch: rate limited (retry_after %s): listing %d chat %d", rle.RetryAfter, listingID, chatID)
+		return
+	}
+	log.Printf("dispatch: rate limited: listing %d chat %d", listingID, chatID)
+}
+
 func (d *Dispatcher) deliver(ctx context.Context, chatID int64, e model.Event) {
 	status := StatusSent
 	if err := d.send(ctx, chatID, e); err != nil {
+		// 429 — явный отказ Telegram с рекомендованной паузой (ТЗ 4.3
+		// «Для 429 учитывается Retry-After»), а не неопределённый исход:
+		// терминальный unknown (contracts.md §2) здесь потерял бы уведомление.
+		// Возвращаем задание в очередь отложенных — повторит флешер; дубль
+		// при повторном Postpone съедает UNIQUE (chat_id, listing_id)
+		// Pg-очереди (ON CONFLICT DO NOTHING).
+		if errors.Is(err, telegram.ErrRateLimited) {
+			logRateLimited(err, e.ID, chatID)
+			if perr := d.postpone(ctx, chatID, e); perr != nil {
+				// Postpone тоже упал — лог и выходим (как в deliverRecipient).
+				log.Printf("postpone listing %d chat %d: %v", e.ID, chatID, perr)
+			}
+			return
+		}
 		// Ошибка отправки фиксируется в журнале как unknown: автоматический
 		// повтор не выполняется (contracts.md §2 — статус unknown без повтора).
 		log.Printf("send listing %d to chat %d: %v", e.ID, chatID, err)
@@ -317,6 +345,16 @@ func (d *Dispatcher) Flush(ctx context.Context) {
 		}
 		status := StatusSent
 		if err := d.send(ctx, job.ChatID, job.Event); err != nil {
+			// 429 — явный отказ (ТЗ 4.3), а не неопределённый исход: задание
+			// возвращается в очередь (retry), повтор — следующим проходом
+			// флешера. Точную паузу Retry-After очередь пока не отслеживает.
+			if errors.Is(err, telegram.ErrRateLimited) {
+				logRateLimited(err, job.Event.ID, job.ChatID)
+				if merr := d.queue.Mark(ctx, job, d.mode, StatusRetry); merr != nil {
+					log.Printf("mark retry listing %d chat %d: %v", job.Event.ID, job.ChatID, merr)
+				}
+				continue
+			}
 			// contracts.md §2: ошибка отправки — статус unknown, без повтора.
 			log.Printf("send listing %d to chat %d: %v", job.Event.ID, job.ChatID, err)
 			status = StatusUnknown
