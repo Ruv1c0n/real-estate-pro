@@ -122,7 +122,10 @@ func main() {
 	consumerErr := make(chan error, 1)
 	go func() {
 		defer close(consumerDone)
-		if err := stream.NewConsumer(redisClient, stream.ConsumerName(), dispatcher.Handle).Run(ctx); err != nil {
+		if err := stream.NewConsumer(redisClient, stream.ConsumerName(), dispatcher.Handle).Run(ctx); err != nil && ctx.Err() == nil {
+			// Ошибка шлётся в main только если ctx ещё жив: при штатной
+			// остановке (SIGTERM) Run завершается «context canceled» — это
+			// не фатальный сбой, и ложный exit 1 портить не нужно.
 			consumerErr <- err
 		}
 	}()
@@ -203,7 +206,10 @@ func (p *healthProber) ready(ctx context.Context) probeResult {
 	if cached {
 		return res
 	}
-	res = p.run(ctx, true)
+	// WithoutCancel: обрыв соединения клиентом (таймаут healthcheck-клиента)
+	// не должен отравлять кэш деградированным снимком на probeCacheTTL —
+	// probe доводится до конца на неотменяемом контексте.
+	res = p.run(context.WithoutCancel(ctx), true)
 	p.mu.Lock()
 	p.readyRes, p.readyAt = res, time.Now()
 	p.mu.Unlock()
@@ -220,7 +226,8 @@ func (p *healthProber) live(ctx context.Context) probeResult {
 	if cached {
 		return res
 	}
-	res = p.run(ctx, false)
+	// Без отмены входящего запроса — как в ready(): кэш не отравляется.
+	res = p.run(context.WithoutCancel(ctx), false)
 	p.mu.Lock()
 	p.liveRes, p.liveAt = res, time.Now()
 	p.mu.Unlock()
@@ -279,16 +286,14 @@ type checkResult struct {
 // Канал результатов буферизован: горутины не блокируются и не дают гонок,
 // если сборщик вышел по общему бюджету раньше их завершения — поздние
 // результаты остаются в канале и игнорируются (недождавшаяся проверка
-// учитывается как false).
+// учитывается как false). Время жизни горутин ограничено их собственными
+// per-check дедлайнами, поэтому явного ожидания не нужно.
 func parallelProbe(ctx context.Context, checks []func(context.Context) bool) []bool {
 	results := make([]bool, len(checks))
 	ch := make(chan checkResult, len(checks))
 
-	var wg sync.WaitGroup
 	for i, check := range checks {
-		wg.Add(1)
 		go func(i int, check func(context.Context) bool) {
-			defer wg.Done()
 			cctx, cancel := context.WithTimeout(ctx, probeCheckTimeout)
 			defer cancel()
 			ch <- checkResult{i, check(cctx)}
