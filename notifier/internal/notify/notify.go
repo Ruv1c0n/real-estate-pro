@@ -168,6 +168,12 @@ func (l *MemoryLimiter) Allow(_ context.Context, chatID int64, mode string) (boo
 	return true, nil
 }
 
+// perRecipientBudget — дедлайн на доставку ОДНОМУ получателю. У получателя
+// 2-3 последовательные операции (журнал, лимитер, Telegram HTTP, очередь
+// отложенных); единый бюджет на всё событие при десятках получателей
+// кончался на середине списка, поэтому дедлайн теперь свой у каждого.
+const perRecipientBudget = 5 * time.Second
+
 // Dispatcher сопоставляет событие с подписками и доставляет уведомления.
 type Dispatcher struct {
 	subs    store.Store
@@ -176,10 +182,13 @@ type Dispatcher struct {
 	queue   DeferredQueue
 	send    Sender
 	mode    string // telegram / log, для notifications_log.mode
+	// perRecipient — дедлайн на одного получателя (см. deliverRecipient);
+	// поле незэкспортировано, тесты того же пакета ставят его напрямую.
+	perRecipient time.Duration
 }
 
 func NewDispatcher(subs store.Store, journal Journal, limiter Limiter, queue DeferredQueue, mode string, send Sender) *Dispatcher {
-	return &Dispatcher{subs: subs, journal: journal, limiter: limiter, queue: queue, mode: mode, send: send}
+	return &Dispatcher{subs: subs, journal: journal, limiter: limiter, queue: queue, mode: mode, send: send, perRecipient: perRecipientBudget}
 }
 
 // deferredBatchSize — сколько отложенных заданий флешер забирает за один проход.
@@ -201,32 +210,57 @@ func (d *Dispatcher) Handle(ctx context.Context, e model.Event) {
 		return
 	}
 	for _, chatID := range model.Recipients(e, recipients) {
-		sent, err := d.journal.Sent(ctx, e.ID, chatID)
-		if err != nil {
-			// Журнал недоступен — не паникуем и не прерываем доставку
-			// остальных получателей: at-least-once допускает повтор.
-			log.Printf("journal check listing %d chat %d: %v", e.ID, chatID, err)
-		}
-		if sent {
-			continue // событие доставлено повторно — не дублируем (ФТ-3.5)
-		}
-		ok, err := d.limiter.Allow(ctx, chatID, d.mode)
-		if err != nil {
-			// Ошибка лимитера трактуется как «слот занят»: задание
-			// откладывается и будет повторено флешером.
-			log.Printf("limiter check listing %d chat %d: %v", e.ID, chatID, err)
-			ok = false
-		}
-		if ok {
-			d.deliver(ctx, chatID, e)
-			continue
-		}
-		if err := d.queue.Postpone(ctx, chatID, e, d.mode); err != nil {
-			log.Printf("postpone listing %d chat %d: %v", e.ID, chatID, err)
-			continue
-		}
-		log.Printf("hourly limit reached: listing %d to chat %d deferred", e.ID, chatID)
+		d.deliverRecipient(ctx, chatID, e)
 	}
+}
+
+// deliverRecipient доставляет событие одному получателю в рамках его
+// собственного дедлайна. Доставка последовательная, и раньше общий бюджет
+// события кончался на середине списка: у хвоста отменялись Allow/Postpone,
+// ничего не записывалось, и событие терялось после XACK. Свой дедлайн у
+// каждого получателя гарантирует, что хвост получает полный бюджет
+// независимо от размера списка.
+func (d *Dispatcher) deliverRecipient(ctx context.Context, chatID int64, e model.Event) {
+	rctx, cancel := context.WithTimeout(ctx, d.perRecipient)
+	defer cancel()
+
+	sent, err := d.journal.Sent(rctx, e.ID, chatID)
+	if err != nil {
+		// Журнал недоступен — не паникуем и не прерываем доставку
+		// остальных получателей: at-least-once допускает повтор.
+		log.Printf("journal check listing %d chat %d: %v", e.ID, chatID, err)
+	}
+	if sent {
+		return // событие доставлено повторно — не дублируем (ФТ-3.5)
+	}
+	ok, err := d.limiter.Allow(rctx, chatID, d.mode)
+	if err != nil {
+		// Ошибка лимитера трактуется как «слот занят»: задание
+		// откладывается и будет повторено флешером.
+		log.Printf("limiter check listing %d chat %d: %v", e.ID, chatID, err)
+		ok = false
+	}
+	if ok {
+		d.deliver(rctx, chatID, e)
+		return
+	}
+	if err := d.postpone(rctx, chatID, e); err != nil {
+		log.Printf("postpone listing %d chat %d: %v", e.ID, chatID, err)
+		return
+	}
+	log.Printf("hourly limit reached: listing %d to chat %d deferred", e.ID, chatID)
+}
+
+// postpone возвращает уведомление в очередь отложенных. Запись идёт на
+// контексте без отмены (context.WithoutCancel): истёкший пер-получательский
+// дедлайн или отмена родителя (например, shutdown) не должны мешать — иначе
+// отложенная строка не запишется, не останется ни записи в журнале, ни
+// задания в очереди, и уведомление будет потеряно молча после XACK.
+// Отложенная строка — единственная гарантия at-least-once через флешер,
+// поэтому она важнее дедлайна. Риск «зависшей» записи без дедлайна осознан
+// и зеркалит XACK в consumer.process (тот же context.WithoutCancel).
+func (d *Dispatcher) postpone(ctx context.Context, chatID int64, e model.Event) error {
+	return d.queue.Postpone(context.WithoutCancel(ctx), chatID, e, d.mode)
 }
 
 func (d *Dispatcher) deliver(ctx context.Context, chatID int64, e model.Event) {

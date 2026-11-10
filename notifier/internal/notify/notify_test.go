@@ -428,3 +428,119 @@ func TestHandleStoreErrorNoDelivery(t *testing.T) {
 		t.Fatalf("postponed = %+v, want пусто", queue.postponed)
 	}
 }
+
+// slowSender — отправитель, который «работает» дольше пер-получательского
+// бюджета и уважает контекст (как реальный HTTP-вызов Telegram).
+type slowSender struct {
+	delay time.Duration
+
+	mu    sync.Mutex
+	calls []string
+}
+
+func (s *slowSender) send(ctx context.Context, chatID int64, e model.Event) error {
+	s.mu.Lock()
+	s.calls = append(s.calls, fmt.Sprintf("%d:%d", chatID, e.ID))
+	s.mu.Unlock()
+	select {
+	case <-time.After(s.delay):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *slowSender) sent() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.calls...)
+}
+
+func TestHandlePerRecipientBudgetKeepsAllRecipients(t *testing.T) {
+	// 20 получателей, каждая отправка дольше пер-получательского бюджета:
+	// бюджет одного получателя не должен ограничивать остальных. Все 20
+	// обрабатываются и фиксируются в журнале — никто не теряется по бюджету.
+	// Раньше общий бюджет события (5 с) кончался на середине списка: у хвоста
+	// отменялись Allow/Postpone, и после XACK уведомления терялись молча.
+	subs := store.NewMemory()
+	for i := int64(1); i <= 20; i++ {
+		subs.Add(context.Background(), model.Subscription{ChatID: i})
+	}
+	journal := newMockJournal()
+	slow := &slowSender{delay: 100 * time.Millisecond}
+	d := NewDispatcher(subs, journal, NewMemoryLimiter(1000, time.Hour), NewMemoryQueue(), ModeLog, slow.send)
+	d.perRecipient = 50 * time.Millisecond
+
+	start := time.Now()
+	d.Handle(context.Background(), testEvent(1))
+	elapsed := time.Since(start)
+
+	// Каждый получатель обработан в своём бюджете: отправка срезана дедлайном
+	// (50 мс < 100 мс) и зафиксирована как unknown — ни один не пропущен.
+	if n := journal.records["unknown/log"]; n != 20 {
+		t.Fatalf("unknown/log = %d, want 20 (каждый получатель получил свой бюджет)", n)
+	}
+	if n := journal.records["sent/log"]; n != 0 {
+		t.Fatalf("sent/log = %d, want 0", n)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("Handle занял %s, want ~20 × 50 мс (дедлайн срезает каждый вызов)", elapsed)
+	}
+}
+
+// hangingSender — отправитель, зависающий на одном чате до отмены контекста:
+// имитация зависшего HTTP-вызова, который сам не завершается.
+type hangingSender struct {
+	hangChat int64
+
+	mu    sync.Mutex
+	calls []string
+}
+
+func (s *hangingSender) send(ctx context.Context, chatID int64, e model.Event) error {
+	s.mu.Lock()
+	s.calls = append(s.calls, fmt.Sprintf("%d:%d", chatID, e.ID))
+	s.mu.Unlock()
+	if chatID == s.hangChat {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second): // страховка: без пер-получательского бюджета тест упадёт по времени
+			return errors.New("sender: hang budget exceeded")
+		}
+	}
+	return nil
+}
+
+func (s *hangingSender) sent() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.calls...)
+}
+
+func TestHandleRecipientTimeoutDoesNotAffectOthers(t *testing.T) {
+	// Зависший отправитель первого чата срезается его пер-получательским
+	// бюджетом (unknown), второй чат получает свой полный бюджет и
+	// доставляется — таймаут одного получателя не валит остальных.
+	subs := store.NewMemory()
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
+	subs.Add(context.Background(), model.Subscription{ChatID: 20})
+	journal := newMockJournal()
+	hanging := &hangingSender{hangChat: 10}
+	d := NewDispatcher(subs, journal, NewMemoryLimiter(1000, time.Hour), NewMemoryQueue(), ModeLog, hanging.send)
+	d.perRecipient = 50 * time.Millisecond
+
+	start := time.Now()
+	d.Handle(context.Background(), testEvent(1))
+	elapsed := time.Since(start)
+
+	if n := journal.records["unknown/log"]; n != 1 {
+		t.Fatalf("unknown/log = %d, want 1 (зависший чат срезан бюджетом)", n)
+	}
+	if n := journal.records["sent/log"]; n != 1 {
+		t.Fatalf("sent/log = %d, want 1 (второй чат доставлен после таймаута первого)", n)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("Handle занял %s, want <2с (пер-получательский дедлайн срезает зависшего)", elapsed)
+	}
+}

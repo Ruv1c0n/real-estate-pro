@@ -25,13 +25,12 @@ const (
 	// DeadStream — стрим для некорректных payload'ов.
 	DeadStream = "listings.dead"
 
-	workerCount  = 8                // пул воркеров, ТЗ 3.6
-	minIdle      = 30 * time.Second // pending старше этого срока забирает XAUTOCLAIM
-	claimEvery   = 15 * time.Second // период обхода pending
-	readBlock    = 5 * time.Second  // блокирующее чтение XREADGROUP
-	readCount    = int64(16)        // сообщений за одно чтение
-	retryDelay   = 3 * time.Second  // пауза при ошибке Redis
-	handleBudget = 5 * time.Second  // бюджет обработки одного события (НФТ-11)
+	workerCount = 8                // пул воркеров, ТЗ 3.6
+	minIdle     = 30 * time.Second // pending старше этого срока забирает XAUTOCLAIM
+	claimEvery  = 15 * time.Second // период обхода pending
+	readBlock   = 5 * time.Second  // блокирующее чтение XREADGROUP
+	readCount   = int64(16)        // сообщений за одно чтение
+	retryDelay  = 3 * time.Second  // пауза при ошибке Redis
 )
 
 // Handler обрабатывает одно событие. Обработка фиксирует доставку
@@ -205,13 +204,22 @@ func (c *Consumer) process(ctx context.Context, msg redis.XMessage) {
 		return
 	}
 
-	// НФТ-11: уведомление не позднее 5 секунд после события.
-	hctx, cancel := context.WithTimeout(ctx, handleBudget)
-	c.handle(hctx, event)
-	cancel()
+	// НФТ-11 — это p95 end-to-end < 5 с при профиле нагрузки «1 событие / 5 с»,
+	// а не бюджет обработки: при последовательной доставке десяткам получателей
+	// общий бюджет события кончался на середине списка — у хвоста отменялись
+	// Allow/Postpone, ничего не записывалось, и безусловный XACK (issue #53)
+	// терял уведомления систематически. Дедлайн теперь пер-получательский
+	// (notify.perRecipientBudget, 5 с на каждого chatID), поэтому общий бюджет
+	// события убран: per-recipient бюджет сохраняет p95 при заданном профиле
+	// нагрузки, а хвост списка получает свой полный бюджет независимо от
+	// количества получателей. От зависшей обработки защиту даёт XAUTOCLAIM
+	// (minIdle): запись, чья обработка пережила 30 с, будет забрана повторно —
+	// повтор безопасен, дедуп по журналу (ФТ-3.5).
+	c.handle(ctx, event)
 
 	// XACK — только после обработки; redis-операции не должны зависеть от
-	// истёкшего бюджета обработки, поэтому отдельный контекст.
+	// отмены контекста обработки (в т.ч. при остановке сервиса), поэтому
+	// отдельный контекст.
 	if err := c.rdb.XAck(context.WithoutCancel(ctx), StreamName, GroupName, msg.ID).Err(); err != nil {
 		// Не подтверждено: запись останется в pending, XAUTOCLAIM вернёт её.
 		log.Printf("xack %s: %v", msg.ID, err)
