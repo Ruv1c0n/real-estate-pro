@@ -687,3 +687,62 @@ func TestFlushRateLimitedRetries(t *testing.T) {
 		t.Fatalf("unknown/telegram = %d, want 0", n)
 	}
 }
+
+// TestMemoryQueuePostponeInflightVisible — повторная публикация события,
+// пока задание «в полёте» (PopBatch без Mark), не создаёт вторую копию:
+// окно PopBatch→Mark невидимо для скана очереди (находка гейт-ревью R8).
+func TestMemoryQueuePostponeInflightVisible(t *testing.T) {
+	q := NewMemoryQueue()
+	ctx := context.Background()
+	e := testEvent(10)
+	if err := q.Postpone(ctx, 100, e, ModeLog); err != nil {
+		t.Fatalf("postpone: %v", err)
+	}
+	jobs, err := q.PopBatch(ctx, 5)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("popbatch: %v, %d заданий", err, len(jobs))
+	}
+	if err := q.Postpone(ctx, 100, e, ModeLog); err != nil {
+		t.Fatalf("postpone inflight: %v", err)
+	}
+	if err := q.Mark(ctx, jobs[0], ModeLog, StatusSent); err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+	if err := q.Postpone(ctx, 100, e, ModeLog); err != nil {
+		t.Fatalf("postpone после mark: %v", err)
+	}
+	jobs, err = q.PopBatch(ctx, 5)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("popbatch после mark: %v, %d заданий", err, len(jobs))
+	}
+}
+
+// TestFlushSkipsAlreadySent — ТЗ 4.3 «Уже записанное состояние sent не
+// отправляется повторно»: задание лежит в очереди, событие уже доставлено
+// другим путём — Flush не отправляет второй раз и закрывает задание как sent.
+func TestFlushSkipsAlreadySent(t *testing.T) {
+	subs := store.NewMemory()
+	if _, err := subs.Add(context.Background(), model.Subscription{ChatID: 100}); err != nil {
+		t.Fatalf("add subscription: %v", err)
+	}
+	j := NewMemoryJournal()
+	q := NewMemoryQueue()
+	l := NewMemoryLimiter(30, time.Hour)
+	sender := &recordingSender{}
+	d := NewDispatcher(subs, j, l, q, ModeLog, sender.send)
+	ctx := context.Background()
+
+	e := testEvent(10)
+	if err := q.Postpone(ctx, 100, e, ModeLog); err != nil {
+		t.Fatalf("postpone: %v", err)
+	}
+	// Событие уже доставлено другим путём (повтор публикации, гонка воркеров).
+	if err := j.Record(ctx, 100, e.ID, e.EventID, e, StatusSent, ModeLog); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+
+	d.Flush(ctx)
+	if got := sender.sent(); len(got) != 0 {
+		t.Fatalf("sent = %v, want пусто — повторная доставка уже sent-события", got)
+	}
+}

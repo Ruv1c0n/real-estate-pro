@@ -222,10 +222,14 @@ func (b *Bot) Send(ctx context.Context, chatID int64, e model.Event) error {
 	return b.api.SendMessage(ctx, chatID, FormatEvent(e))
 }
 
-// maxMessageLen — лимит длины одного сообщения Telegram (в рунах — символах,
-// не байтах). Сообщение длиннее лимита SendMessage отклонит целиком, поэтому
-// длина ограничивается при форматировании (см. FormatEvent).
-const maxMessageLen = 4096
+// maxMessageLen — рабочий потолок длины сообщения (в рунах — символах, не
+// байтах). Официальный лимит Telegram — 4096 символов, но вне-BMP-эмодзи
+// (🏠 U+1F3E0, 📍 U+1F4CD в шапке уведомления) считаются в UTF-16 как две
+// единицы; для офсетов entities Bot API документированы именно UTF-16
+// единицы, поэтому оставляем запас в 2 единицы от формального лимита.
+// Сообщение длиннее лимита SendMessage отклонит целиком, поэтому длина
+// ограничивается при форматировании (см. FormatEvent).
+const maxMessageLen = 4094
 
 // ellipsis — признак усечённого поля в конце.
 const ellipsis = "…"
@@ -296,10 +300,12 @@ func FormatEvent(e model.Event) string {
 			city := truncateRunes(e.City, cityLen-need-1) + ellipsis
 			return "🏠 Новое объявление\n" + strings.Replace(stats, e.City, city, 1) + "\n" + ellipsis
 		}
-		// Город короче некуда — отдаём шапку как есть: частично скроенный
-		// текст лучше отброшенного события.
 	}
-	return head
+	// Безусловный последний ярус: инвариант «сообщение всегда ≤ лимита»
+	// обязан держаться на любом входе (иначе SendMessage отклонит его —
+	// unknown без повтора, уведомление потеряно целиком). Отдаём шапку,
+	// усечённую до лимита.
+	return truncateRunes(head, maxMessageLen-1) + ellipsis
 }
 
 // Describe — человекочитаемое описание фильтра подписки.

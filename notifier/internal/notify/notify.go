@@ -391,6 +391,23 @@ func (d *Dispatcher) Flush(ctx context.Context) {
 			}
 			continue
 		}
+		// ТЗ 4.3 «Уже записанное состояние sent не отправляется повторно»:
+		// событие могло быть доставлено другим путём (повтор публикации,
+		// гонка воркеров) после того, как задание легло в очередь. Ошибка
+		// журнала не блокирует отправку — at-least-once допускает повтор,
+		// его гасит дедуп журнала при Record.
+		sent, serr := d.journal.Sent(ctx, job.Event.ID, job.ChatID)
+		if serr != nil {
+			log.Printf("journal check deferred listing %d chat %d: %v", job.Event.ID, job.ChatID, serr)
+		}
+		if sent {
+			// Задание закрывается как sent: в Pg строка уже не deferred
+			// (UPDATE не найдёт её), в memory Mark убирает из очереди.
+			if merr := d.queue.Mark(ctx, job, d.mode, StatusSent); merr != nil {
+				log.Printf("mark listing %d chat %d: %v", job.Event.ID, job.ChatID, merr)
+			}
+			continue
+		}
 		status := StatusSent
 		if err := d.send(ctx, job.ChatID, job.Event); err != nil {
 			// 429 — явный отказ (ТЗ 4.3), а не неопределённый исход: задание
