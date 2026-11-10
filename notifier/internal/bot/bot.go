@@ -3,12 +3,14 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
 	"strings"
 	"time"
 
+	"notifier/internal/dicts"
 	"notifier/internal/model"
 	"notifier/internal/store"
 	"notifier/internal/telegram"
@@ -28,6 +30,11 @@ type Validator interface {
 
 // MaxSubscriptionsPerUser — лимит подписок на пользователя (ТЗ 3.6).
 const MaxSubscriptionsPerUser = 10
+
+// msgUnavailable — единственный ответ при недоступности хранилища или
+// справочников: детали ошибки (хост/пользователь БД, URL core-api) в чат
+// не утекают — они уходят в лог (L6).
+const msgUnavailable = "Сервис временно недоступен, попробуйте позже."
 
 type Bot struct {
 	api   API
@@ -93,17 +100,17 @@ func (b *Bot) handle(ctx context.Context, chatID int64, text string) {
 	var reply string
 	switch cmd {
 	case "/start":
-		reply = b.start(chatID)
+		reply = b.start(ctx, chatID)
 	case "/help":
 		reply = helpText
 	case "/subscribe":
 		reply = b.subscribe(ctx, chatID, args)
 	case "/list":
-		reply = b.list(chatID)
+		reply = b.list(ctx, chatID)
 	case "/unsubscribe":
-		reply = b.unsubscribe(chatID, args)
+		reply = b.unsubscribe(ctx, chatID, args)
 	case "/stop":
-		reply = b.stop(chatID)
+		reply = b.stop(ctx, chatID)
 	default:
 		if !strings.HasPrefix(cmd, "/") {
 			return
@@ -114,7 +121,12 @@ func (b *Bot) handle(ctx context.Context, chatID int64, text string) {
 }
 
 func (b *Bot) subscribe(ctx context.Context, chatID int64, args []string) string {
-	if n := b.subs.CountForChat(chatID); n >= MaxSubscriptionsPerUser {
+	n, err := b.subs.CountForChat(ctx, chatID)
+	if err != nil {
+		log.Printf("bot: count subscriptions (chat %d): %v", chatID, err)
+		return msgUnavailable
+	}
+	if n >= MaxSubscriptionsPerUser {
 		return fmt.Sprintf("У вас уже %d подписок — это максимум. /list покажет ваши подписки, /unsubscribe удалит лишнюю.", MaxSubscriptionsPerUser)
 	}
 	s, err := ParseSubscription(args)
@@ -123,15 +135,30 @@ func (b *Bot) subscribe(ctx context.Context, chatID int64, args []string) string
 	}
 	s.Country, s.City, err = b.dicts.Validate(ctx, s.Country, s.City)
 	if err != nil {
+		// Недоступность справочников может нести детали (URL core-api) — в чат
+		// идёт нейтральный текст (L6). Ошибки валидации («неизвестный город»)
+		// — пользовательские, их показываем как есть.
+		if errors.Is(err, dicts.ErrUnavailable) {
+			log.Printf("bot: validate subscription (chat %d): %v", chatID, err)
+			return msgUnavailable
+		}
 		return "Не получилось: " + err.Error()
 	}
 	s.ChatID = chatID
-	s = b.subs.Add(s)
+	s, err = b.subs.Add(ctx, s)
+	if err != nil {
+		log.Printf("bot: add subscription (chat %d): %v", chatID, err)
+		return msgUnavailable
+	}
 	return fmt.Sprintf("Подписка #%d создана: %s", s.ID, Describe(s))
 }
 
-func (b *Bot) list(chatID int64) string {
-	subs := b.subs.ByChat(chatID)
+func (b *Bot) list(ctx context.Context, chatID int64) string {
+	subs, err := b.subs.ByChat(ctx, chatID)
+	if err != nil {
+		log.Printf("bot: list subscriptions (chat %d): %v", chatID, err)
+		return msgUnavailable
+	}
 	if len(subs) == 0 {
 		return "Подписок пока нет. Создайте: /subscribe city=Minsk rooms=1 max=400"
 	}
@@ -142,7 +169,7 @@ func (b *Bot) list(chatID int64) string {
 	return strings.TrimSpace(sb.String())
 }
 
-func (b *Bot) unsubscribe(chatID int64, args []string) string {
+func (b *Bot) unsubscribe(ctx context.Context, chatID int64, args []string) string {
 	if len(args) != 1 {
 		return "Укажите номер: /unsubscribe 1"
 	}
@@ -150,7 +177,12 @@ func (b *Bot) unsubscribe(chatID int64, args []string) string {
 	if err != nil {
 		return "Номер подписки должен быть числом: /unsubscribe 1"
 	}
-	if !b.subs.Delete(chatID, id) {
+	ok, err := b.subs.Delete(ctx, chatID, id)
+	if err != nil {
+		log.Printf("bot: delete subscription %d (chat %d): %v", id, chatID, err)
+		return msgUnavailable
+	}
+	if !ok {
 		return "Такой подписки нет."
 	}
 	return fmt.Sprintf("Подписка #%d удалена.", id)
@@ -158,19 +190,21 @@ func (b *Bot) unsubscribe(chatID int64, args []string) string {
 
 // start регистрирует пользователя в notifier.users (/start, ФТ-3.1) и
 // показывает помощь. Повторный /start идемпотентен.
-func (b *Bot) start(chatID int64) string {
-	if err := b.subs.EnsureUser(chatID); err != nil {
-		return "Не получилось: " + err.Error()
+func (b *Bot) start(ctx context.Context, chatID int64) string {
+	if err := b.subs.EnsureUser(ctx, chatID); err != nil {
+		log.Printf("bot: ensure user (chat %d): %v", chatID, err)
+		return msgUnavailable
 	}
 	return helpText
 }
 
 // stop удаляет пользователя и все его данные (ФТ-3.1): в Postgres каскад
 // чистит подписки и журнал; для ответа боту хранилище возвращает число подписок.
-func (b *Bot) stop(chatID int64) string {
-	n, err := b.subs.DeleteUser(chatID)
+func (b *Bot) stop(ctx context.Context, chatID int64) string {
+	n, err := b.subs.DeleteUser(ctx, chatID)
 	if err != nil {
-		return "Не получилось: " + err.Error()
+		log.Printf("bot: delete user (chat %d): %v", chatID, err)
+		return msgUnavailable
 	}
 	return fmt.Sprintf("Готово: удалено подписок — %d. Вы больше не будете получать уведомления. /subscribe вернёт их в любой момент.", n)
 }

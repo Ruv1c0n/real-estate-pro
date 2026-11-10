@@ -62,9 +62,9 @@ func newTestDispatcher(limit int) (*Dispatcher, *recordingSender, *store.Memory,
 
 func TestHandleSendsOncePerChat(t *testing.T) {
 	d, sender, subs, _, _ := newTestDispatcher(1000)
-	subs.Add(model.Subscription{ChatID: 10, City: "Minsk"})
-	subs.Add(model.Subscription{ChatID: 10, Rooms: model.IntPtr(1)}) // тот же чат
-	subs.Add(model.Subscription{ChatID: 20, City: "Brest"})          // не совпал
+	subs.Add(context.Background(), model.Subscription{ChatID: 10, City: "Minsk"})
+	subs.Add(context.Background(), model.Subscription{ChatID: 10, Rooms: model.IntPtr(1)}) // тот же чат
+	subs.Add(context.Background(), model.Subscription{ChatID: 20, City: "Brest"})          // не совпал
 
 	d.Handle(context.Background(), testEvent(1))
 
@@ -76,7 +76,7 @@ func TestHandleSendsOncePerChat(t *testing.T) {
 
 func TestHandleRedeliveryDeduplicated(t *testing.T) {
 	d, sender, subs, _, _ := newTestDispatcher(1000)
-	subs.Add(model.Subscription{ChatID: 10})
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
 
 	e := testEvent(1)
 	d.Handle(context.Background(), e)
@@ -91,7 +91,7 @@ func TestHandleDeferWhenLimitReached(t *testing.T) {
 	base := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
 	d, sender, subs, limiter, _ := newTestDispatcher(2)
 	limiter.nowFunc = func() time.Time { return base }
-	subs.Add(model.Subscription{ChatID: 10})
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
 
 	d.Handle(context.Background(), testEvent(1))
 	d.Handle(context.Background(), testEvent(2))
@@ -112,8 +112,8 @@ func TestHandleDeferWhenLimitReached(t *testing.T) {
 
 func TestHandleDifferentChatsHaveOwnLimits(t *testing.T) {
 	d, sender, subs, _, _ := newTestDispatcher(1)
-	subs.Add(model.Subscription{ChatID: 10})
-	subs.Add(model.Subscription{ChatID: 20})
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
+	subs.Add(context.Background(), model.Subscription{ChatID: 20})
 
 	d.Handle(context.Background(), testEvent(1))
 	d.Handle(context.Background(), testEvent(2))
@@ -248,7 +248,7 @@ func (m *mockQueue) Mark(_ context.Context, job DeferredJob, _, status string) e
 func TestHandlePostponesWhenLimitReached(t *testing.T) {
 	sender := &recordingSender{}
 	subs := store.NewMemory()
-	subs.Add(model.Subscription{ChatID: 10})
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
 	queue := &mockQueue{}
 	d := NewDispatcher(subs, newMockJournal(), &mockLimiter{allowed: false}, queue, ModeLog, sender.send)
 
@@ -267,7 +267,7 @@ func TestHandleLimiterErrorPostpones(t *testing.T) {
 	// уведомление не теряется; Dispatcher не паникует.
 	sender := &recordingSender{}
 	subs := store.NewMemory()
-	subs.Add(model.Subscription{ChatID: 10})
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
 	queue := &mockQueue{}
 	d := NewDispatcher(subs, newMockJournal(), &mockLimiter{err: errors.New("db down")}, queue, ModeLog, sender.send)
 
@@ -344,7 +344,7 @@ func TestHandleSentErrorStillDelivers(t *testing.T) {
 	journal := newMockJournal()
 	journal.sentErr = errors.New("db down")
 	d := NewDispatcher(subs, journal, &mockLimiter{allowed: true}, NewMemoryQueue(), ModeLog, sender.send)
-	subs.Add(model.Subscription{ChatID: 10})
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
 
 	d.Handle(context.Background(), testEvent(1))
 
@@ -361,7 +361,7 @@ func TestHandleRecordErrorNoPanic(t *testing.T) {
 	journal := newMockJournal()
 	journal.recordErr = errors.New("db down")
 	d := NewDispatcher(subs, journal, &mockLimiter{allowed: true}, NewMemoryQueue(), ModeLog, sender.send)
-	subs.Add(model.Subscription{ChatID: 10})
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
 
 	d.Handle(context.Background(), testEvent(1))
 	d.Flush(context.Background())
@@ -378,7 +378,7 @@ func TestHandleRecordsStatusAndMode(t *testing.T) {
 	subs := store.NewMemory()
 	journal := newMockJournal()
 	d := NewDispatcher(subs, journal, &mockLimiter{allowed: true}, NewMemoryQueue(), ModeTelegram, sender.send)
-	subs.Add(model.Subscription{ChatID: 10})
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
 
 	d.Handle(context.Background(), testEvent(1))
 
@@ -393,5 +393,38 @@ func TestHandleRecordsStatusAndMode(t *testing.T) {
 
 	if n := journal.records["unknown/telegram"]; n != 1 {
 		t.Fatalf("записей unknown/telegram = %d, want 1", n)
+	}
+}
+
+// failingStore — Store, у которого All возвращает ошибку: хранилище подписок
+// недоступно в момент обработки события.
+type failingStore struct {
+	store.Store
+	err error
+}
+
+func (f *failingStore) All(context.Context) ([]model.Subscription, error) {
+	return nil, f.err
+}
+
+func TestHandleStoreErrorNoDelivery(t *testing.T) {
+	// Хранилище подписок недоступно: ошибку All нельзя трактовать как
+	// «получателей нет» — доставка не выполняется вовсе (sender не вызван,
+	// в очередь отложенных ничего не попадает). До условного XACK (issue #53)
+	// событие при этом теряется из стрима — см. Handle.
+	mem := store.NewMemory()
+	mem.Add(context.Background(), model.Subscription{ChatID: 10})
+	sender := &recordingSender{}
+	queue := &mockQueue{}
+	d := NewDispatcher(&failingStore{Store: mem, err: errors.New("db down")},
+		newMockJournal(), &mockLimiter{allowed: true}, queue, ModeLog, sender.send)
+
+	d.Handle(context.Background(), testEvent(1))
+
+	if got := sender.sent(); len(got) != 0 {
+		t.Fatalf("sent = %v, want 0 (ошибка хранилища отменяет доставку)", got)
+	}
+	if len(queue.postponed) != 0 {
+		t.Fatalf("postponed = %+v, want пусто", queue.postponed)
 	}
 }

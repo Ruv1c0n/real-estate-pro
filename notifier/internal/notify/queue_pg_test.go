@@ -228,7 +228,7 @@ func TestPgThirtyPerHourScenario(t *testing.T) {
 	q := NewPgQueue(testPool)
 	sender := &recordingSender{}
 	subs := store.NewMemory()
-	subs.Add(model.Subscription{ChatID: 100})
+	subs.Add(context.Background(), model.Subscription{ChatID: 100})
 	d := NewDispatcher(subs, j, l, q, ModeLog, sender.send)
 	ctx := context.Background()
 

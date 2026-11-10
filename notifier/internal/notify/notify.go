@@ -189,7 +189,18 @@ const deferredBatchSize = 100
 // (уникальные чаты, ФТ-3.4), пропускает повторную доставку по журналу,
 // отправляет сразу или откладывает при исчерпании лимита.
 func (d *Dispatcher) Handle(ctx context.Context, e model.Event) {
-	for _, chatID := range model.Recipients(e, d.subs.All()) {
+	recipients, err := d.subs.All(ctx)
+	if err != nil {
+		// Хранилище подписок недоступно: ошибку нельзя трактовать как
+		// «получателей нет» — это была бы молчаливая потеря событий. Доставку
+		// не начинаем вовсе, чтобы никто не получил частичную рассылку.
+		// До условного XACK (issue #53) событие при этом теряется из стрима —
+		// осознанный шаг к R10: надёжность даёт подтверждение после полной
+		// обработки, а не до неё.
+		log.Printf("dispatch: list subscriptions: %v", err)
+		return
+	}
+	for _, chatID := range model.Recipients(e, recipients) {
 		sent, err := d.journal.Sent(ctx, e.ID, chatID)
 		if err != nil {
 			// Журнал недоступен — не паникуем и не прерываем доставку

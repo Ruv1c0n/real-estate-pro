@@ -254,7 +254,7 @@ func TestPgDispatcherDoubleDelivery(t *testing.T) {
 
 	sender := &recordingSender{}
 	subs := store.NewMemory()
-	subs.Add(model.Subscription{ChatID: 100})
+	subs.Add(context.Background(), model.Subscription{ChatID: 100})
 	d := NewDispatcher(subs, j, NewMemoryLimiter(10, time.Hour), NewMemoryQueue(), ModeLog, sender.send)
 
 	e := testEvent(1)
