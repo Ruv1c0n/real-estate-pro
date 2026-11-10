@@ -51,6 +51,29 @@ type eventJSON struct {
 	CreatedAt *time.Time `json:"created_at"`
 }
 
+// MarshalJSON кодирует событие сразу в контрактную форму (contracts.md §2,
+// snake_case): единая точка кодирования снимка для всех, кто пишет payload
+// (журнал и очередь отложенных в notifications_log); ParseEvent — обратная
+// операция. Все 13 ключей присутствуют всегда; Address может быть null.
+func (e Event) MarshalJSON() ([]byte, error) {
+	j := eventJSON{
+		EventID:   &e.EventID,
+		ID:        &e.ID,
+		Source:    &e.Source,
+		DealType:  &e.DealType,
+		Country:   &e.Country,
+		City:      &e.City,
+		Rooms:     &e.Rooms,
+		Price:     &e.Price,
+		Currency:  &e.Currency,
+		PriceUSD:  &e.PriceUSD,
+		Address:   e.Address,
+		URL:       &e.URL,
+		CreatedAt: &e.CreatedAt,
+	}
+	return json.Marshal(j)
+}
+
 // ParseEvent разбирает JSON из поля `data` и проверяет обязательные поля.
 func ParseEvent(data []byte) (Event, error) {
 	var j eventJSON

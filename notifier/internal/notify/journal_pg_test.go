@@ -8,7 +8,6 @@ package notify
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -180,25 +179,10 @@ func TestPgJournalSentIgnoresDeferred(t *testing.T) {
 	}
 }
 
-// eventPayload — зеркало model.Event: journal хранит снимок события
-// через encoding/json без тегов (поля — Go-имена структуры), round-trip
-// проверяем по полям JSON в колонке payload.
-type eventPayload struct {
-	EventID   string    `json:"EventID"`
-	ID        int64     `json:"ID"`
-	Source    string    `json:"Source"`
-	DealType  string    `json:"DealType"`
-	Country   string    `json:"Country"`
-	City      string    `json:"City"`
-	Rooms     int       `json:"Rooms"`
-	Price     float64   `json:"Price"`
-	Currency  string    `json:"Currency"`
-	PriceUSD  int64     `json:"PriceUSD"`
-	Address   *string   `json:"Address"`
-	URL       string    `json:"URL"`
-	CreatedAt time.Time `json:"CreatedAt"`
-}
-
+// TestPgJournalPayloadRoundTrip — снимок события в payload сохраняется без
+// потерь и читается model.ParseEvent. Форма payload — контрактная
+// (contracts.md §2, snake_case), её обеспечивает Event.MarshalJSON; конкретные
+// имена ключей здесь не проверяем — важен round-trip по полям события.
 func TestPgJournalPayloadRoundTrip(t *testing.T) {
 	j := newTestJournal(t)
 	mustAddUser(t, 100)
@@ -230,11 +214,15 @@ func TestPgJournalPayloadRoundTrip(t *testing.T) {
 		100, want.ID).Scan(&raw); err != nil {
 		t.Fatalf("select payload: %v", err)
 	}
-	var got eventPayload
-	if err := json.Unmarshal(raw, &got); err != nil {
-		t.Fatalf("unmarshal payload: %v", err)
+	got, err := model.ParseEvent(raw)
+	if err != nil {
+		t.Fatalf("ParseEvent(payload): %v", err)
 	}
 
+	// Сравнение по полям события: time — через Equal (после JSON round-trip
+	// возможна другая метка таймзоны при том же моменте), Address — по
+	// разыменованному указателю (nil = «любое значение» не допускаем: в want
+	// адрес задан).
 	if got.EventID != want.EventID || got.ID != want.ID || got.Source != want.Source ||
 		got.DealType != want.DealType || got.Country != want.Country || got.City != want.City ||
 		got.Rooms != want.Rooms || got.Price != want.Price || got.Currency != want.Currency ||

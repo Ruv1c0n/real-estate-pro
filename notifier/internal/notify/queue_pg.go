@@ -9,51 +9,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"notifier/internal/model"
 )
-
-// eventSnapshot — снимок события в контрактной форме (contracts.md §2,
-// snake_case). PopBatch разбирает payload через model.ParseEvent, который
-// ждёт именно такой формат, поэтому хранить его надо не «как.Marshal(Event)»
-// (Go-имена полей), а в контрактном виде.
-type eventSnapshot struct {
-	EventID   string    `json:"event_id"`
-	ID        int64     `json:"id"`
-	Source    string    `json:"source"`
-	DealType  string    `json:"deal_type"`
-	Country   string    `json:"country"`
-	City      string    `json:"city"`
-	Rooms     int       `json:"rooms"`
-	Price     float64   `json:"price"`
-	Currency  string    `json:"currency"`
-	PriceUSD  int64     `json:"price_usd"`
-	Address   *string   `json:"address"`
-	URL       string    `json:"url"`
-	CreatedAt time.Time `json:"created_at"`
-}
-
-func snapshotOf(e model.Event) eventSnapshot {
-	return eventSnapshot{
-		EventID:   e.EventID,
-		ID:        e.ID,
-		Source:    e.Source,
-		DealType:  e.DealType,
-		Country:   e.Country,
-		City:      e.City,
-		Rooms:     e.Rooms,
-		Price:     e.Price,
-		Currency:  e.Currency,
-		PriceUSD:  e.PriceUSD,
-		Address:   e.Address,
-		URL:       e.URL,
-		CreatedAt: e.CreatedAt,
-	}
-}
 
 // PgQueue — очередь отложенных заданий. Транзакция PopBatch держит блокировки
 // FOR UPDATE до Mark: параллельный PopBatch (SKIP LOCKED) уже занятые строки
@@ -75,7 +36,9 @@ func NewPgQueue(pool *pgxpool.Pool) *PgQueue {
 // события не создаёт второе задание, а существующая строка (deferred или уже
 // доставленная) остаётся как есть.
 func (q *PgQueue) Postpone(ctx context.Context, chatID int64, e model.Event, mode string) error {
-	payload, err := json.Marshal(snapshotOf(e))
+	// Payload в контрактной форме (contracts.md §2): его кодирует
+	// Event.MarshalJSON — тот же вид, который ParseEvent читает в PopBatch.
+	payload, err := json.Marshal(e)
 	if err != nil {
 		return fmt.Errorf("queue payload: %w", err)
 	}
