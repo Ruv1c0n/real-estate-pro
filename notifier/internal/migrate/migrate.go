@@ -13,6 +13,7 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -60,8 +61,13 @@ func Apply(ctx context.Context, pool *pgxpool.Pool) error {
 	// Лок снимаем на том же соединении и вне отмены родительского ctx
 	// (Apply может завершиться по отмене ctx — лок всё равно обязан быть
 	// снят; если соединение сломалось, Release уничтожит его вместе с локом).
+	// Дедлайн на разблокировку: WithoutCancel снимает отмену, но не задаёт
+	// бюджет — «полуоткрытое» соединение иначе подвесило бы выход из Apply
+	// до срабатывания keepalive.
 	defer func() {
-		if _, err := conn.Exec(context.WithoutCancel(ctx),
+		unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if _, err := conn.Exec(unlockCtx,
 			`SELECT pg_advisory_unlock($1)`, advisoryLockKey); err != nil {
 			log.Printf("migrations: release advisory lock: %v", err)
 		}
@@ -82,7 +88,9 @@ func Apply(ctx context.Context, pool *pgxpool.Pool) error {
 
 	// Служебная таблица могла только что создаться вместе со схемой —
 	// ищем только в ней, пути search_path не используем.
-	applied := make(map[string]bool)
+	// Имя appliedVersions: функция applied(ctx, pool) того же пакета
+	// затенялась бы локальной переменной с прежним именем.
+	appliedVersions := make(map[string]bool)
 	rows, err := pool.Query(ctx, `SELECT version FROM notifier.schema_migrations`)
 	if err != nil {
 		return fmt.Errorf("migrations: list applied: %w", err)
@@ -95,7 +103,7 @@ func Apply(ctx context.Context, pool *pgxpool.Pool) error {
 		if err := rows.Scan(&v); err != nil {
 			return fmt.Errorf("migrations: scan applied: %w", err)
 		}
-		applied[v] = true
+		appliedVersions[v] = true
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("migrations: list applied: %w", err)
@@ -107,7 +115,7 @@ func Apply(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 	for _, name := range names {
 		version := versionOf(name)
-		if applied[version] {
+		if appliedVersions[version] {
 			log.Printf("migration %s already applied", version)
 			continue
 		}
