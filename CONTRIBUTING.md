@@ -79,8 +79,8 @@ locally:
 ```bash
 docker compose up -d postgres redis
 # once: create a dedicated test database (default credentials app/app;
-# adjust if you changed POSTGRES_USER/POSTGRES_PASSWORD in .env)
+# adjust if you changed POSTGRES_USER, POSTGRES_PASSWORD or POSTGRES_PORT in .env)
 docker compose exec postgres psql -U app -d realestate -c "CREATE DATABASE realestate_test;"
 cd notifier
-NOTIFIER_TEST_DSN='host=127.0.0.1 user=app password=app dbname=realestate_test' go test ./...
+NOTIFIER_TEST_DSN='host=127.0.0.1 port=5432 user=app password=app dbname=realestate_test' go test ./...
 ```

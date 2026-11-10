@@ -83,7 +83,7 @@ docker compose down
 
 ## Целевая конфигурация по ТЗ
 
-Добавлены `.env.example`, Redis volume/AOF/noeviction и проверки готовности notifier. Этап 2 notifier реализован: встроенный раннер автоматически применяет при старте SQL-миграцию `0001` схемы `notifier` (готовит Илья), а подписки, журнал уведомлений, счётчики лимита 30/час и отложенные задания хранятся в PostgreSQL. Если переменные `POSTGRES_*` не заданы, notifier работает в memory-режиме (fallback: подписки живут до рестарта); если переменные заданы, но PostgreSQL недоступен на старте, сервис завершается фатальной ошибкой (fail-fast).
+Добавлены `.env.example`, Redis volume/AOF/noeviction и проверки готовности notifier. Этап 2 notifier реализован: встроенный раннер автоматически применяет при старте SQL-миграцию `0001` схемы `notifier` (готовит Илья), а подписки, журнал уведомлений, счётчики лимита 30/час и отложенные задания хранятся в PostgreSQL. Если не заданы ни `DATABASE_URL`, ни переменные `POSTGRES_*`, notifier работает в memory-режиме (fallback: подписки живут до рестарта); если переменные заданы, но PostgreSQL недоступен на старте, сервис завершается фатальной ошибкой (fail-fast).
 
 Как понять режим: при старте в memory-режиме notifier пишет в лог `DB disabled: running in memory mode`, а поле `db` в телах `GET /health` и `GET /health/ready` отражает наличие пула PostgreSQL. `db: false` при отсутствии пула (`nil`) — это memory-режим, а не авария, и readiness он не понижает.
 
@@ -93,7 +93,7 @@ docker compose down
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Без токена — log-режим; реализовано в notifier |
 | `POSTGRES_*` | Адрес PostgreSQL по частям (`HOST`, `PORT`, `USER`, `PASSWORD`, `DB`); так notifier и core-api получают его в Compose |
-| `DATABASE_URL` | Только для локального Core API (`postgresql+asyncpg`); notifier проверяет её первой — до `POSTGRES_*` — как legacy libpq-DSN |
+| `DATABASE_URL` | Только для локального Core API (`postgresql+asyncpg`); notifier проверяет её первой — до `POSTGRES_*` — как legacy-DSN. Работают только форматы, которые разбирает pgx: значение `+asyncpg` из `.env.example` уронит локальный запуск notifier |
 | `REDIS_URL` | Адрес Redis; сейчас задан в Compose |
 | `CORE_API_URL` | Адрес Core API для collector и справочников notifier |
 | `MOCK_MODE` | `true` по умолчанию; требуется подключить к конфигурации collector |

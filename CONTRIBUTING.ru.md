@@ -74,8 +74,8 @@ postgres/redis нет, поэтому эти тесты там скипаютс�
 ```bash
 docker compose up -d postgres redis
 # один раз: выделенная тестовая БД (реквизиты по умолчанию app/app;
-# скорректируйте, если меняли POSTGRES_USER/POSTGRES_PASSWORD в .env)
+# скорректируйте, если меняли POSTGRES_USER, POSTGRES_PASSWORD или POSTGRES_PORT в .env)
 docker compose exec postgres psql -U app -d realestate -c "CREATE DATABASE realestate_test;"
 cd notifier
-NOTIFIER_TEST_DSN='host=127.0.0.1 user=app password=app dbname=realestate_test' go test ./...
+NOTIFIER_TEST_DSN='host=127.0.0.1 port=5432 user=app password=app dbname=realestate_test' go test ./...
 ```
