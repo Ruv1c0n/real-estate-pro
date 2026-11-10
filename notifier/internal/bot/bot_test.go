@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 
 	"notifier/internal/dicts"
 	"notifier/internal/model"
@@ -365,5 +366,93 @@ func TestFormatEventNewContract(t *testing.T) {
 	}
 	if strings.Contains(text, "USD") || strings.Contains(text, "📍") {
 		t.Errorf("USD-цена и пустой адрес не должны попадать в текст: %q", text)
+	}
+}
+
+func TestFormatEventShortEventUnchanged(t *testing.T) {
+	// Обычное событие влезает в лимит — текст байт-в-байт прежний
+	// (усечение не должно менять поведение коротких сообщений).
+	address := "ул. Примерная, 1"
+	e := model.Event{
+		DealType: model.DealRent, City: "Minsk", Rooms: 1,
+		Price: 1100, Currency: "BYN", PriceUSD: 350,
+		Address: &address, URL: "https://example.com/123",
+	}
+	want := "🏠 Новое объявление\n" +
+		"Minsk, 1-к · $350 (1100 BYN)\n" +
+		"📍 ул. Примерная, 1\n" +
+		"https://example.com/123"
+	if got := FormatEvent(e); got != want {
+		t.Errorf("FormatEvent =\n%q\nwant\n%q", got, want)
+	}
+}
+
+func TestFormatEventNilAddressUnchanged(t *testing.T) {
+	// address=nil — как раньше: строки адреса нет вовсе.
+	e := model.Event{
+		DealType: model.DealSale, City: "Brest", Rooms: 0,
+		PriceUSD: 50000, URL: "https://example.com/42",
+	}
+	want := "🏠 Новое объявление\n" +
+		"Brest, студия · $50000\n" +
+		"https://example.com/42"
+	if got := FormatEvent(e); got != want {
+		t.Errorf("FormatEvent =\n%q\nwant\n%q", got, want)
+	}
+}
+
+func TestFormatEventTruncatesLongAddress(t *testing.T) {
+	// Адрес в ~5 КБ рун (10 КБ байт): сообщение обязано влезть в лимит
+	// Telegram (по рунам!), цена/комнатность/ссылка не выпадают (ФТ-3.4).
+	address := strings.Repeat("а", 5000) // кириллица: 2 байта на руну
+	e := model.Event{
+		DealType: model.DealRent, City: "Minsk", Rooms: 2,
+		Price: 1100, Currency: "BYN", PriceUSD: 350,
+		Address: &address, URL: "https://example.com/123",
+	}
+	text := FormatEvent(e)
+
+	if n := utf8.RuneCountInString(text); n > maxMessageLen {
+		t.Fatalf("длина сообщения %d рун > %d — SendMessage отклонит его", n, maxMessageLen)
+	}
+	for _, want := range []string{"Minsk", "2-к", "$350", "1100 BYN", "https://example.com/123", "…"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("в уведомлении нет %q: %q", want, text)
+		}
+	}
+	if strings.Contains(text, address) {
+		t.Error("гигантский адрес должен быть усечён")
+	}
+	// Лимит считается рунами: при побайтовом усечении адреса осталось бы
+	// вдвое меньше рун, и хвоста в 3000 рун не было бы.
+	if !strings.Contains(text, strings.Repeat("а", 3000)) {
+		t.Error("усечённый адрес должен сохранить большую часть рун")
+	}
+}
+
+func TestFormatEventTruncatesGiantURL(t *testing.T) {
+	// Гигантский url: даже без адреса сообщение не влезает — усекается сам
+	// url с «…» (единственный случай, когда ссылка теряет хвост).
+	url := "https://example.com/" + strings.Repeat("p", 4500)
+	address := "ул. Примерная, 1"
+	e := model.Event{
+		DealType: model.DealRent, City: "Minsk", Rooms: 1,
+		PriceUSD: 350, Address: &address, URL: url,
+	}
+	text := FormatEvent(e)
+
+	if n := utf8.RuneCountInString(text); n > maxMessageLen {
+		t.Fatalf("длина сообщения %d рун > %d — SendMessage отклонит его", n, maxMessageLen)
+	}
+	for _, want := range []string{"Minsk", "1-к", "$350", "https://example.com/"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("в уведомлении нет %q: %q", want, text)
+		}
+	}
+	if !strings.HasSuffix(text, "…") {
+		t.Errorf("сообщение должно заканчиваться многоточием усечённого url: %q", text)
+	}
+	if strings.Contains(text, url) {
+		t.Error("гигантский url должен быть усечён")
 	}
 }

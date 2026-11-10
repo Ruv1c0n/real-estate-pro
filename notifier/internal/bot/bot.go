@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"notifier/internal/dicts"
 	"notifier/internal/model"
@@ -221,26 +222,84 @@ func (b *Bot) Send(ctx context.Context, chatID int64, e model.Event) error {
 	return b.api.SendMessage(ctx, chatID, FormatEvent(e))
 }
 
+// maxMessageLen — лимит длины одного сообщения Telegram (в рунах — символах,
+// не байтах). Сообщение длиннее лимита SendMessage отклонит целиком, поэтому
+// длина ограничивается при форматировании (см. FormatEvent).
+const maxMessageLen = 4096
+
+// ellipsis — признак усечённого поля в конце.
+const ellipsis = "…"
+
+// truncateRunes обрезает s до не более чем n рун.
+func truncateRunes(s string, n int) string {
+	if n < 0 {
+		n = 0
+	}
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	return string([]rune(s)[:n])
+}
+
 // FormatEvent — текст уведомления (ФТ-3.4: цена, адрес, комнатность, ссылка).
+// Сообщение обязано влезать в лимит Telegram (maxMessageLen), иначе SendMessage
+// отклонит его целиком: статус unknown без автоматического повтора —
+// уведомление потеряно навсегда. Длинные поля усекаются только здесь,
+// при форматировании: сначала адрес, в крайнем случае url — цена
+// и комнатность не выпадают никогда (событие не отбрасывается, ТЗ 3.6).
 func FormatEvent(e model.Event) string {
-	var sb strings.Builder
-	sb.WriteString("🏠 Новое объявление\n")
-	line := e.City
+	addr := ""
+	if e.Address != nil {
+		addr = strings.TrimSpace(*e.Address)
+	}
+	stats := e.City
 	if e.Rooms == 0 {
-		line += ", студия"
+		stats += ", студия"
 	} else {
-		line += fmt.Sprintf(", %d-к", e.Rooms)
+		stats += fmt.Sprintf(", %d-к", e.Rooms)
 	}
-	line += fmt.Sprintf(" · $%d", e.PriceUSD)
+	stats += fmt.Sprintf(" · $%d", e.PriceUSD)
 	if e.Currency != "" && !strings.EqualFold(e.Currency, "USD") && e.Price > 0 {
-		line += fmt.Sprintf(" (%.0f %s)", e.Price, e.Currency)
+		stats += fmt.Sprintf(" (%.0f %s)", e.Price, e.Currency)
 	}
-	sb.WriteString(line + "\n")
-	if e.Address != nil && strings.TrimSpace(*e.Address) != "" {
-		sb.WriteString("📍 " + strings.TrimSpace(*e.Address) + "\n")
+	var addrLine string
+	if addr != "" {
+		addrLine = "📍 " + addr + "\n"
 	}
-	sb.WriteString(e.URL)
-	return sb.String()
+	msg := "🏠 Новое объявление\n" + stats + "\n" + addrLine + e.URL
+	if utf8.RuneCountInString(msg) <= maxMessageLen {
+		return msg // обычное событие влезает — текст без изменений
+	}
+
+	head := "🏠 Новое объявление\n" + stats + "\n"
+
+	// Сначала урезаем адрес: ссылка (ФТ-3.4) должна остаться целиком.
+	// На строку адреса нужно минимум под «📍 …\n» — 4 руны.
+	if addr != "" {
+		if room := maxMessageLen - utf8.RuneCountInString(head) - utf8.RuneCountInString(e.URL); room >= 4 {
+			return head + "📍 " + truncateRunes(addr, room-4) + ellipsis + "\n" + e.URL
+		}
+	}
+
+	// Даже пустой адрес не спасает — не влезает url: усекаем его
+	// (единственный случай, когда ссылка теряет хвост).
+	if room := maxMessageLen - utf8.RuneCountInString(head); room >= 1 {
+		return head + truncateRunes(e.URL, room-1) + ellipsis
+	}
+
+	// Теоретический случай: сама шапка длиннее лимита — гигантский city
+	// из стрима. Урезаем город, цена и комнатность в конце строки остаются;
+	// вместо url остаётся многоточие.
+	if headLen := utf8.RuneCountInString(head); headLen > maxMessageLen {
+		need := headLen - maxMessageLen + 1
+		if cityLen := utf8.RuneCountInString(e.City); cityLen > need {
+			city := truncateRunes(e.City, cityLen-need-1) + ellipsis
+			return "🏠 Новое объявление\n" + strings.Replace(stats, e.City, city, 1) + "\n" + ellipsis
+		}
+		// Город короче некуда — отдаём шапку как есть: частично скроенный
+		// текст лучше отброшенного события.
+	}
+	return head
 }
 
 // Describe — человекочитаемое описание фильтра подписки.
