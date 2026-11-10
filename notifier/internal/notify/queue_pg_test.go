@@ -216,6 +216,66 @@ func TestPgQueuePopBatchSkipsDelivered(t *testing.T) {
 	q.rollbackTx(ctx)
 }
 
+// TestPgQueuePopBatchQuarantinesBadRow — строка с битым payload не должна
+// останавливать доставку: PopBatch возвращает валидные задания, битая строка
+// карантинится (status='failed'), а не остаётся навсегда головой очереди,
+// зацикливая флушер.
+func TestPgQueuePopBatchQuarantinesBadRow(t *testing.T) {
+	resetTestDB(t)
+	mustAddUser(t, 100)
+	q := NewPgQueue(testPool)
+	ctx := context.Background()
+
+	mustPostpone(t, q, 100, 1)
+	// Битая строка: JSON валиден для JSONB, но не является контрактным
+	// событием — ParseEvent её отвергнет (обязательные поля отсутствуют).
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO notifier.notifications_log (chat_id, listing_id, event_id, status, mode, payload)
+		VALUES ($1, $2, $3, 'deferred', $4, $5)`,
+		100, int64(2), testUUID, ModeLog, `{"broken": true}`); err != nil {
+		t.Fatalf("insert bad row: %v", err)
+	}
+
+	jobs, err := q.PopBatch(ctx, 10)
+	if err != nil {
+		t.Fatalf("PopBatch: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].Event.ID != 1 {
+		t.Fatalf("PopBatch = %+v, want только валидное задание (listing 1)", jobs)
+	}
+
+	// Как во флушере: первый Mark коммитит транзакцию PopBatch — вместе с
+	// ней уходит в БД и карантин битой строки.
+	if err := q.Mark(ctx, jobs[0], ModeLog, StatusSent); err != nil {
+		t.Fatalf("Mark: %v", err)
+	}
+
+	var status string
+	var sentAt *time.Time
+	if err := testPool.QueryRow(ctx,
+		"SELECT status, sent_at FROM notifier.notifications_log WHERE chat_id = 100 AND listing_id = 2").
+		Scan(&status, &sentAt); err != nil {
+		t.Fatalf("select bad row: %v", err)
+	}
+	if status != "failed" {
+		t.Errorf("status битой строки = %q, want failed", status)
+	}
+	if sentAt == nil {
+		t.Error("sent_at битой строки = NULL, want заполнен")
+	}
+
+	// Повторный PopBatch битую строку не возвращает — она больше не deferred.
+	jobs, err = q.PopBatch(ctx, 10)
+	if err != nil {
+		t.Fatalf("повторный PopBatch: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Errorf("повторный PopBatch = %+v, want пусто", jobs)
+	}
+	// Транзакция открыта даже при пустом батче — откат.
+	q.rollbackTx(ctx)
+}
+
 // TestPgThirtyPerHourScenario — критерий приёмки T5: сценарий ТЗ 3.6 целиком
 // на Pg-реализациях. 30 доставок проходят, 31-е откладывается, после
 // освобождения окна флешер доставляет его со статусом sent.
