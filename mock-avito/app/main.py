@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -45,23 +46,30 @@ if state["mode"] not in ("batch", "stream"):
 items: list[dict] = generate_batch(MOCK_COUNT, state["seed"])
 items_by_id: dict[str, dict] = {it["id"]: it for it in items}
 
+# Мутации набора и чтения разделены потоками: публикации — в event loop,
+# чтения — в threadpool синхронных хендлеров, reset — из admin-ручек.
+# RLock защищает структуру списков/словарей; сами dict-элементы после
+# создания не мутируются, поэтому снапшот-копия под локом достаточна.
+items_lock = threading.RLock()
+
 stream_rng = random.Random(state["seed"] + 1)
 stream_seq = 0
 
 
 def _publish_one() -> dict:
     global stream_seq
-    stream_seq += 1
-    item = generate_stream_item(stream_seq, stream_rng)
-    bad = state["bad_data"]
-    if bad["enabled"] and stream_rng.random() < bad["rate"]:
-        item = make_broken(item)
-    items.append(item)
-    items_by_id[item["id"]] = item
-    while len(items) > MOCK_STREAM_MAX_ITEMS:
-        old = items.pop(0)
-        items_by_id.pop(old["id"], None)
-    state["publications"] += 1
+    with items_lock:
+        stream_seq += 1
+        item = generate_stream_item(stream_seq, stream_rng)
+        bad = state["bad_data"]
+        if bad["enabled"] and stream_rng.random() < bad["rate"]:
+            item = make_broken(item)
+        items.append(item)
+        items_by_id[item["id"]] = item
+        while len(items) > MOCK_STREAM_MAX_ITEMS:
+            old = items.pop(0)
+            items_by_id.pop(old["id"], None)
+        state["publications"] += 1
     state["feed"].appendleft(item)
     return item
 
@@ -69,17 +77,18 @@ def _publish_one() -> dict:
 def reset_items(seed: int) -> None:
     """Пересоздаёт набор из seed (POST /admin/reset), подмешивая bad data."""
     global stream_seq
-    batch = generate_batch(MOCK_COUNT, seed)
-    bad = state["bad_data"]
-    if bad["enabled"]:
-        batch = mix_broken(batch, bad["rate"], seed)
-    items.clear()
-    items.extend(batch)
-    items_by_id.clear()
-    items_by_id.update({it["id"]: it for it in items})
-    stream_seq = 0
-    state["seed"] = seed
-    state["publications"] = 0
+    with items_lock:
+        batch = generate_batch(MOCK_COUNT, seed)
+        bad = state["bad_data"]
+        if bad["enabled"]:
+            batch = mix_broken(batch, bad["rate"], seed)
+        items.clear()
+        items.extend(batch)
+        items_by_id.clear()
+        items_by_id.update({it["id"]: it for it in items})
+        stream_seq = 0
+        state["seed"] = seed
+        state["publications"] = 0
     state["feed"].clear()
 
 
@@ -133,7 +142,11 @@ async def ops_middleware(request: Request, call_next):
         state["requests"]["search"] += 1
     elif request.url.path.startswith("/item"):
         state["requests"]["item"] += 1
-    elif request.url.path.startswith("/admin"):
+    elif request.url.path.startswith("/admin") and not request.url.path.startswith(
+        "/admin/ui"
+    ):
+        # Консоль /admin/ui опрашивается каждые 2 с в фоне — в метрике
+        # действий она была бы чистым шумом; считаем только /admin/*-ручки.
         state["requests"]["admin"] += 1
 
     limited = any(request.url.path.startswith(p) for p in LIMITED_PATHS)
@@ -203,10 +216,12 @@ async def http_error_handler(
 
 @app.get("/health")
 def health():
+    with items_lock:
+        total = len(items)
     return {
         "status": "ok",
         "mode": state["mode"],
-        "total": len(items),
+        "total": total,
         "publications": state["publications"],
         "uptime_s": int(time.time() - state["started_at"]),
     }
@@ -237,7 +252,10 @@ def search_listings(
             return _fail_response(fail)
         del state["chaos_left"][fail]  # серия исчерпана — дальше успешные ответы
 
-    found = items
+    # Снапшот под локом: фильтрация/сортировка идут по копии, мутации
+    # stream-публикаций не рвут итерацию (см. items_lock).
+    with items_lock:
+        found = list(items)
     if deal_type:
         found = [it for it in found if it["deal_type"] == deal_type]
     if country:
@@ -268,7 +286,8 @@ def search_listings(
 
 @app.get("/item/{item_id}")
 def get_item(item_id: str):
-    item = items_by_id.get(item_id)
+    with items_lock:
+        item = items_by_id.get(item_id)
     if item is None:
         raise HTTPException(status_code=404, detail="not found")
     return item

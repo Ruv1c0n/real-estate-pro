@@ -52,7 +52,7 @@ docker compose --profile mock down
 | `GET /admin/state` | — | текущее состояние и метрики |
 | `POST /admin/mode` | `{"mode": "batch"\|"stream"}` | переключение режима без рестарта |
 | `POST /admin/chaos` | `{"code": 0\|429\|500, "every": N}` | глобальный хаос: каждый N-й запрос к данным → код (0 = выкл) |
-| `POST /admin/delay` | `{"ms": 0..5000}` | искусственная задержка ответов (таймауты) |
+| `POST /admin/delay` | `{"ms": 0..5000}` | искусственная задержка ответов на `/search/listings` и `/item` (проверка таймаутов Collector) |
 | `POST /admin/rate-limit` | `{"per_minute": N}` | глобальный лимит запросов (0 = выкл), превышение → 429 + `Retry-After` |
 | `POST /admin/bad-data` | `{"enabled": bool, "rate": 0..1}` | ломаные объявления (цена 0, неизвестный город, `deal_type` вне rent/sale, комнаты <0) — проверка 422-ветки Collector → Core API (ТЗ 3.1) |
 | `POST /admin/reset` | `{"seed": int?}` | пересоздать набор; если bad data включены — подмешать долю |

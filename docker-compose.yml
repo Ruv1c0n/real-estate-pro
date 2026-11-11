@@ -119,6 +119,9 @@ services:
     environment:
       MOCK_PUBLISH_MODE: "${MOCK_PUBLISH_MODE:-batch}"
       MOCK_SEED: "${MOCK_SEED:-42}"
+      MOCK_COUNT: "${MOCK_COUNT:-520}"
+      MOCK_STREAM_MIN_SEC: "${MOCK_STREAM_MIN_SEC:-5}"
+      MOCK_STREAM_MAX_SEC: "${MOCK_STREAM_MAX_SEC:-30}"
       # Пустое значение выключает /admin (консоль и ручки управления).
       MOCK_ADMIN_KEY: "${MOCK_ADMIN_KEY:-mock-admin}"
     healthcheck:

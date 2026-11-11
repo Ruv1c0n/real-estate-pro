@@ -12,7 +12,8 @@ import app.main as main_mod
 import pytest
 from fastapi.testclient import TestClient
 
-client = TestClient(main_mod.app)
+# Модульный TestClient здесь не нужен: fixture stream_app создаёт свой
+# клиент на перезагруженном app (TestClient(reloaded.app)).
 
 
 @pytest.fixture(scope="module", autouse=True)
