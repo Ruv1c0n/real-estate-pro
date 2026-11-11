@@ -55,6 +55,15 @@ func Apply(ctx context.Context, pool *pgxpool.Pool) error {
 	// зарегистрированный ниже unlock выполнится ДО возврата соединения в пул.
 	defer conn.Release()
 
+	// statement_timeout (5с на всех соединениях пула из db.go) снимаем на
+	// lock-соединении: statement_timeout по документации PostgreSQL включает
+	// и ожидание блокировок — иначе второй параллельный раннер, дождавшийся
+	// очереди на pg_advisory_lock дольше 5с, падал бы по таймауту вместо
+	// ожидания. Снятие действует только на эту сессию.
+	if _, err := conn.Exec(ctx, `SET statement_timeout = 0`); err != nil {
+		return fmt.Errorf("migrations: relax statement timeout on lock connection: %w", err)
+	}
+
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, advisoryLockKey); err != nil {
 		return fmt.Errorf("migrations: acquire advisory lock: %w", err)
 	}
