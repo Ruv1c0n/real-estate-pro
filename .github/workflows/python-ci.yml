@@ -19,6 +19,11 @@ on:
       - requirements-lint.txt
   workflow_dispatch:
 
+# Новый пуш в ту же ветку отменяет устаревший прогон — экономия минут
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   ruff:
     runs-on: ubuntu-latest
