@@ -41,6 +41,7 @@ func New(api API, subs store.Store, dicts Validator) *Bot {
 
 const helpText = `Я присылаю новые объявления о недвижимости под ваши фильтры.
 
+/start — зарегистрироваться и показать помощь
 /subscribe city=Minsk rooms=1 max=400 deal=rent
   параметры (нужен хотя бы один):
   city — город (латиницей), country — код страны (BY),
@@ -91,7 +92,9 @@ func (b *Bot) handle(ctx context.Context, chatID int64, text string) {
 
 	var reply string
 	switch cmd {
-	case "/start", "/help":
+	case "/start":
+		reply = b.start(chatID)
+	case "/help":
 		reply = helpText
 	case "/subscribe":
 		reply = b.subscribe(ctx, chatID, args)
@@ -153,10 +156,22 @@ func (b *Bot) unsubscribe(chatID int64, args []string) string {
 	return fmt.Sprintf("Подписка #%d удалена.", id)
 }
 
-// stop удаляет пользователя и все его данные (ФТ-3.1). Пока удаляются
-// подписки; на этапе 2 (миграции схемы notifier) добавится удаление пользователя.
+// start регистрирует пользователя в notifier.users (/start, ФТ-3.1) и
+// показывает помощь. Повторный /start идемпотентен.
+func (b *Bot) start(chatID int64) string {
+	if err := b.subs.EnsureUser(chatID); err != nil {
+		return "Не получилось: " + err.Error()
+	}
+	return helpText
+}
+
+// stop удаляет пользователя и все его данные (ФТ-3.1): в Postgres каскад
+// чистит подписки и журнал; для ответа боту хранилище возвращает число подписок.
 func (b *Bot) stop(chatID int64) string {
-	n := b.subs.DeleteAllForChat(chatID)
+	n, err := b.subs.DeleteUser(chatID)
+	if err != nil {
+		return "Не получилось: " + err.Error()
+	}
 	return fmt.Sprintf("Готово: удалено подписок — %d. Вы больше не будете получать уведомления. /subscribe вернёт их в любой момент.", n)
 }
 
