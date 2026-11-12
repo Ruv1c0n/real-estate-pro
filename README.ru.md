@@ -69,6 +69,7 @@ ADMIN_KEY=ключ_для_debug_event
 
 - `http://localhost:8000` и `http://localhost:8001` — временные HTTP-серверы, полноценного приложения пока нет.
 - `http://localhost:8080/health` — проверка notifier: доступность Redis и справочников Core API, режим доставки (telegram/log).
+- `http://localhost:8080/health/ready` — проверка готовности: 200, только когда доступны Redis, справочники Core API и — в db-режиме — PostgreSQL; иначе 503 с тем же JSON-телом.
 - `POST http://localhost:8080/debug/event` с заголовком `X-Admin-Key` — демо-событие: тело валидируется и публикуется в стрим `listings.new`, проходя обычный путь доставки. Без заданного `ADMIN_KEY` эндпоинт отвечает 404.
 
 Логи и остановка:
@@ -82,12 +83,17 @@ docker compose down
 
 ## Целевая конфигурация по ТЗ
 
-Добавлены `.env.example`, Redis volume/AOF/noeviction и проверки готовности notifier. Остаются миграции схемы `notifier` (SQL-миграции готовит Илья), после которых подписки, журнал и отложенные задания переедут из памяти процесса в PostgreSQL. После заполнения `.env` запуск выполняется одной командой `docker compose up --build`.
+Добавлены `.env.example`, Redis volume/AOF/noeviction и проверки готовности notifier. Этап 2 notifier реализован: встроенный раннер автоматически применяет при старте SQL-миграцию `0001` схемы `notifier` (готовит Илья), а подписки, журнал уведомлений, счётчики лимита 30/час и отложенные задания хранятся в PostgreSQL. Если не заданы ни `DATABASE_URL`, ни переменные `POSTGRES_*`, notifier работает в memory-режиме (fallback: подписки живут до рестарта); если переменные заданы, но PostgreSQL недоступен на старте, сервис завершается фатальной ошибкой (fail-fast).
+
+Как понять режим: при старте в memory-режиме notifier пишет в лог `DB disabled: running in memory mode`, а поле `db` в телах `GET /health` и `GET /health/ready` отражает наличие пула PostgreSQL. `db: false` при отсутствии пула (`nil`) — это memory-режим, а не авария, и readiness он не понижает.
+
+После заполнения `.env` запуск выполняется одной командой `docker compose up --build`.
 
 | Настройка | Назначение / значение |
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Без токена — log-режим; реализовано в notifier |
-| `DATABASE_URL` | Адрес PostgreSQL; разные права на схемы сервисов |
+| `POSTGRES_*` | Адрес PostgreSQL по частям (`HOST`, `PORT`, `USER`, `PASSWORD`, `DB`); так notifier и core-api получают его в Compose |
+| `DATABASE_URL` | Только для локального Core API (`postgresql+asyncpg`); notifier проверяет её первой — до `POSTGRES_*` — как legacy-DSN. Работают только форматы, которые разбирает pgx: значение `+asyncpg` из `.env.example` уронит локальный запуск notifier |
 | `REDIS_URL` | Адрес Redis; сейчас задан в Compose |
 | `CORE_API_URL` | Адрес Core API для collector и справочников notifier |
 | `MOCK_MODE` | `true` по умолчанию; требуется подключить к конфигурации collector |
@@ -112,6 +118,7 @@ docker compose down
 | `GET /collect/runs/{run_id}` | Состояние пакетного сбора |
 | `POST /debug/event` | Валидация и добавление тестового события в Streams |
 | `GET /health` | Состояние сервиса и его зависимостей |
+| `GET /health/ready` | Готовность: 200, только когда доступны Redis, справочники и (в db-режиме) PostgreSQL; иначе 503 с тем же телом |
 
 Служебные маршруты collector и `/debug/*` защищаются `X-Admin-Key`. Core API предоставляет OpenAPI на `/docs`.
 

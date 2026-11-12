@@ -29,7 +29,11 @@
 - контракты из `docs/contracts.md`: событие `listings.new`, `POST /api/v1/listings`, формат `RawListing`;
 - схема БД меняется **только миграциями**:
   - схема `core` — Alembic;
-  - схема `notifier` — SQL-миграции (готовит Илья, применяет Даниил);
+  - схема `notifier` — SQL-миграции (автор — Илья, применяет Даниил):
+    файлы `notifier/migrations/*.sql` встраиваются в бинарник и применяются
+    при старте notifier автоматически; имя файла — `000N_описание.sql`,
+    порядок лексикографический; каждый файл сам открывает и фиксирует
+    транзакцию (`BEGIN`/`COMMIT`) — раннер выполняет файл одним `Exec`;
 - каждый сервис работает только со своей схемой Postgres; чужие данные — через API или события;
 - секреты — только через `.env` (в репо есть `.env.example`; CI проверяет утечки через gitleaks).
 
@@ -60,4 +64,18 @@ docker compose up --build
 
 ```bash
 cd notifier && gofmt -l . && go vet ./... && go test ./...
+```
+
+### Тесты с PostgreSQL и Redis
+
+Часть тестов notifier работает против PostgreSQL и Redis. В CI сервисов
+postgres/redis нет, поэтому эти тесты там скипаются — это норма. Локальный запуск:
+
+```bash
+docker compose up -d postgres redis
+# один раз: выделенная тестовая БД (реквизиты по умолчанию app/app;
+# скорректируйте, если меняли POSTGRES_USER, POSTGRES_PASSWORD или POSTGRES_PORT в .env)
+docker compose exec postgres psql -U app -d realestate -c "CREATE DATABASE realestate_test;"
+cd notifier
+NOTIFIER_TEST_DSN='host=127.0.0.1 port=5432 user=app password=app dbname=realestate_test' go test ./...
 ```
