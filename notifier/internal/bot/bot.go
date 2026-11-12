@@ -3,12 +3,15 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"notifier/internal/dicts"
 	"notifier/internal/model"
 	"notifier/internal/store"
 	"notifier/internal/telegram"
@@ -29,6 +32,11 @@ type Validator interface {
 // MaxSubscriptionsPerUser — лимит подписок на пользователя (ТЗ 3.6).
 const MaxSubscriptionsPerUser = 10
 
+// msgUnavailable — единственный ответ при недоступности хранилища или
+// справочников: детали ошибки (хост/пользователь БД, URL core-api) в чат
+// не утекают — они уходят в лог (L6).
+const msgUnavailable = "Сервис временно недоступен, попробуйте позже."
+
 type Bot struct {
 	api   API
 	subs  store.Store
@@ -41,6 +49,7 @@ func New(api API, subs store.Store, dicts Validator) *Bot {
 
 const helpText = `Я присылаю новые объявления о недвижимости под ваши фильтры.
 
+/start — зарегистрироваться и показать помощь
 /subscribe city=Minsk rooms=1 max=400 deal=rent
   параметры (нужен хотя бы один):
   city — город (латиницей), country — код страны (BY),
@@ -91,16 +100,18 @@ func (b *Bot) handle(ctx context.Context, chatID int64, text string) {
 
 	var reply string
 	switch cmd {
-	case "/start", "/help":
+	case "/start":
+		reply = b.start(ctx, chatID)
+	case "/help":
 		reply = helpText
 	case "/subscribe":
 		reply = b.subscribe(ctx, chatID, args)
 	case "/list":
-		reply = b.list(chatID)
+		reply = b.list(ctx, chatID)
 	case "/unsubscribe":
-		reply = b.unsubscribe(chatID, args)
+		reply = b.unsubscribe(ctx, chatID, args)
 	case "/stop":
-		reply = b.stop(chatID)
+		reply = b.stop(ctx, chatID)
 	default:
 		if !strings.HasPrefix(cmd, "/") {
 			return
@@ -111,7 +122,12 @@ func (b *Bot) handle(ctx context.Context, chatID int64, text string) {
 }
 
 func (b *Bot) subscribe(ctx context.Context, chatID int64, args []string) string {
-	if n := b.subs.CountForChat(chatID); n >= MaxSubscriptionsPerUser {
+	n, err := b.subs.CountForChat(ctx, chatID)
+	if err != nil {
+		log.Printf("bot: count subscriptions (chat %d): %v", chatID, err)
+		return msgUnavailable
+	}
+	if n >= MaxSubscriptionsPerUser {
 		return fmt.Sprintf("У вас уже %d подписок — это максимум. /list покажет ваши подписки, /unsubscribe удалит лишнюю.", MaxSubscriptionsPerUser)
 	}
 	s, err := ParseSubscription(args)
@@ -120,15 +136,30 @@ func (b *Bot) subscribe(ctx context.Context, chatID int64, args []string) string
 	}
 	s.Country, s.City, err = b.dicts.Validate(ctx, s.Country, s.City)
 	if err != nil {
+		// Недоступность справочников может нести детали (URL core-api) — в чат
+		// идёт нейтральный текст (L6). Ошибки валидации («неизвестный город»)
+		// — пользовательские, их показываем как есть.
+		if errors.Is(err, dicts.ErrUnavailable) {
+			log.Printf("bot: validate subscription (chat %d): %v", chatID, err)
+			return msgUnavailable
+		}
 		return "Не получилось: " + err.Error()
 	}
 	s.ChatID = chatID
-	s = b.subs.Add(s)
+	s, err = b.subs.Add(ctx, s)
+	if err != nil {
+		log.Printf("bot: add subscription (chat %d): %v", chatID, err)
+		return msgUnavailable
+	}
 	return fmt.Sprintf("Подписка #%d создана: %s", s.ID, Describe(s))
 }
 
-func (b *Bot) list(chatID int64) string {
-	subs := b.subs.ByChat(chatID)
+func (b *Bot) list(ctx context.Context, chatID int64) string {
+	subs, err := b.subs.ByChat(ctx, chatID)
+	if err != nil {
+		log.Printf("bot: list subscriptions (chat %d): %v", chatID, err)
+		return msgUnavailable
+	}
 	if len(subs) == 0 {
 		return "Подписок пока нет. Создайте: /subscribe city=Minsk rooms=1 max=400"
 	}
@@ -139,7 +170,7 @@ func (b *Bot) list(chatID int64) string {
 	return strings.TrimSpace(sb.String())
 }
 
-func (b *Bot) unsubscribe(chatID int64, args []string) string {
+func (b *Bot) unsubscribe(ctx context.Context, chatID int64, args []string) string {
 	if len(args) != 1 {
 		return "Укажите номер: /unsubscribe 1"
 	}
@@ -147,16 +178,35 @@ func (b *Bot) unsubscribe(chatID int64, args []string) string {
 	if err != nil {
 		return "Номер подписки должен быть числом: /unsubscribe 1"
 	}
-	if !b.subs.Delete(chatID, id) {
+	ok, err := b.subs.Delete(ctx, chatID, id)
+	if err != nil {
+		log.Printf("bot: delete subscription %d (chat %d): %v", id, chatID, err)
+		return msgUnavailable
+	}
+	if !ok {
 		return "Такой подписки нет."
 	}
 	return fmt.Sprintf("Подписка #%d удалена.", id)
 }
 
-// stop удаляет пользователя и все его данные (ФТ-3.1). Пока удаляются
-// подписки; на этапе 2 (миграции схемы notifier) добавится удаление пользователя.
-func (b *Bot) stop(chatID int64) string {
-	n := b.subs.DeleteAllForChat(chatID)
+// start регистрирует пользователя в notifier.users (/start, ФТ-3.1) и
+// показывает помощь. Повторный /start идемпотентен.
+func (b *Bot) start(ctx context.Context, chatID int64) string {
+	if err := b.subs.EnsureUser(ctx, chatID); err != nil {
+		log.Printf("bot: ensure user (chat %d): %v", chatID, err)
+		return msgUnavailable
+	}
+	return helpText
+}
+
+// stop удаляет пользователя и все его данные (ФТ-3.1): в Postgres каскад
+// чистит подписки и журнал; для ответа боту хранилище возвращает число подписок.
+func (b *Bot) stop(ctx context.Context, chatID int64) string {
+	n, err := b.subs.DeleteUser(ctx, chatID)
+	if err != nil {
+		log.Printf("bot: delete user (chat %d): %v", chatID, err)
+		return msgUnavailable
+	}
 	return fmt.Sprintf("Готово: удалено подписок — %d. Вы больше не будете получать уведомления. /subscribe вернёт их в любой момент.", n)
 }
 
@@ -172,26 +222,90 @@ func (b *Bot) Send(ctx context.Context, chatID int64, e model.Event) error {
 	return b.api.SendMessage(ctx, chatID, FormatEvent(e))
 }
 
+// maxMessageLen — рабочий потолок длины сообщения (в рунах — символах, не
+// байтах). Официальный лимит Telegram — 4096 символов, но вне-BMP-эмодзи
+// (🏠 U+1F3E0, 📍 U+1F4CD в шапке уведомления) считаются в UTF-16 как две
+// единицы; для офсетов entities Bot API документированы именно UTF-16
+// единицы, поэтому оставляем запас в 2 единицы от формального лимита.
+// Сообщение длиннее лимита SendMessage отклонит целиком, поэтому длина
+// ограничивается при форматировании (см. FormatEvent).
+const maxMessageLen = 4094
+
+// ellipsis — признак усечённого поля в конце.
+const ellipsis = "…"
+
+// truncateRunes обрезает s до не более чем n рун.
+func truncateRunes(s string, n int) string {
+	if n < 0 {
+		n = 0
+	}
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	return string([]rune(s)[:n])
+}
+
 // FormatEvent — текст уведомления (ФТ-3.4: цена, адрес, комнатность, ссылка).
+// Сообщение обязано влезать в лимит Telegram (maxMessageLen), иначе SendMessage
+// отклонит его целиком: статус unknown без автоматического повтора —
+// уведомление потеряно навсегда. Длинные поля усекаются только здесь,
+// при форматировании: сначала адрес, в крайнем случае url — цена
+// и комнатность не выпадают никогда (событие не отбрасывается, ТЗ 3.6).
 func FormatEvent(e model.Event) string {
-	var sb strings.Builder
-	sb.WriteString("🏠 Новое объявление\n")
-	line := e.City
+	addr := ""
+	if e.Address != nil {
+		addr = strings.TrimSpace(*e.Address)
+	}
+	stats := e.City
 	if e.Rooms == 0 {
-		line += ", студия"
+		stats += ", студия"
 	} else {
-		line += fmt.Sprintf(", %d-к", e.Rooms)
+		stats += fmt.Sprintf(", %d-к", e.Rooms)
 	}
-	line += fmt.Sprintf(" · $%d", e.PriceUSD)
+	stats += fmt.Sprintf(" · $%d", e.PriceUSD)
 	if e.Currency != "" && !strings.EqualFold(e.Currency, "USD") && e.Price > 0 {
-		line += fmt.Sprintf(" (%.0f %s)", e.Price, e.Currency)
+		stats += fmt.Sprintf(" (%.0f %s)", e.Price, e.Currency)
 	}
-	sb.WriteString(line + "\n")
-	if e.Address != nil && strings.TrimSpace(*e.Address) != "" {
-		sb.WriteString("📍 " + strings.TrimSpace(*e.Address) + "\n")
+	var addrLine string
+	if addr != "" {
+		addrLine = "📍 " + addr + "\n"
 	}
-	sb.WriteString(e.URL)
-	return sb.String()
+	msg := "🏠 Новое объявление\n" + stats + "\n" + addrLine + e.URL
+	if utf8.RuneCountInString(msg) <= maxMessageLen {
+		return msg // обычное событие влезает — текст без изменений
+	}
+
+	head := "🏠 Новое объявление\n" + stats + "\n"
+
+	// Сначала урезаем адрес: ссылка (ФТ-3.4) должна остаться целиком.
+	// На строку адреса нужно минимум под «📍 …\n» — 4 руны.
+	if addr != "" {
+		if room := maxMessageLen - utf8.RuneCountInString(head) - utf8.RuneCountInString(e.URL); room >= 4 {
+			return head + "📍 " + truncateRunes(addr, room-4) + ellipsis + "\n" + e.URL
+		}
+	}
+
+	// Даже пустой адрес не спасает — не влезает url: усекаем его
+	// (единственный случай, когда ссылка теряет хвост).
+	if room := maxMessageLen - utf8.RuneCountInString(head); room >= 1 {
+		return head + truncateRunes(e.URL, room-1) + ellipsis
+	}
+
+	// Теоретический случай: сама шапка длиннее лимита — гигантский city
+	// из стрима. Урезаем город, цена и комнатность в конце строки остаются;
+	// вместо url остаётся многоточие.
+	if headLen := utf8.RuneCountInString(head); headLen > maxMessageLen {
+		need := headLen - maxMessageLen + 1
+		if cityLen := utf8.RuneCountInString(e.City); cityLen > need {
+			city := truncateRunes(e.City, cityLen-need-1) + ellipsis
+			return "🏠 Новое объявление\n" + strings.Replace(stats, e.City, city, 1) + "\n" + ellipsis
+		}
+	}
+	// Безусловный последний ярус: инвариант «сообщение всегда ≤ лимита»
+	// обязан держаться на любом входе (иначе SendMessage отклонит его —
+	// unknown без повтора, уведомление потеряно целиком). Отдаём шапку,
+	// усечённую до лимита.
+	return truncateRunes(head, maxMessageLen-1) + ellipsis
 }
 
 // Describe — человекочитаемое описание фильтра подписки.
