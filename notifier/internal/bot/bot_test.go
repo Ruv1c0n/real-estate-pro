@@ -55,6 +55,93 @@ func newTestBot(validator Validator) (*Bot, *fakeAPI, *store.Memory) {
 	return New(api, subs, validator), api, subs
 }
 
+// recordingStore оборачивает реальную Memory и запоминает вызовы методов
+// пользователя — чтобы тест мог проверить, что бот их вызывает.
+type recordingStore struct {
+	store.Store
+	ensured  []int64
+	deleted  []int64
+	deletedN int
+}
+
+func (r *recordingStore) EnsureUser(chatID int64) error {
+	r.ensured = append(r.ensured, chatID)
+	return r.Store.EnsureUser(chatID)
+}
+
+func (r *recordingStore) DeleteUser(chatID int64) (int, error) {
+	n, err := r.Store.DeleteUser(chatID)
+	r.deleted = append(r.deleted, chatID)
+	r.deletedN = n
+	return n, err
+}
+
+func TestStartEnsuresUser(t *testing.T) {
+	api := &fakeAPI{}
+	rec := &recordingStore{Store: store.NewMemory()}
+	b := New(api, rec, stubValidator{})
+
+	b.handle(context.Background(), 10, "/start")
+
+	if len(rec.ensured) != 1 || rec.ensured[0] != 10 {
+		t.Errorf("EnsureUser вызван %v, want [10]", rec.ensured)
+	}
+	if !strings.Contains(api.last(), "/subscribe") {
+		t.Errorf("/start должен показывать помощь: %q", api.last())
+	}
+	// Повторный /start — без ошибки в ответе.
+	b.handle(context.Background(), 10, "/start")
+	if strings.Contains(api.last(), "Не получилось") {
+		t.Errorf("повторный /start не должен падать: %q", api.last())
+	}
+}
+
+func TestStopDeletesUserAndReportsCount(t *testing.T) {
+	api := &fakeAPI{}
+	rec := &recordingStore{Store: store.NewMemory()}
+	rec.Add(model.Subscription{ChatID: 10, City: "Minsk"})
+	rec.Add(model.Subscription{ChatID: 10, City: "Brest"})
+	b := New(api, rec, stubValidator{})
+
+	b.handle(context.Background(), 10, "/stop")
+
+	if len(rec.deleted) != 1 || rec.deleted[0] != 10 {
+		t.Errorf("DeleteUser вызван %v, want [10]", rec.deleted)
+	}
+	if !strings.Contains(api.last(), "удалено подписок — 2") {
+		t.Errorf("ответ /stop: %q", api.last())
+	}
+}
+
+func TestStartSubscribeStopStartScenario(t *testing.T) {
+	b, api, subs := newTestBot(stubValidator{})
+	chat := int64(10)
+
+	b.handle(context.Background(), chat, "/start")
+	b.handle(context.Background(), chat, "/subscribe city=Minsk")
+	if n := subs.CountForChat(chat); n != 1 {
+		t.Fatalf("после /subscribe подписок %d, want 1", n)
+	}
+
+	b.handle(context.Background(), chat, "/stop")
+	if n := subs.CountForChat(chat); n != 0 {
+		t.Fatalf("после /stop подписок %d, want 0", n)
+	}
+	if !strings.Contains(api.last(), "удалено подписок — 1") {
+		t.Errorf("ответ /stop: %q", api.last())
+	}
+
+	// После /stop пользователь может вернуться: /start + новая подписка.
+	b.handle(context.Background(), chat, "/start")
+	b.handle(context.Background(), chat, "/subscribe city=Brest")
+	if !strings.Contains(api.last(), "Подписка #") {
+		t.Errorf("повторная подписка после /stop не удалась: %q", api.last())
+	}
+	if n := subs.CountForChat(chat); n != 1 {
+		t.Errorf("после повторного цикла подписок %d, want 1", n)
+	}
+}
+
 func TestStopRemovesAllSubscriptions(t *testing.T) {
 	b, api, subs := newTestBot(stubValidator{})
 	chat := int64(10)

@@ -155,3 +155,29 @@ func TestHealthy(t *testing.T) {
 		t.Fatal("Healthy должен быть false без Core API и кэша")
 	}
 }
+
+// CachedHealthy истинна только при свежем кэше и не делает сетевых вызовов
+// (используется liveness /health — см. main.go).
+func TestCachedHealthy(t *testing.T) {
+	c, srv, calls := newServer(t)
+	c.ttl = time.Minute // свежий кэш после первого фетча
+	ctx := context.Background()
+
+	if c.CachedHealthy() {
+		t.Fatal("кэша ещё нет — CachedHealthy должна быть false")
+	}
+	if !c.Healthy(ctx) {
+		t.Fatal("Healthy должен быть true при живом Core API")
+	}
+	if !c.CachedHealthy() {
+		t.Fatal("после успешного фетча кэш свеж — CachedHealthy должна быть true")
+	}
+	srv.Close()
+	before := calls.Load()
+	if !c.CachedHealthy() {
+		t.Fatal("свежий кэш — CachedHealthy должна оставаться true после падения Core API")
+	}
+	if n := calls.Load(); n != before {
+		t.Fatalf("CachedHealthy сделал сетевые вызовы: %d -> %d, ожидается 0 новых", before, n)
+	}
+}
