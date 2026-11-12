@@ -23,6 +23,14 @@ type Store interface {
 	CountForChat(chatID int64) int
 	// All возвращает копию всех подписок (безопасно для чтения из горутин).
 	All() []model.Subscription
+	// EnsureUser создаёт запись пользователя (/start, ФТ-3.1), если её ещё нет.
+	// Повторный вызов — без ошибки. Add вызывает EnsureUser сам, поэтому
+	// /subscribe работает и без предварительного /start.
+	EnsureUser(chatID int64) error
+	// DeleteUser удаляет пользователя (/stop, ФТ-3.1) вместе с его данными —
+	// в Postgres каскадом чистятся подписки и журнал — и возвращает число
+	// удалённых подписок для ответа бота.
+	DeleteUser(chatID int64) (int, error)
 }
 
 // Memory — реализация Store в памяти процесса.
@@ -30,13 +38,21 @@ type Memory struct {
 	mu     sync.RWMutex
 	nextID int64
 	subs   []model.Subscription
+	users  map[int64]struct{}
 }
 
 var _ Store = (*Memory)(nil)
 
-func NewMemory() *Memory { return &Memory{nextID: 1} }
+func NewMemory() *Memory {
+	return &Memory{nextID: 1, users: make(map[int64]struct{})}
+}
 
 func (m *Memory) Add(s model.Subscription) model.Subscription {
+	// В Postgres подписка ссылается на пользователя (FK): /subscribe без
+	// предварительного /start тоже должен работать, поэтому Add создаёт
+	// запись пользователя сам — Memory ведёт себя так же.
+	_ = m.EnsureUser(s.ChatID)
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s.ID = m.nextID
@@ -103,4 +119,22 @@ func (m *Memory) All() []model.Subscription {
 	out := make([]model.Subscription, len(m.subs))
 	copy(out, m.subs)
 	return out
+}
+
+// EnsureUser запоминает пользователя; повторный вызов — no-op.
+func (m *Memory) EnsureUser(chatID int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.users[chatID] = struct{}{}
+	return nil
+}
+
+// DeleteUser удаляет пользователя вместе с подписками (в Postgres это делает
+// каскад БД) и возвращает их число для ответа бота.
+func (m *Memory) DeleteUser(chatID int64) (int, error) {
+	n := m.DeleteAllForChat(chatID)
+	m.mu.Lock()
+	delete(m.users, chatID)
+	m.mu.Unlock()
+	return n, nil
 }
