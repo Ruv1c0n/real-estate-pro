@@ -17,58 +17,94 @@ import (
 // Telegram, в log-режиме (ФТ-3.6, без TELEGRAM_BOT_TOKEN) — запись в stdout.
 type Sender func(ctx context.Context, chatID int64, e model.Event) error
 
-// journalKey — ключ журнала: пара (объявление, пользователь), ФТ-3.5.
-type journalKey struct {
-	listingID int64
-	chatID    int64
-}
+// Режим доставки, попадает в notifications_log.mode (учитываются отдельно,
+// contracts.md §2). Выбирается в main.go по наличию TELEGRAM_BOT_TOKEN.
+const (
+	ModeTelegram = "telegram"
+	ModeLog      = "log"
+)
+
+// Статусы записи журнала из схемы 0001 (notifications_log_status_chk).
+// 'failed' не используется: ошибки отправки фиксируются как 'unknown'
+// без автоматического повтора (contracts.md §2).
+const (
+	StatusSent    = "sent"
+	StatusUnknown = "unknown"
+)
 
 // Journal — журнал отправленных уведомлений: одному пользователю одно
-// объявление отправляется не более одного раза. Реализация в памяти;
-// на этапе 2 (миграции схемы notifier) заменяется таблицей
-// notifications_log с уникальной парой (user_id, listing_id).
-type Journal struct {
-	mu      sync.Mutex
-	sent    map[journalKey]time.Time
-	ttl     time.Duration
-	nowFunc func() time.Time
-}
-
-func NewJournal(ttl time.Duration) *Journal {
-	return &Journal{sent: make(map[journalKey]time.Time), ttl: ttl, nowFunc: time.Now}
-}
-
-// Sent сообщает, отправлялось ли уже это объявление этому пользователю.
-func (j *Journal) Sent(listingID, chatID int64) bool {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	j.cleanup()
-	_, ok := j.sent[journalKey{listingID, chatID}]
-	return ok
-}
-
-// Record отмечает объявление как отправленное пользователю.
-func (j *Journal) Record(listingID, chatID int64) {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	j.cleanup()
-	j.sent[journalKey{listingID, chatID}] = j.nowFunc()
-}
-
-// cleanup удаляет записи старше ttl, чтобы журнал не рос бесконечно.
-func (j *Journal) cleanup() {
-	now := j.nowFunc()
-	for k, at := range j.sent {
-		if now.Sub(at) > j.ttl {
-			delete(j.sent, k)
-		}
-	}
+// объявление доставляется не более одного раза (ФТ-3.5). Дедуп постоянный,
+// без TTL: в PostgreSQL это UNIQUE (chat_id, listing_id).
+type Journal interface {
+	// Sent сообщает, доставлялось ли уже это объявление этому пользователю.
+	Sent(ctx context.Context, listingID, chatID int64) (bool, error)
+	// Record фиксирует доставку со статусом ('sent'/'unknown'), снимком
+	// события и режимом отправки.
+	Record(ctx context.Context, chatID, listingID int64, eventID string, event model.Event, status, mode string) error
 }
 
 // Limiter — скользящее окно «не более N уведомлений за период» на
 // пользователя (ТЗ 3.6: 30 в час). На этапе 2 окно считается по журналу
 // в PostgreSQL; сейчас — в памяти процесса.
-type Limiter struct {
+type Limiter interface {
+	// Allow проверяет и сразу занимает слот окна. true — отправлять можно.
+	Allow(chatID int64) bool
+}
+
+// journalKey — ключ in-memory журнала: пара (объявление, пользователь).
+type journalKey struct {
+	listingID int64
+	chatID    int64
+}
+
+// memoryJournalTTL — срок жизни записи in-memory журнала. Костыль режима
+// без БД, чтобы карта не росла бесконечно: постоянный дедуп даёт только
+// таблица notifications_log (UNIQUE без TTL).
+const memoryJournalTTL = 24 * time.Hour
+
+// MemoryJournal — реализация Journal в памяти для режима без БД и тестов.
+type MemoryJournal struct {
+	mu      sync.Mutex
+	sent    map[journalKey]time.Time
+	nowFunc func() time.Time
+}
+
+func NewMemoryJournal() *MemoryJournal {
+	return &MemoryJournal{sent: make(map[journalKey]time.Time), nowFunc: time.Now}
+}
+
+// Sent сообщает, отправлялось ли уже это объявление этому пользователю.
+func (j *MemoryJournal) Sent(_ context.Context, listingID, chatID int64) (bool, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.cleanup()
+	_, ok := j.sent[journalKey{listingID, chatID}]
+	return ok, nil
+}
+
+// Record отмечает объявление как отправленное пользователю. Статус, снимок
+// события и режим in-memory журнал не хранит — для этого есть таблица
+// notifications_log.
+func (j *MemoryJournal) Record(_ context.Context, chatID, listingID int64, _ string, _ model.Event, _, _ string) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.cleanup()
+	j.sent[journalKey{listingID, chatID}] = j.nowFunc()
+	return nil
+}
+
+// cleanup удаляет записи старше TTL, чтобы журнал не рос бесконечно.
+func (j *MemoryJournal) cleanup() {
+	now := j.nowFunc()
+	for k, at := range j.sent {
+		if now.Sub(at) > memoryJournalTTL {
+			delete(j.sent, k)
+		}
+	}
+}
+
+// MemoryLimiter — реализация Limiter в памяти для режима без БД и тестов.
+type MemoryLimiter struct {
 	mu      sync.Mutex
 	limit   int
 	window  time.Duration
@@ -76,12 +112,12 @@ type Limiter struct {
 	nowFunc func() time.Time
 }
 
-func NewLimiter(limit int, window time.Duration) *Limiter {
-	return &Limiter{limit: limit, window: window, sent: make(map[int64][]time.Time), nowFunc: time.Now}
+func NewMemoryLimiter(limit int, window time.Duration) *MemoryLimiter {
+	return &MemoryLimiter{limit: limit, window: window, sent: make(map[int64][]time.Time), nowFunc: time.Now}
 }
 
 // Allow проверяет и сразу занимает слот окна. true — отправлять можно.
-func (l *Limiter) Allow(chatID int64) bool {
+func (l *MemoryLimiter) Allow(chatID int64) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.nowFunc()
@@ -109,16 +145,17 @@ type deferredJob struct {
 // Dispatcher сопоставляет событие с подписками и доставляет уведомления.
 type Dispatcher struct {
 	subs    store.Store
-	journal *Journal
-	limiter *Limiter
+	journal Journal
+	limiter Limiter
 	send    Sender
+	mode    string // telegram / log, для notifications_log.mode
 
 	deferMu  sync.Mutex
 	deferred []deferredJob
 }
 
-func NewDispatcher(subs store.Store, journal *Journal, limiter *Limiter, send Sender) *Dispatcher {
-	return &Dispatcher{subs: subs, journal: journal, limiter: limiter, send: send}
+func NewDispatcher(subs store.Store, journal Journal, limiter Limiter, mode string, send Sender) *Dispatcher {
+	return &Dispatcher{subs: subs, journal: journal, limiter: limiter, mode: mode, send: send}
 }
 
 // Handle обрабатывает одно событие из стрима: находит получателей
@@ -126,7 +163,13 @@ func NewDispatcher(subs store.Store, journal *Journal, limiter *Limiter, send Se
 // отправляет сразу или откладывает при исчерпании лимита.
 func (d *Dispatcher) Handle(ctx context.Context, e model.Event) {
 	for _, chatID := range model.Recipients(e, d.subs.All()) {
-		if d.journal.Sent(e.ID, chatID) {
+		sent, err := d.journal.Sent(ctx, e.ID, chatID)
+		if err != nil {
+			// Журнал недоступен — не паникуем и не прерываем доставку
+			// остальных получателей: at-least-once допускает повтор.
+			log.Printf("journal check listing %d chat %d: %v", e.ID, chatID, err)
+		}
+		if sent {
 			continue // событие доставлено повторно — не дублируем (ФТ-3.5)
 		}
 		if d.limiter.Allow(chatID) {
@@ -138,12 +181,18 @@ func (d *Dispatcher) Handle(ctx context.Context, e model.Event) {
 }
 
 func (d *Dispatcher) deliver(ctx context.Context, chatID int64, e model.Event) {
+	status := StatusSent
 	if err := d.send(ctx, chatID, e); err != nil {
-		// Ошибка отправки фиксируется в журнале: автоматический повтор
-		// не выполняется (contracts.md §2 — статус unknown без повтора).
+		// Ошибка отправки фиксируется в журнале как unknown: автоматический
+		// повтор не выполняется (contracts.md §2 — статус unknown без повтора).
 		log.Printf("send listing %d to chat %d: %v", e.ID, chatID, err)
+		status = StatusUnknown
 	}
-	d.journal.Record(e.ID, chatID)
+	if err := d.journal.Record(ctx, chatID, e.ID, e.EventID, e, status, d.mode); err != nil {
+		// Недоступная БД не должна валить сервис: доставка уже прошла,
+		// повтор будет только при следующей публикации события.
+		log.Printf("journal record listing %d chat %d: %v", e.ID, chatID, err)
+	}
 }
 
 func (d *Dispatcher) postpone(chatID int64, e model.Event) {
@@ -177,7 +226,11 @@ func (d *Dispatcher) Flush(ctx context.Context) {
 
 	var requeue []deferredJob
 	for _, job := range jobs {
-		if d.journal.Sent(job.event.ID, job.chatID) {
+		sent, err := d.journal.Sent(ctx, job.event.ID, job.chatID)
+		if err != nil {
+			log.Printf("journal check listing %d chat %d: %v", job.event.ID, job.chatID, err)
+		}
+		if sent {
 			continue // уже доставлено другим путём
 		}
 		if d.limiter.Allow(job.chatID) {

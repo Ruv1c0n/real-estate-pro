@@ -2,6 +2,7 @@ package notify
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -50,12 +51,12 @@ func (s *recordingSender) sent() []string {
 	return append([]string(nil), s.calls...)
 }
 
-func newTestDispatcher(limit int) (*Dispatcher, *recordingSender, *store.Memory, *Limiter) {
+func newTestDispatcher(limit int) (*Dispatcher, *recordingSender, *store.Memory, *MemoryLimiter) {
 	sender := &recordingSender{}
 	subs := store.NewMemory()
-	journal := NewJournal(time.Hour)
-	limiter := NewLimiter(limit, time.Hour)
-	return NewDispatcher(subs, journal, limiter, sender.send), sender, subs, limiter
+	journal := NewMemoryJournal()
+	limiter := NewMemoryLimiter(limit, time.Hour)
+	return NewDispatcher(subs, journal, limiter, ModeLog, sender.send), sender, subs, limiter
 }
 
 func TestHandleSendsOncePerChat(t *testing.T) {
@@ -123,7 +124,7 @@ func TestHandleDifferentChatsHaveOwnLimits(t *testing.T) {
 
 func TestLimiterSlidingWindow(t *testing.T) {
 	base := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
-	l := NewLimiter(2, time.Hour)
+	l := NewMemoryLimiter(2, time.Hour)
 	l.nowFunc = func() time.Time { return base }
 
 	if !l.Allow(1) || !l.Allow(1) {
@@ -145,22 +146,115 @@ func TestLimiterSlidingWindow(t *testing.T) {
 	}
 }
 
-func TestJournalTTL(t *testing.T) {
+func TestMemoryJournalTTL(t *testing.T) {
 	base := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
-	j := NewJournal(time.Hour)
+	j := NewMemoryJournal()
 	j.nowFunc = func() time.Time { return base }
 
-	j.Record(1, 10)
-	if !j.Sent(1, 10) {
-		t.Fatal("запись должна быть видна сразу")
+	if err := j.Record(context.Background(), 10, 1, testUUID, testEvent(1), StatusSent, ModeLog); err != nil {
+		t.Fatalf("Record: %v", err)
 	}
-	if j.Sent(2, 10) {
+	if sent, err := j.Sent(context.Background(), 1, 10); err != nil || !sent {
+		t.Fatalf("Sent = %v, %v; want true, nil (запись видна сразу)", sent, err)
+	}
+	if sent, _ := j.Sent(context.Background(), 2, 10); sent {
 		t.Fatal("другое объявление не должно считаться отправленным")
 	}
 
-	j.nowFunc = func() time.Time { return base.Add(2 * time.Hour) }
-	if j.Sent(1, 10) {
+	// In-memory журнал чистится по TTL, чтобы не рос бесконечно; постоянный
+	// дедуп даёт только таблица notifications_log (UNIQUE без TTL).
+	j.nowFunc = func() time.Time { return base.Add(25 * time.Hour) }
+	if sent, _ := j.Sent(context.Background(), 1, 10); sent {
 		t.Fatal("после TTL запись удаляется")
+	}
+}
+
+// mockJournal — Journal для проверки поведения Dispatcher при отказе БД.
+type mockJournal struct {
+	mu        sync.Mutex
+	sentErr   error // ошибка, которую возвращает Sent
+	recordErr error // ошибка, которую возвращает Record
+	records   map[string]int
+}
+
+func newMockJournal() *mockJournal {
+	return &mockJournal{records: make(map[string]int)}
+}
+
+func (m *mockJournal) Sent(_ context.Context, listingID, chatID int64) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.records[fmt.Sprintf("%d:%d", chatID, listingID)] > 0, m.sentErr
+}
+
+func (m *mockJournal) Record(_ context.Context, chatID, listingID int64, _ string, _ model.Event, status, mode string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.recordErr != nil {
+		return m.recordErr
+	}
+	m.records[fmt.Sprintf("%d:%d", chatID, listingID)]++
+	m.records[status+"/"+mode]++
+	return nil
+}
+
+func TestHandleSentErrorStillDelivers(t *testing.T) {
+	// Журнал недоступен (Sent падает): Dispatcher не паникует, доставка
+	// продолжается — at-least-once допускает повтор (contracts.md §2).
+	sender := &recordingSender{}
+	subs := store.NewMemory()
+	journal := newMockJournal()
+	journal.sentErr = errors.New("db down")
+	d := NewDispatcher(subs, journal, NewMemoryLimiter(10, time.Hour), ModeLog, sender.send)
+	subs.Add(model.Subscription{ChatID: 10})
+
+	d.Handle(context.Background(), testEvent(1))
+
+	if got := sender.sent(); len(got) != 1 {
+		t.Fatalf("sent = %v, want 1 (ошибка журнала не отменяет доставку)", got)
+	}
+}
+
+func TestHandleRecordErrorNoPanic(t *testing.T) {
+	// Record падает (БД недоступна) после успешной отправки: Dispatcher
+	// логирует и продолжает, повтор — только при следующей публикации.
+	sender := &recordingSender{}
+	subs := store.NewMemory()
+	journal := newMockJournal()
+	journal.recordErr = errors.New("db down")
+	d := NewDispatcher(subs, journal, NewMemoryLimiter(10, time.Hour), ModeLog, sender.send)
+	subs.Add(model.Subscription{ChatID: 10})
+
+	d.Handle(context.Background(), testEvent(1))
+	d.Flush(context.Background())
+
+	if got := sender.sent(); len(got) != 1 {
+		t.Fatalf("sent = %v, want 1 (ошибка Record не должна ломать доставку)", got)
+	}
+}
+
+func TestHandleRecordsStatusAndMode(t *testing.T) {
+	// Успешная отправка записывается со статусом sent, ошибка — unknown;
+	// режим доставки берётся из Dispatcher.
+	sender := &recordingSender{}
+	subs := store.NewMemory()
+	journal := newMockJournal()
+	d := NewDispatcher(subs, journal, NewMemoryLimiter(10, time.Hour), ModeTelegram, sender.send)
+	subs.Add(model.Subscription{ChatID: 10})
+
+	d.Handle(context.Background(), testEvent(1))
+
+	if n := journal.records["sent/telegram"]; n != 1 {
+		t.Fatalf("записей sent/telegram = %d, want 1", n)
+	}
+
+	sender.mu.Lock()
+	sender.err = errors.New("telegram unavailable")
+	sender.mu.Unlock()
+	d.Handle(context.Background(), testEvent(2))
+
+	if n := journal.records["unknown/telegram"]; n != 1 {
+		t.Fatalf("записей unknown/telegram = %d, want 1", n)
 	}
 }
 
@@ -172,7 +266,10 @@ func TestFlushDropsAlreadySent(t *testing.T) {
 	d.Handle(context.Background(), testEvent(2)) // отложено
 
 	// Событие 2 успело уйти другим путём — в журнале.
-	d.journal.Record(2, 10)
+	e2 := testEvent(2)
+	if err := d.journal.Record(context.Background(), 10, 2, e2.EventID, e2, StatusSent, ModeLog); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
 	d.Flush(context.Background())
 
 	for _, c := range sender.sent() {
