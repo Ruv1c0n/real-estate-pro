@@ -1,0 +1,85 @@
+# graphify-pages: пересборка knowledge-графа (graphify) после каждого мержа в main
+# и публикация на GitHub Pages вместе с archify-диаграммой.
+#
+# Модель обновления:
+# - CI делает только детерминированную AST-переэкстракцию (`graphify update`, без LLM,
+#   без секретов). Семантические рёбра/имена сообществ обновляются локально
+#   (`graphify label --missing-only`) и попадают в main обычным коммитом.
+# - Исходники графа в main: graphify-out/{graph.json, manifest.json, .graphify_labels.json,
+#   GRAPH_REPORT.md} (остальное — в .gitignore).
+# - archify-диаграмма (architecture.html) обновляется вручную в ветке gh-pages.
+
+name: graphify-pages
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      # extras sql,pdf нужны: docs/Real_Estate_Pro_TZ.pdf входит в граф
+      - name: Install graphify
+        run: uv tool install 'graphifyy[sql,pdf]'
+
+      - name: Rebuild graph (AST-only, no LLM)
+        run: graphify update .
+
+      - name: Assemble site
+        run: |
+          mkdir -p site
+          cp graphify-out/graph.html site/graph.html
+          cp graphify-out/GRAPH_REPORT.md site/GRAPH_REPORT.md
+          cat > site/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html lang="ru">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Real Estate Pro — architecture &amp; knowledge graph</title>
+            <style>
+              body { font-family: system-ui, sans-serif; max-width: 42rem; margin: 4rem auto; padding: 0 1rem; }
+              h1 { font-size: 1.4rem; } li { margin: .5rem 0; }
+              .meta { color: #666; font-size: .9rem; }
+            </style>
+          </head>
+          <body>
+            <h1>Real Estate Pro — architecture &amp; knowledge graph</h1>
+            <ul>
+              <li><a href="graph.html">Knowledge graph (graphify)</a> — интерактивный граф кода, доков и ТЗ</li>
+              <li><a href="architecture.html">Architecture diagram (archify)</a> — диаграмма стенда (обновляется вручную)</li>
+              <li><a href="GRAPH_REPORT.md">GRAPH_REPORT.md</a> — текстовый отчёт последней сборки</li>
+            </ul>
+            <p class="meta">Пересобрано CI из main (graphify update, AST-only). Граф коммитится в main:
+            graphify-out/{graph.json, manifest.json, .graphify_labels.json, GRAPH_REPORT.md}.</p>
+          </body>
+          </html>
+          EOF
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
