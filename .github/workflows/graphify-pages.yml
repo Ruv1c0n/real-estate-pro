@@ -1,5 +1,5 @@
 # graphify-pages: пересборка knowledge-графа (graphify) после каждого мержа в main
-# и публикация на GitHub Pages вместе с archify-диаграммой.
+# и публикация на GitHub Pages (источник — ветка gh-pages).
 #
 # Модель обновления:
 # - CI делает только детерминированную AST-переэкстракцию (`graphify update`, без LLM,
@@ -7,25 +7,25 @@
 #   (`graphify label --missing-only`) и попадают в main обычным коммитом.
 # - Исходники графа в main: graphify-out/{graph.json, manifest.json, .graphify_labels.json,
 #   GRAPH_REPORT.md} (остальное — в .gitignore).
-# - archify-диаграмма (architecture.html) обновляется вручную в ветке gh-pages.
+# - В ветке gh-pages site-файлы лежат в корне; archify-диаграмма (architecture.html)
+#   обновляется там вручную — keep_files: true не даёт CI её затереть.
 
 name: graphify-pages
 
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
-  contents: read
-  pages: write
-  id-token: write
+  contents: write
 
 concurrency:
-  group: pages
+  group: graphify-pages
   cancel-in-progress: true
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -70,16 +70,11 @@ jobs:
           </html>
           EOF
 
-      - uses: actions/upload-pages-artifact@v3
+      # keep_files: true сохраняет architecture.html (обновляется вручную в gh-pages)
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
         with:
-          path: site
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v4
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: site
+          keep_files: true
+          commit_message: "graphify rebuild from ${{ github.sha }}"
