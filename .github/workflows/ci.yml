@@ -73,7 +73,11 @@ jobs:
         env:
           NOTIFIER_TEST_DSN: "host=127.0.0.1 port=5432 user=app password=app dbname=realestate sslmode=disable"
           NOTIFIER_TEST_REDIS_ADDR: 127.0.0.1:6379
-        run: go test -race ./...
+        # -p 1: пакеты notify и store имеют собственные TestMain с накатом
+        # миграций и TRUNCATE notifier.users CASCADE в одну и ту же БД —
+        # параллельный прогон пакетов даёт гонки (pg_type duplicate key при
+        # конкурентном CREATE TABLE, затирание данных между тестами).
+        run: go test -race -count=1 -p 1 ./...
 
   # Правило ТЗ 6.5: секреты только через .env — ловим случайные коммиты токенов
   gitleaks:
