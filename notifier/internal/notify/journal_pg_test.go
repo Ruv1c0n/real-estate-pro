@@ -75,13 +75,20 @@ func applyMigration(ctx context.Context, pool *pgxpool.Pool) {
 // CASCADE каскадом чистит подписки и журнал (ФК ON DELETE CASCADE).
 func newTestJournal(t *testing.T) *PgJournal {
 	t.Helper()
+	resetTestDB(t)
+	return NewPgJournal(testPool)
+}
+
+// resetTestDB очищает схему notifier между тестами и скипает тест,
+// если БД не сконфигурирована (в CI это норма).
+func resetTestDB(t *testing.T) {
+	t.Helper()
 	if !hasDB {
 		t.Skip("NOTIFIER_TEST_DSN не задан — тесты PostgreSQL пропущены (в CI это норма)")
 	}
 	if _, err := testPool.Exec(context.Background(), "TRUNCATE notifier.users CASCADE"); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
-	return NewPgJournal(testPool)
 }
 
 // mustAddUser вставляет пользователя: chat_id в notifications_log ссылается
@@ -248,7 +255,7 @@ func TestPgDispatcherDoubleDelivery(t *testing.T) {
 	sender := &recordingSender{}
 	subs := store.NewMemory()
 	subs.Add(model.Subscription{ChatID: 100})
-	d := NewDispatcher(subs, j, NewMemoryLimiter(10, time.Hour), ModeLog, sender.send)
+	d := NewDispatcher(subs, j, NewMemoryLimiter(10, time.Hour), NewMemoryQueue(), ModeLog, sender.send)
 
 	e := testEvent(1)
 	d.Handle(context.Background(), e)

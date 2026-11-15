@@ -32,6 +32,10 @@ const (
 	StatusUnknown = "unknown"
 )
 
+// StatusRetry — не статус журнала, а инструкция Mark для очереди отложенных:
+// задание остаётся в очереди и будет повторено следующим проходом флешера.
+const StatusRetry = "retry"
+
 // Journal — журнал отправленных уведомлений: одному пользователю одно
 // объявление доставляется не более одного раза (ФТ-3.5). Дедуп постоянный,
 // без TTL: в PostgreSQL это UNIQUE (chat_id, listing_id).
@@ -44,11 +48,34 @@ type Journal interface {
 }
 
 // Limiter — скользящее окно «не более N уведомлений за период» на
-// пользователя (ТЗ 3.6: 30 в час). На этапе 2 окно считается по журналу
-// в PostgreSQL; сейчас — в памяти процесса.
+// пользователя (ТЗ 3.6: 30 в час), отдельно по режиму доставки
+// (contracts.md §2: log учитывается отдельно от Telegram).
 type Limiter interface {
-	// Allow проверяет и сразу занимает слот окна. true — отправлять можно.
-	Allow(chatID int64) bool
+	// Allow проверяет окно, но ничего не пишет: окно считается по фактически
+	// отправленным уведомлениям (их фиксирует Record в deliver). Гонка
+	// Allow → Record закрывается сериализацией доставок одного чата
+	// (Dispatcher.lockChat): параллельные доставки одного чата не могут
+	// одновременно увидеть один и тот же свободный слот.
+	Allow(ctx context.Context, chatID int64, mode string) (bool, error)
+}
+
+// DeferredJob — уведомление, не вместившееся в часовой лимит.
+type DeferredJob struct {
+	ChatID int64
+	Event  model.Event
+}
+
+// DeferredQueue — очередь отложенных уведомлений (contracts.md §2: лишние
+// задания откладываются; на этапе 2 — в PostgreSQL). Хранится в той же
+// таблице notifications_log: строка со статусом 'deferred'.
+type DeferredQueue interface {
+	// Postpone кладёт задание в очередь.
+	Postpone(ctx context.Context, chatID int64, e model.Event, mode string) error
+	// PopBatch возвращает до limit самых старых заданий из очереди.
+	PopBatch(ctx context.Context, limit int) ([]DeferredJob, error)
+	// Mark фиксирует исход: sent/unknown — доставка завершена,
+	// retry — задание остаётся в очереди.
+	Mark(ctx context.Context, job DeferredJob, mode, status string) error
 }
 
 // journalKey — ключ in-memory журнала: пара (объявление, пользователь).
@@ -103,43 +130,45 @@ func (j *MemoryJournal) cleanup() {
 	}
 }
 
+// limiterKey — ключ окна in-memory лимитера: пользователь и режим доставки.
+type limiterKey struct {
+	chatID int64
+	mode   string
+}
+
 // MemoryLimiter — реализация Limiter в памяти для режима без БД и тестов.
 type MemoryLimiter struct {
 	mu      sync.Mutex
 	limit   int
 	window  time.Duration
-	sent    map[int64][]time.Time
+	sent    map[limiterKey][]time.Time
 	nowFunc func() time.Time
 }
 
 func NewMemoryLimiter(limit int, window time.Duration) *MemoryLimiter {
-	return &MemoryLimiter{limit: limit, window: window, sent: make(map[int64][]time.Time), nowFunc: time.Now}
+	return &MemoryLimiter{limit: limit, window: window, sent: make(map[limiterKey][]time.Time), nowFunc: time.Now}
 }
 
 // Allow проверяет и сразу занимает слот окна. true — отправлять можно.
-func (l *MemoryLimiter) Allow(chatID int64) bool {
+// В отличие от Pg-версии слот занимается до отправки: in-memory режим
+// демонстрационный, гонки между экземплярами там не бывает.
+func (l *MemoryLimiter) Allow(_ context.Context, chatID int64, mode string) (bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.nowFunc()
-	fresh := l.sent[chatID][:0]
-	for _, at := range l.sent[chatID] {
+	key := limiterKey{chatID, mode}
+	fresh := l.sent[key][:0]
+	for _, at := range l.sent[key] {
 		if now.Sub(at) < l.window {
 			fresh = append(fresh, at)
 		}
 	}
 	if len(fresh) >= l.limit {
-		l.sent[chatID] = fresh
-		return false
+		l.sent[key] = fresh
+		return false, nil
 	}
-	l.sent[chatID] = append(fresh, now)
-	return true
-}
-
-// deferredJob — уведомление, не вместившееся в часовой лимит (contracts.md §2:
-// лишние задания откладываются; на этапе 2 — в PostgreSQL).
-type deferredJob struct {
-	chatID int64
-	event  model.Event
+	l.sent[key] = append(fresh, now)
+	return true, nil
 }
 
 // Dispatcher сопоставляет событие с подписками и доставляет уведомления.
@@ -147,19 +176,21 @@ type Dispatcher struct {
 	subs    store.Store
 	journal Journal
 	limiter Limiter
+	queue   DeferredQueue
 	send    Sender
 	mode    string // telegram / log, для notifications_log.mode
 
-	deferMu  sync.Mutex
-	deferred []deferredJob
-
 	claimMu  sync.Mutex
 	inFlight map[journalKey]struct{} // доставки «в полёте»: клейм до проверки журнала
+
+	chatMu    sync.Mutex
+	chatLocks map[int64]*sync.Mutex // сериализация доставок одному чату
 }
 
-func NewDispatcher(subs store.Store, journal Journal, limiter Limiter, mode string, send Sender) *Dispatcher {
-	return &Dispatcher{subs: subs, journal: journal, limiter: limiter, mode: mode, send: send,
-		inFlight: make(map[journalKey]struct{})}
+func NewDispatcher(subs store.Store, journal Journal, limiter Limiter, queue DeferredQueue, mode string, send Sender) *Dispatcher {
+	return &Dispatcher{subs: subs, journal: journal, limiter: limiter, queue: queue, mode: mode, send: send,
+		inFlight:  make(map[journalKey]struct{}),
+		chatLocks: make(map[int64]*sync.Mutex)}
 }
 
 // claim закрепляет пару (объявление, чат) за текущей доставкой: закрывает
@@ -186,6 +217,27 @@ func (d *Dispatcher) release(k journalKey) {
 	delete(d.inFlight, k)
 }
 
+// lockChat сериализует доставки одному чату: критическая секция
+// Allow → send → Record должна пройти целиком, иначе два параллельных
+// пути увидят один и тот же свободный слот лимитера и лимит будет
+// превышен (ревью #49). Разные чаты доставляются параллельно; блокировка
+// процессная — при нескольких инстансах notifier понадобится атомарный
+// резерв слота на стороне БД.
+func (d *Dispatcher) lockChat(chatID int64) func() {
+	d.chatMu.Lock()
+	l, ok := d.chatLocks[chatID]
+	if !ok {
+		l = &sync.Mutex{}
+		d.chatLocks[chatID] = l
+	}
+	d.chatMu.Unlock()
+	l.Lock()
+	return l.Unlock
+}
+
+// deferredBatchSize — сколько отложенных заданий флешер забирает за один проход.
+const deferredBatchSize = 100
+
 // Handle обрабатывает одно событие из стрима: находит получателей
 // (уникальные чаты, ФТ-3.4), пропускает повторную доставку по журналу,
 // отправляет сразу или откладывает при исчерпании лимита. Перед проверкой
@@ -193,27 +245,48 @@ func (d *Dispatcher) release(k journalKey) {
 // доставляется параллельным путём — шаг пропускается.
 func (d *Dispatcher) Handle(ctx context.Context, e model.Event) {
 	for _, chatID := range model.Recipients(e, d.subs.All()) {
-		key := journalKey{listingID: e.ID, chatID: chatID}
-		if !d.claim(key) {
-			continue // уже доставляется другим путём — не дублируем (ФТ-3.5)
-		}
-		sent, err := d.journal.Sent(ctx, e.ID, chatID)
-		if err != nil {
-			// Журнал недоступен — не паникуем и не прерываем доставку
-			// остальных получателей: at-least-once допускает повтор.
-			log.Printf("journal check listing %d chat %d: %v", e.ID, chatID, err)
-		}
-		if sent {
-			d.release(key) // событие доставлено повторно — не дублируем (ФТ-3.5)
-			continue
-		}
-		if d.limiter.Allow(chatID) {
-			d.deliver(ctx, chatID, e)
-		} else {
-			d.postpone(chatID, e)
-		}
-		d.release(key)
+		d.handleRecipient(ctx, chatID, e)
 	}
+}
+
+// handleRecipient доставляет (или откладывает) событие одному чату.
+// Порядок захвата фиксирован: клейм → чат-лок. Критическая секция
+// Allow → send → Record сериализуется чатом, поэтому параллельный путь
+// не увидит один и тот же свободный слот лимитера.
+func (d *Dispatcher) handleRecipient(ctx context.Context, chatID int64, e model.Event) {
+	key := journalKey{listingID: e.ID, chatID: chatID}
+	if !d.claim(key) {
+		return // уже доставляется другим путём — не дублируем (ФТ-3.5)
+	}
+	defer d.release(key)
+	unlockChat := d.lockChat(chatID)
+	defer unlockChat()
+
+	sent, err := d.journal.Sent(ctx, e.ID, chatID)
+	if err != nil {
+		// Журнал недоступен — не паникуем и не прерываем доставку
+		// остальных получателей: at-least-once допускает повтор.
+		log.Printf("journal check listing %d chat %d: %v", e.ID, chatID, err)
+	}
+	if sent {
+		return // событие доставлено повторно — не дублируем (ФТ-3.5)
+	}
+	ok, err := d.limiter.Allow(ctx, chatID, d.mode)
+	if err != nil {
+		// Ошибка лимитера трактуется как «слот занят»: задание
+		// откладывается и будет повторено флешером.
+		log.Printf("limiter check listing %d chat %d: %v", e.ID, chatID, err)
+		ok = false
+	}
+	if ok {
+		d.deliver(ctx, chatID, e)
+		return
+	}
+	if err := d.queue.Postpone(ctx, chatID, e, d.mode); err != nil {
+		log.Printf("postpone listing %d chat %d: %v", e.ID, chatID, err)
+		return
+	}
+	log.Printf("hourly limit reached: listing %d to chat %d deferred", e.ID, chatID)
 }
 
 func (d *Dispatcher) deliver(ctx context.Context, chatID int64, e model.Event) {
@@ -231,13 +304,6 @@ func (d *Dispatcher) deliver(ctx context.Context, chatID int64, e model.Event) {
 	}
 }
 
-func (d *Dispatcher) postpone(chatID int64, e model.Event) {
-	d.deferMu.Lock()
-	d.deferred = append(d.deferred, deferredJob{chatID: chatID, event: e})
-	d.deferMu.Unlock()
-	log.Printf("hourly limit reached: listing %d to chat %d deferred", e.ID, chatID)
-}
-
 // RunFlusher периодически отправляет отложенные уведомления,
 // когда часовое окно освобождается.
 func (d *Dispatcher) RunFlusher(ctx context.Context, every time.Duration) {
@@ -253,42 +319,62 @@ func (d *Dispatcher) RunFlusher(ctx context.Context, every time.Duration) {
 	}
 }
 
-// Flush делает один проход по отложенным заданиям. Перед проверкой журнала
-// пара закрепляется клеймом: занятая другим путём пара возвращается в
-// очередь — тот путь либо доставит её, либо оставит запись в журнале,
-// которую следующее поколение отсеет по Sent.
+// Flush делает один проход по очереди отложенных: забирает батч самых
+// старых заданий и разбирает его по одному (flushJob).
 func (d *Dispatcher) Flush(ctx context.Context) {
-	d.deferMu.Lock()
-	jobs := d.deferred
-	d.deferred = nil
-	d.deferMu.Unlock()
-
-	var requeue []deferredJob
-	for _, job := range jobs {
-		key := journalKey{listingID: job.event.ID, chatID: job.chatID}
-		if !d.claim(key) {
-			requeue = append(requeue, job) // доставляется прямо сейчас — повторим позже
-			continue
-		}
-		sent, err := d.journal.Sent(ctx, job.event.ID, job.chatID)
-		if err != nil {
-			log.Printf("journal check listing %d chat %d: %v", job.event.ID, job.chatID, err)
-		}
-		if sent {
-			d.release(key) // уже доставлено другим путём
-			continue
-		}
-		if d.limiter.Allow(job.chatID) {
-			d.deliver(ctx, job.chatID, job.event)
-			d.release(key)
-		} else {
-			requeue = append(requeue, job)
-			d.release(key)
-		}
+	jobs, err := d.queue.PopBatch(ctx, deferredBatchSize)
+	if err != nil {
+		log.Printf("pop deferred batch: %v", err)
+		return
 	}
-	if len(requeue) > 0 {
-		d.deferMu.Lock()
-		d.deferred = append(requeue, d.deferred...)
-		d.deferMu.Unlock()
+	for _, job := range jobs {
+		d.flushJob(ctx, job)
+	}
+}
+
+// flushJob разбирает одно отложенное задание. Клейм берётся до всего:
+// занятое параллельной доставкой задание помечается retry и повторится
+// следующим проходом (ТЗ 3.6 — отложенные не отбрасываются). Порядок
+// захвата тот же, что в Handle: клейм → чат-лок; критическая секция
+// Allow → send → Record сериализуется чатом.
+func (d *Dispatcher) flushJob(ctx context.Context, job DeferredJob) {
+	key := journalKey{listingID: job.Event.ID, chatID: job.ChatID}
+	if !d.claim(key) {
+		// Доставляется прямо сейчас другим путём — вернуть в очередь.
+		if err := d.queue.Mark(ctx, job, d.mode, StatusRetry); err != nil {
+			log.Printf("mark retry listing %d chat %d: %v", job.Event.ID, job.ChatID, err)
+		}
+		return
+	}
+	defer d.release(key)
+	unlockChat := d.lockChat(job.ChatID)
+	defer unlockChat()
+
+	ok, err := d.limiter.Allow(ctx, job.ChatID, d.mode)
+	if err != nil {
+		// Окно не подтверждено — задание остаётся в очереди.
+		log.Printf("limiter check listing %d chat %d: %v", job.Event.ID, job.ChatID, err)
+		ok = false
+	}
+	if !ok {
+		if err := d.queue.Mark(ctx, job, d.mode, StatusRetry); err != nil {
+			log.Printf("mark retry listing %d chat %d: %v", job.Event.ID, job.ChatID, err)
+		}
+		return
+	}
+	status := StatusSent
+	if err := d.send(ctx, job.ChatID, job.Event); err != nil {
+		// contracts.md §2: ошибка отправки — статус unknown, без повтора.
+		log.Printf("send listing %d to chat %d: %v", job.Event.ID, job.ChatID, err)
+		status = StatusUnknown
+	}
+	if err := d.queue.Mark(ctx, job, d.mode, status); err != nil {
+		log.Printf("mark listing %d chat %d: %v", job.Event.ID, job.ChatID, err)
+	}
+	// Журнал: для Pg-очереди строка задания и есть запись журнала,
+	// Record подтверждает её (upsert по той же паре); для memory-очереди
+	// это единственная фиксация доставки.
+	if err := d.journal.Record(ctx, job.ChatID, job.Event.ID, job.Event.EventID, job.Event, status, d.mode); err != nil {
+		log.Printf("journal record listing %d chat %d: %v", job.Event.ID, job.ChatID, err)
 	}
 }
