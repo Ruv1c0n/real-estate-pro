@@ -28,7 +28,6 @@ import (
 // Параметры доставки (ТЗ 3.6 и contracts.md §2).
 const (
 	notificationsPerHour = 30
-	journalTTL           = 24 * time.Hour
 	flushInterval        = 30 * time.Second
 	debugBodyLimit       = 1 << 20 // 1 МБ на демо-событие
 )
@@ -52,26 +51,37 @@ func main() {
 	defer redisClient.Close()
 
 	subs := store.NewMemory()
-	journal := notify.NewJournal(journalTTL)
-	limiter := notify.NewLimiter(notificationsPerHour, time.Hour)
+	limiter := notify.NewMemoryLimiter(notificationsPerHour, time.Hour)
 	dictsClient := dicts.New(env("CORE_API_URL", "http://localhost:8000"))
 
+	// Журнал: в Postgres, когда БД доступна (постоянный дедуп, ФТ-3.5),
+	// иначе in-memory для режима без БД.
+	var journal notify.Journal
+	if pool != nil {
+		journal = notify.NewPgJournal(pool)
+	} else {
+		journal = notify.NewMemoryJournal()
+	}
+
 	var sender notify.Sender
+	var mode string
 	var tgBot *bot.Bot
 	if token := os.Getenv("TELEGRAM_BOT_TOKEN"); token != "" {
+		mode = notify.ModeTelegram
 		tgBot = bot.New(telegram.NewClient(token), subs, dictsClient)
 		go tgBot.Run(ctx)
 		sender = tgBot.Send
 	} else {
 		// Режим «лог» (ФТ-3.6): совпадения пишутся в stdout, без Telegram.
 		log.Println("TELEGRAM_BOT_TOKEN is empty: log mode, bot disabled")
+		mode = notify.ModeLog
 		sender = func(_ context.Context, chatID int64, e model.Event) error {
 			log.Printf("MATCH: chat %d <- listing %d (%s, $%d) %s", chatID, e.ID, e.City, e.PriceUSD, e.URL)
 			return nil
 		}
 	}
 
-	dispatcher := notify.NewDispatcher(subs, journal, limiter, sender)
+	dispatcher := notify.NewDispatcher(subs, journal, limiter, mode, sender)
 	go dispatcher.RunFlusher(ctx, flushInterval)
 
 	// Ошибка создания consumer group делает сервис слепым — это фатально.
