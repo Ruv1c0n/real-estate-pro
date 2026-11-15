@@ -320,3 +320,82 @@ func TestPostgresConstraintViolationReturnsError(t *testing.T) {
 		})
 	}
 }
+
+func TestPostgresEnsureUserIdempotent(t *testing.T) {
+	p := newTestStore(t)
+
+	if err := p.EnsureUser(300); err != nil {
+		t.Fatalf("EnsureUser: %v", err)
+	}
+	if err := p.EnsureUser(300); err != nil { // повторный — no-op
+		t.Fatalf("повторный EnsureUser: %v", err)
+	}
+
+	var n int
+	if err := testPool.QueryRow(context.Background(),
+		"SELECT count(*) FROM notifier.users WHERE chat_id = 300").Scan(&n); err != nil {
+		t.Fatalf("count users: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("строк users для chat 300: %d, want 1", n)
+	}
+}
+
+func TestPostgresDeleteUserCascade(t *testing.T) {
+	p := newTestStore(t)
+	if err := p.EnsureUser(100); err != nil {
+		t.Fatalf("EnsureUser: %v", err)
+	}
+	p.Add(model.Subscription{ChatID: 100, City: "Minsk"})
+	p.Add(model.Subscription{ChatID: 100, City: "Brest"})
+	// Строка журнала: каскад по FK должен убрать и её (/stop, ФТ-3.1).
+	if _, err := testPool.Exec(context.Background(), `
+		INSERT INTO notifier.notifications_log (chat_id, listing_id, event_id, status, mode, payload)
+		VALUES (100, 1, gen_random_uuid(), 'deferred', 'log', '{}')`); err != nil {
+		t.Fatalf("insert log row: %v", err)
+	}
+
+	n, err := p.DeleteUser(100)
+	if err != nil {
+		t.Fatalf("DeleteUser: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("DeleteUser вернул %d подписок, want 2", n)
+	}
+	assertTablesEmpty(t, "notifier.users", "notifier.subscriptions", "notifier.notifications_log")
+}
+
+func TestPostgresAddCreatesUser(t *testing.T) {
+	p := newTestStore(t)
+	// Пользователя для чата 300 нет: Add должен создать его сам —
+	// /subscribe без предварительного /start работает.
+	got := p.Add(model.Subscription{ChatID: 300, City: "Minsk"})
+	if got.ID <= 0 {
+		t.Fatalf("Add() без /start вернул ID %d", got.ID)
+	}
+
+	var n int
+	if err := testPool.QueryRow(context.Background(),
+		"SELECT count(*) FROM notifier.users WHERE chat_id = 300").Scan(&n); err != nil {
+		t.Fatalf("count users: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("строк users для chat 300: %d, want 1", n)
+	}
+}
+
+// assertTablesEmpty проверяет, что во всех перечисленных таблицах пусто
+// (после /stop не должно оставаться данных ни в одной из трёх).
+func assertTablesEmpty(t *testing.T, tables ...string) {
+	t.Helper()
+	for _, table := range tables {
+		var n int
+		if err := testPool.QueryRow(context.Background(),
+			"SELECT count(*) FROM "+table).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		if n != 0 {
+			t.Errorf("в %s осталось строк: %d, want 0", table, n)
+		}
+	}
+}
