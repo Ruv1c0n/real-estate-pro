@@ -4,7 +4,10 @@
 Раскладка считается в Python (vectorized Fruchterman-Reingold на numpy)
 и вшивается в HTML готовыми координатами: JS делает только pan/zoom/drag/
 highlight/поиск. Запуск:
-  python -I gen.py .trail/cache/.graph/wiring.json trail-viz/index.html
+  python -I gen.py <wiring.json> trail-viz/index.html
+
+  Путь к wiring.json зависит от окружения: .trail/cache/.graph/wiring.json
+  (репо с .trail/) или graft/wiring.json (дефолт trail без .trail/, как в CI).
 """
 import json, sys, pathlib, math
 import numpy as np
