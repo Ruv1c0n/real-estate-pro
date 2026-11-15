@@ -278,3 +278,112 @@ func TestFlushDropsAlreadySent(t *testing.T) {
 		}
 	}
 }
+
+// blockingSender — отправитель, «зависающий» в отправке, чтобы смоделировать
+// конкурентную доставку того же задания другим путём.
+type blockingSender struct {
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	calls   []string
+}
+
+func newBlockingSender() *blockingSender {
+	return &blockingSender{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (s *blockingSender) send(_ context.Context, chatID int64, e model.Event) error {
+	s.mu.Lock()
+	s.calls = append(s.calls, fmt.Sprintf("%d:%d", chatID, e.ID))
+	s.mu.Unlock()
+	s.once.Do(func() { close(s.entered) })
+	<-s.release
+	return nil
+}
+
+func (s *blockingSender) sent() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.calls...)
+}
+
+func TestClaimRelease(t *testing.T) {
+	d, _, _, _ := newTestDispatcher(10)
+	key := journalKey{listingID: 1, chatID: 10}
+
+	if !d.claim(key) {
+		t.Fatal("первый клейм должен пройти")
+	}
+	if d.claim(key) {
+		t.Fatal("повторный клейм той же пары должен быть отклонён")
+	}
+	d.release(key)
+	if !d.claim(key) {
+		t.Fatal("после release клейм должен пройти снова")
+	}
+	d.release(key)
+}
+
+func TestHandleConcurrentDeliveryNotDuplicated(t *testing.T) {
+	// Гонка двух путей (consumer ∥ flusher): оба успевают прочитать
+	// journal.Sent == false до записи результата. Клейм «в полёте»
+	// должен оставить ровно одну отправку (ревью #46).
+	sender := newBlockingSender()
+	subs := store.NewMemory()
+	d := NewDispatcher(subs, NewMemoryJournal(), NewMemoryLimiter(10, time.Hour), ModeLog, sender.send)
+	subs.Add(model.Subscription{ChatID: 10})
+
+	e := testEvent(1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		d.Handle(context.Background(), e)
+	}()
+	<-sender.entered                  // первый путь завис в отправке, клейм удерживается
+	d.Handle(context.Background(), e) // второй путь — пропускает по клейму
+	close(sender.release)
+	wg.Wait()
+
+	if got := sender.sent(); len(got) != 1 {
+		t.Fatalf("sent = %v, want 1 (параллельная доставка не дублируется)", got)
+	}
+}
+
+func TestFlushRequeuesClaimedJob(t *testing.T) {
+	// Задание, занятое параллельной доставкой, возвращается в отложенные,
+	// а не отбрасывается (ТЗ 3.6: отложенные не теряются).
+	base := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	d, sender, subs, limiter := newTestDispatcher(1)
+	limiter.nowFunc = func() time.Time { return base }
+	subs.Add(model.Subscription{ChatID: 10})
+
+	d.Handle(context.Background(), testEvent(1))
+	d.Handle(context.Background(), testEvent(2)) // отложено
+
+	key := journalKey{listingID: 2, chatID: 10}
+	if !d.claim(key) {
+		t.Fatal("клейм должен пройти до Flush")
+	}
+
+	limiter.nowFunc = func() time.Time { return base.Add(61 * time.Minute) }
+	d.Flush(context.Background())
+
+	if got := sender.sent(); len(got) != 1 {
+		t.Fatalf("sent = %v, want 1 (занятое клеймом задание не отправляется)", got)
+	}
+	d.deferMu.Lock()
+	requeued := len(d.deferred)
+	d.deferMu.Unlock()
+	if requeued != 1 {
+		t.Fatalf("отложенных после Flush = %d, want 1 (задание вернулось в очередь)", requeued)
+	}
+
+	d.release(key)
+	d.Flush(context.Background())
+
+	if got := sender.sent(); len(got) != 2 || got[1] != "10:2" {
+		t.Fatalf("sent = %v, want [10:1 10:2] (после release задание доставлено)", got)
+	}
+}

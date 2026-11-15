@@ -152,17 +152,51 @@ type Dispatcher struct {
 
 	deferMu  sync.Mutex
 	deferred []deferredJob
+
+	claimMu  sync.Mutex
+	inFlight map[journalKey]struct{} // доставки «в полёте»: клейм до проверки журнала
 }
 
 func NewDispatcher(subs store.Store, journal Journal, limiter Limiter, mode string, send Sender) *Dispatcher {
-	return &Dispatcher{subs: subs, journal: journal, limiter: limiter, mode: mode, send: send}
+	return &Dispatcher{subs: subs, journal: journal, limiter: limiter, mode: mode, send: send,
+		inFlight: make(map[journalKey]struct{})}
+}
+
+// claim закрепляет пару (объявление, чат) за текущей доставкой: закрывает
+// гонку двух параллельных путей (consumer и flusher), которые оба успевают
+// прочитать journal.Sent == false до записи результата. Клейм берётся ДО
+// проверки журнала, а Record выполняется только под клеймом, поэтому
+// проверка Sent не может промахнуться из-за ещё не записанной доставки.
+// Процесс один — клейма достаточно; при нескольких инстансах notifier
+// понадобился бы клейм на уровне БД.
+func (d *Dispatcher) claim(k journalKey) bool {
+	d.claimMu.Lock()
+	defer d.claimMu.Unlock()
+	if _, ok := d.inFlight[k]; ok {
+		return false
+	}
+	d.inFlight[k] = struct{}{}
+	return true
+}
+
+// release снимает клейм после завершения доставки (или отказа от неё).
+func (d *Dispatcher) release(k journalKey) {
+	d.claimMu.Lock()
+	defer d.claimMu.Unlock()
+	delete(d.inFlight, k)
 }
 
 // Handle обрабатывает одно событие из стрима: находит получателей
 // (уникальные чаты, ФТ-3.4), пропускает повторную доставку по журналу,
-// отправляет сразу или откладывает при исчерпании лимита.
+// отправляет сразу или откладывает при исчерпании лимита. Перед проверкой
+// журнала пара (объявление, чат) закрепляется клеймом; если она уже
+// доставляется параллельным путём — шаг пропускается.
 func (d *Dispatcher) Handle(ctx context.Context, e model.Event) {
 	for _, chatID := range model.Recipients(e, d.subs.All()) {
+		key := journalKey{listingID: e.ID, chatID: chatID}
+		if !d.claim(key) {
+			continue // уже доставляется другим путём — не дублируем (ФТ-3.5)
+		}
 		sent, err := d.journal.Sent(ctx, e.ID, chatID)
 		if err != nil {
 			// Журнал недоступен — не паникуем и не прерываем доставку
@@ -170,13 +204,15 @@ func (d *Dispatcher) Handle(ctx context.Context, e model.Event) {
 			log.Printf("journal check listing %d chat %d: %v", e.ID, chatID, err)
 		}
 		if sent {
-			continue // событие доставлено повторно — не дублируем (ФТ-3.5)
+			d.release(key) // событие доставлено повторно — не дублируем (ФТ-3.5)
+			continue
 		}
 		if d.limiter.Allow(chatID) {
 			d.deliver(ctx, chatID, e)
 		} else {
 			d.postpone(chatID, e)
 		}
+		d.release(key)
 	}
 }
 
@@ -217,7 +253,10 @@ func (d *Dispatcher) RunFlusher(ctx context.Context, every time.Duration) {
 	}
 }
 
-// Flush делает один проход по отложенным заданиям.
+// Flush делает один проход по отложенным заданиям. Перед проверкой журнала
+// пара закрепляется клеймом: занятая другим путём пара возвращается в
+// очередь — тот путь либо доставит её, либо оставит запись в журнале,
+// которую следующее поколение отсеет по Sent.
 func (d *Dispatcher) Flush(ctx context.Context) {
 	d.deferMu.Lock()
 	jobs := d.deferred
@@ -226,17 +265,25 @@ func (d *Dispatcher) Flush(ctx context.Context) {
 
 	var requeue []deferredJob
 	for _, job := range jobs {
+		key := journalKey{listingID: job.event.ID, chatID: job.chatID}
+		if !d.claim(key) {
+			requeue = append(requeue, job) // доставляется прямо сейчас — повторим позже
+			continue
+		}
 		sent, err := d.journal.Sent(ctx, job.event.ID, job.chatID)
 		if err != nil {
 			log.Printf("journal check listing %d chat %d: %v", job.event.ID, job.chatID, err)
 		}
 		if sent {
-			continue // уже доставлено другим путём
+			d.release(key) // уже доставлено другим путём
+			continue
 		}
 		if d.limiter.Allow(job.chatID) {
 			d.deliver(ctx, job.chatID, job.event)
+			d.release(key)
 		} else {
 			requeue = append(requeue, job)
+			d.release(key)
 		}
 	}
 	if len(requeue) > 0 {
