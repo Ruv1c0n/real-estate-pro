@@ -8,52 +8,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"notifier/internal/model"
 )
-
-// eventSnapshot — снимок события в контрактной форме (contracts.md §2,
-// snake_case). PopBatch разбирает payload через model.ParseEvent, который
-// ждёт именно такой формат, поэтому хранить его надо не «как.Marshal(Event)»
-// (Go-имена полей), а в контрактном виде.
-type eventSnapshot struct {
-	EventID   string    `json:"event_id"`
-	ID        int64     `json:"id"`
-	Source    string    `json:"source"`
-	DealType  string    `json:"deal_type"`
-	Country   string    `json:"country"`
-	City      string    `json:"city"`
-	Rooms     int       `json:"rooms"`
-	Price     float64   `json:"price"`
-	Currency  string    `json:"currency"`
-	PriceUSD  int64     `json:"price_usd"`
-	Address   *string   `json:"address"`
-	URL       string    `json:"url"`
-	CreatedAt time.Time `json:"created_at"`
-}
-
-func snapshotOf(e model.Event) eventSnapshot {
-	return eventSnapshot{
-		EventID:   e.EventID,
-		ID:        e.ID,
-		Source:    e.Source,
-		DealType:  e.DealType,
-		Country:   e.Country,
-		City:      e.City,
-		Rooms:     e.Rooms,
-		Price:     e.Price,
-		Currency:  e.Currency,
-		PriceUSD:  e.PriceUSD,
-		Address:   e.Address,
-		URL:       e.URL,
-		CreatedAt: e.CreatedAt,
-	}
-}
 
 // PgQueue — очередь отложенных заданий. Транзакция PopBatch держит блокировки
 // FOR UPDATE до Mark: параллельный PopBatch (SKIP LOCKED) уже занятые строки
@@ -75,7 +37,9 @@ func NewPgQueue(pool *pgxpool.Pool) *PgQueue {
 // события не создаёт второе задание, а существующая строка (deferred или уже
 // доставленная) остаётся как есть.
 func (q *PgQueue) Postpone(ctx context.Context, chatID int64, e model.Event, mode string) error {
-	payload, err := json.Marshal(snapshotOf(e))
+	// Payload в контрактной форме (contracts.md §2): его кодирует
+	// Event.MarshalJSON — тот же вид, который ParseEvent читает в PopBatch.
+	payload, err := json.Marshal(e)
 	if err != nil {
 		return fmt.Errorf("queue payload: %w", err)
 	}
@@ -92,7 +56,11 @@ func (q *PgQueue) Postpone(ctx context.Context, chatID int64, e model.Event, mod
 
 // PopBatch возвращает до limit самых старых отложенных заданий
 // (индекс notifications_log_deferred_idx). Строки блокируются за этим
-// воркером до Mark.
+// воркером до Mark. Строка с битым payload батч не откатывает: она
+// карантинится (status='failed', причина в логе) и пропускается — из-за
+// одной битой строки доставка для всех вставать не должна. Из-за
+// карантина батч может вернуться меньше limit (недобранные строки флешер
+// заберёт следующим проходом).
 func (q *PgQueue) PopBatch(ctx context.Context, limit int) ([]DeferredJob, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -104,7 +72,7 @@ func (q *PgQueue) PopBatch(ctx context.Context, limit int) ([]DeferredJob, error
 		q.tx = tx
 	}
 	rows, err := q.tx.Query(ctx, `
-		SELECT chat_id, payload FROM notifier.notifications_log
+		SELECT id, chat_id, payload FROM notifier.notifications_log
 		WHERE status = 'deferred'
 		ORDER BY created_at
 		LIMIT $1
@@ -116,23 +84,57 @@ func (q *PgQueue) PopBatch(ctx context.Context, limit int) ([]DeferredJob, error
 	defer rows.Close()
 
 	var jobs []DeferredJob
+	var badIDs []int64 // строки с битым payload — карантин после закрытия rows
 	for rows.Next() {
-		var chatID int64
+		var id, chatID int64
 		var payload []byte
-		if err := rows.Scan(&chatID, &payload); err != nil {
+		if err := rows.Scan(&id, &chatID, &payload); err != nil {
 			q.rollbackTx(ctx)
 			return nil, fmt.Errorf("queue pop scan: %w", err)
 		}
 		e, err := model.ParseEvent(payload)
 		if err != nil {
-			q.rollbackTx(ctx)
-			return nil, fmt.Errorf("queue pop payload: %w", err)
+			// Битую строку нельзя откатывать вместе с батчем: она осталась
+			// бы головой ORDER BY created_at, и флушер зациклился на ней.
+			// Запоминаем id и карантиним после закрытия rows (Exec в той же
+			// tx, пока rows открыты, не выполняется), разбор остальных строк
+			// продолжаем.
+			badIDs = append(badIDs, id)
+			log.Printf("queue pop payload: bad row quarantined id=%d: %v", id, err)
+			continue
 		}
 		jobs = append(jobs, DeferredJob{ChatID: chatID, Event: e})
 	}
 	if err := rows.Err(); err != nil {
 		q.rollbackTx(ctx)
 		return nil, fmt.Errorf("queue pop rows: %w", err)
+	}
+	rows.Close()
+
+	// Карантин битых строк: в той же транзакции, которая держит на них
+	// FOR UPDATE, — автономный UPDATE из другого соединения упёрся бы в
+	// собственную блокировку (самодедлок). Коммит произойдёт вместе с
+	// батчем при первом Mark. sent_at для 'failed' может быть NULL (CHECK
+	// требует его только для sent/unknown), но задаём now() сразу: статус
+	// финальный, sent_at служит меткой времени карантина.
+	for _, id := range badIDs {
+		if _, err := q.tx.Exec(ctx, `
+			UPDATE notifier.notifications_log
+			SET status = 'failed', sent_at = now()
+			WHERE id = $1`, id); err != nil {
+			q.rollbackTx(ctx)
+			return nil, fmt.Errorf("queue quarantine: %w", err)
+		}
+	}
+	// Батч без валидных заданий Mark не дождётся никогда — коммитим
+	// карантинную транзакцию сразу: иначе она с блокировками строк осталась
+	// бы открытой (idle-in-transaction) до ближайшего Mark.
+	if len(jobs) == 0 {
+		if err := q.tx.Commit(ctx); err != nil {
+			q.tx = nil
+			return nil, fmt.Errorf("queue commit: %w", err)
+		}
+		q.tx = nil
 	}
 	return jobs, nil
 }
