@@ -23,6 +23,7 @@ import (
 var (
 	testPool *pgxpool.Pool
 	hasDB    bool
+	testDSN  string // сохраняется для тестов, открывающих свой пул (см. dispatcher_pg_test.go)
 )
 
 func TestMain(m *testing.M) {
@@ -46,6 +47,7 @@ func TestMain(m *testing.M) {
 
 	applyMigration(ctx, pool)
 
+	testDSN = dsn
 	testPool = pool
 	hasDB = true
 	code := m.Run()
