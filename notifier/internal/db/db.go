@@ -3,6 +3,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"strings"
@@ -20,13 +21,24 @@ const (
 	defaultDB       = "realestate"
 )
 
+// pingAttempts — число попыток пинга при старте (задержки 1s, 2s между ними).
+const pingAttempts = 3
+
 // Connect открывает пул соединений с Postgres.
 //
-// Если ни одной переменной POSTGRES_* не задано или пинг не прошёл при старте,
-// возвращает (nil, nil) и не падает: сервис продолжает работать на in-memory
-// хранилище — так живут CI и локальные тесты без Docker.
+// (nil, nil) возвращается только когда БД не сконфигурирована (ни одной
+// переменной POSTGRES_*): сервис продолжает работать на in-memory хранилище —
+// так живут CI и локальные тесты без Docker. Сконфигурированная, но
+// недоступная БД — ошибка старта (fail-fast, main.go делает log.Fatal):
+// тихий уход в memory-режим маскировал бы проблему окружения весь аптайм.
+// Частичная конфигурация (задана часть POSTGRES_* без user/password) — тоже
+// ошибка: иначе misconfig молча превращается в подключение app/app@127.0.0.1.
+// Переподключение в процессе работы обеспечивает сам pgxpool.
 func Connect(ctx context.Context) (*pgxpool.Pool, error) {
-	dsn := dsnFromEnv()
+	dsn, err := dsnFromEnv()
+	if err != nil {
+		return nil, err
+	}
 	if dsn == "" {
 		log.Println("DB disabled: running in memory mode")
 		return nil, nil
@@ -38,18 +50,37 @@ func Connect(ctx context.Context) (*pgxpool.Pool, error) {
 	}
 	cfg.MaxConns = 5
 
-	// Пинг с таймаутом: недоступная база не должна блокировать старт.
-	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	// Пинг с ограниченными ретраями: до 3 попыток с задержкой 1s, 2s между
+	// ними — Postgres при одновременном старте docker compose может ещё
+	// подниматься. Общий бюджет 10s ограничивает блокировку старта сверху:
+	// при исчерпании попыток или бюджета — ошибка (fail-fast), а не ожидание.
+	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	pool, err := pgxpool.NewWithConfig(pingCtx, cfg)
 	if err != nil {
 		return nil, err
 	}
-	if err := pool.Ping(pingCtx); err != nil {
+
+	var pingErr error
+	for attempt := 1; ; attempt++ {
+		if pingErr = pool.Ping(pingCtx); pingErr == nil {
+			break
+		}
+		// Попытки или бюджет (отмена ctx) исчерпаны — отдаём ошибку наверх.
+		if attempt == pingAttempts || pingCtx.Err() != nil {
+			break
+		}
+		// Пауза между попытками (1s, 2s); досрочный выход — при отмене
+		// контекста или исчерпании бюджета.
+		select {
+		case <-pingCtx.Done():
+		case <-time.After(time.Duration(attempt) * time.Second):
+		}
+	}
+	if pingErr != nil {
 		pool.Close()
-		log.Printf("DB disabled: running in memory mode (ping: %v)", err)
-		return nil, nil
+		return nil, fmt.Errorf("db: ping: %w", pingErr)
 	}
 
 	log.Println("DB connected")
@@ -59,9 +90,13 @@ func Connect(ctx context.Context) (*pgxpool.Pool, error) {
 // dsnFromEnv собирает DSN из окружения. Задан DATABASE_URL (legacy-вариант
 // с main) — используется как есть, без разбора частей. Ни одной переменной
 // POSTGRES_* нет — БД не сконфигурирована, возвращается пустая строка.
-func dsnFromEnv() string {
+// Задана хоть одна часть POSTGRES_* — user и password обязательны явно:
+// недостающие части подставлялись бы дефолтами, и опечатка в имени
+// переменной (например, задан только POSTGRES_DB) дала бы «рабочее»
+// подключение app/app@127.0.0.1 вместо ошибки конфигурации.
+func dsnFromEnv() (string, error) {
 	if url := os.Getenv("DATABASE_URL"); url != "" {
-		return url
+		return url, nil
 	}
 
 	host := os.Getenv("POSTGRES_HOST")
@@ -71,7 +106,11 @@ func dsnFromEnv() string {
 	name := os.Getenv("POSTGRES_DB")
 
 	if host == "" && port == "" && user == "" && password == "" && name == "" {
-		return ""
+		return "", nil
+	}
+
+	if user == "" || password == "" {
+		return "", fmt.Errorf("db: POSTGRES_USER и POSTGRES_PASSWORD должны быть заданы явно, когда задана любая из переменных POSTGRES_*")
 	}
 
 	if host == "" {
@@ -79,12 +118,6 @@ func dsnFromEnv() string {
 	}
 	if port == "" {
 		port = defaultPort
-	}
-	if user == "" {
-		user = defaultUser
-	}
-	if password == "" {
-		password = defaultPassword
 	}
 	if name == "" {
 		name = defaultDB
@@ -97,7 +130,7 @@ func dsnFromEnv() string {
 		" user=" + quoteValue(user) +
 		" password=" + quoteValue(password) +
 		" dbname=" + quoteValue(name) +
-		" sslmode=disable"
+		" sslmode=disable", nil
 }
 
 // quoteValue экранирует значение по правилам pgx-connstring: значения с
