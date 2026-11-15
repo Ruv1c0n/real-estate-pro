@@ -10,7 +10,7 @@
 
 | Компонент | Стек / порт | Назначение |
 |---|---|---|
-| `core-api` | Python, FastAPI, SQLAlchemy, Alembic / 8000 | Объявления, поиск, справочники, кэш, outbox, публикация событий |
+| `core-api` | Python, FastAPI, SQLAlchemy (Alembic запланирован) / 8000 | Объявления, поиск, справочники, кэш, outbox, публикация событий |
 | `collector` | Python, httpx, Jinja2, HTMX / 8001 | API-адаптер, mock-данные, нормализация, доставка, веб-маршруты |
 | `notifier` | Go, go-redis, Telegram Bot API / 8080 | Пользователи, подписки, Streams, задания и отправка уведомлений |
 | `postgres` | PostgreSQL / 5432 | Схемы `core` и `notifier` |
@@ -67,7 +67,8 @@ ADMIN_KEY=ключ_для_debug_event
 
 После запуска каркаса:
 
-- `http://localhost:8000` и `http://localhost:8001` — временные HTTP-серверы, полноценного приложения пока нет.
+- `http://localhost:8000` — каркас core-api: отданы `/health`, `/health/live` и `/health/ready`; полноценного API объявлений и справочников пока нет.
+- `http://localhost:8001` — заглушка collector: HTTP-сервер запущен, полноценного приложения пока нет.
 - `http://localhost:8080/health` — проверка notifier: доступность Redis и справочников Core API, режим доставки (telegram/log).
 - `http://localhost:8080/health/ready` — проверка готовности: 200, только когда доступны Redis, справочники Core API и — в db-режиме — PostgreSQL; иначе 503 с тем же JSON-телом.
 - `POST http://localhost:8080/debug/event` с заголовком `X-Admin-Key` — демо-событие: тело валидируется и публикуется в стрим `listings.new`, проходя обычный путь доставки. Без заданного `ADMIN_KEY` эндпоинт отвечает 404.
@@ -93,6 +94,7 @@ docker compose down
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Без токена — log-режим; реализовано в notifier |
 | `POSTGRES_*` | Адрес PostgreSQL по частям (`HOST`, `PORT`, `USER`, `PASSWORD`, `DB`); так notifier и core-api получают его в Compose |
+| `POSTGRES_SSLMODE` | Режим TLS для подключения notifier к PostgreSQL (`sslmode` в собранном DSN); пустое значение означает `disable` — встроенный дефолт |
 | `DATABASE_URL` | Только для локального Core API (`postgresql+asyncpg`); notifier проверяет её первой — до `POSTGRES_*` — как legacy-DSN. Работают только форматы, которые разбирает pgx: значение `+asyncpg` из `.env.example` уронит локальный запуск notifier |
 | `REDIS_URL` | Адрес Redis; сейчас задан в Compose |
 | `CORE_API_URL` | Адрес Core API для collector и справочников notifier |

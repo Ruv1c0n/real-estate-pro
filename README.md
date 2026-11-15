@@ -10,7 +10,7 @@ My part of the project: the Go notifier (Telegram Bot API, Redis Streams), the T
 
 | Component | Stack / port | Purpose |
 |---|---|---|
-| `core-api` | Python, FastAPI, SQLAlchemy, Alembic / 8000 | Listings, search, reference data, cache, outbox, event publishing |
+| `core-api` | Python, FastAPI, SQLAlchemy (Alembic planned) / 8000 | Listings, search, reference data, cache, outbox, event publishing |
 | `collector` | Python, httpx, Jinja2, HTMX / 8001 | API adapter, mock data, normalization, delivery, web routes |
 | `notifier` | Go, go-redis, Telegram Bot API / 8080 | Users, subscriptions, Streams, delivery jobs and notifications |
 | `postgres` | PostgreSQL / 5432 | Schemas `core` and `notifier` |
@@ -67,7 +67,8 @@ Without a token, notifier writes matches to stdout. In the current Compose, `MOC
 
 Once the skeleton is up:
 
-- `http://localhost:8000` and `http://localhost:8001` — temporary HTTP servers; the real applications are not implemented yet.
+- `http://localhost:8000` — core-api skeleton: `/health`, `/health/live` and `/health/ready` endpoints are served; the listings API and reference data are not implemented yet.
+- `http://localhost:8001` — collector placeholder: an HTTP server is running; the real application is not implemented yet.
 - `http://localhost:8080/health` — notifier health check: Redis and Core API reference data availability, delivery mode (telegram/log).
 - `http://localhost:8080/health/ready` — readiness check: 200 only when Redis, Core API reference data and, in db mode, PostgreSQL are available; otherwise 503 with the same JSON body.
 - `POST http://localhost:8080/debug/event` with the `X-Admin-Key` header — a demo event: the body is validated and published to the `listings.new` stream, going through the regular delivery path. If `ADMIN_KEY` is not set, the endpoint responds with 404.
@@ -93,6 +94,7 @@ With `.env` filled in, startup is a single `docker compose up --build`.
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Without a token — log mode; implemented in notifier |
 | `POSTGRES_*` | PostgreSQL address in parts (`HOST`, `PORT`, `USER`, `PASSWORD`, `DB`); this is how notifier and core-api receive it in Compose |
+| `POSTGRES_SSLMODE` | TLS mode for notifier's PostgreSQL connection (`sslmode` in the assembled DSN); an empty value means `disable`, the built-in default |
 | `DATABASE_URL` | For local Core API only (`postgresql+asyncpg`); notifier checks it first — before `POSTGRES_*` — as a legacy DSN. Only pgx-parseable formats work: the `+asyncpg` value from `.env.example` fails a local notifier startup |
 | `REDIS_URL` | Redis address; currently set in Compose |
 | `CORE_API_URL` | Core API address for collector and notifier reference data |
