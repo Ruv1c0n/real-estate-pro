@@ -19,6 +19,7 @@ const (
 	defaultUser     = "app"
 	defaultPassword = "app"
 	defaultDB       = "realestate"
+	defaultSSLMode  = "disable"
 )
 
 // pingAttempts — число попыток пинга при старте (задержки 1s, 2s между ними).
@@ -46,9 +47,15 @@ func Connect(ctx context.Context) (*pgxpool.Pool, error) {
 
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("db: parse dsn: %w", err)
 	}
 	cfg.MaxConns = 5
+
+	// Ограничения соединений: ConnectTimeout не даёт установке соединения
+	// висеть бесконечно; statement_timeout — сессионный лимит на запрос,
+	// зависший запрос не держит соединение пула вечно.
+	cfg.ConnConfig.ConnectTimeout = 5 * time.Second
+	cfg.ConnConfig.RuntimeParams["statement_timeout"] = "5s"
 
 	// Пинг с ограниченными ретраями: до 3 попыток с задержкой 1s, 2s между
 	// ними — Postgres при одновременном старте docker compose может ещё
@@ -59,7 +66,7 @@ func Connect(ctx context.Context) (*pgxpool.Pool, error) {
 
 	pool, err := pgxpool.NewWithConfig(pingCtx, cfg)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("db: create pool: %w", err)
 	}
 
 	var pingErr error
@@ -104,8 +111,9 @@ func dsnFromEnv() (string, error) {
 	user := os.Getenv("POSTGRES_USER")
 	password := os.Getenv("POSTGRES_PASSWORD")
 	name := os.Getenv("POSTGRES_DB")
+	sslmode := os.Getenv("POSTGRES_SSLMODE")
 
-	if host == "" && port == "" && user == "" && password == "" && name == "" {
+	if host == "" && port == "" && user == "" && password == "" && name == "" && sslmode == "" {
 		return "", nil
 	}
 
@@ -122,6 +130,9 @@ func dsnFromEnv() (string, error) {
 	if name == "" {
 		name = defaultDB
 	}
+	if sslmode == "" {
+		sslmode = defaultSSLMode
+	}
 
 	// Keyword-value формат, а не URL: знак @ и другие спецсимволы пароля
 	// его не ломают (тот же класс бага, что словили в Python на PR #39).
@@ -130,7 +141,7 @@ func dsnFromEnv() (string, error) {
 		" user=" + quoteValue(user) +
 		" password=" + quoteValue(password) +
 		" dbname=" + quoteValue(name) +
-		" sslmode=disable", nil
+		" sslmode=" + quoteValue(sslmode), nil
 }
 
 // quoteValue экранирует значение по правилам pgx-connstring: значения с
