@@ -9,6 +9,10 @@
 #   GRAPH_REPORT.md} (остальное — в .gitignore).
 # - В ветке gh-pages site-файлы лежат в корне; archify-диаграмма (architecture.html)
 #   обновляется там вручную — keep_files: true не даёт CI её затереть.
+# - Trail-граф кода (trail-graph.html): CI ставит trail (версия запинена — формат
+#   wiring.json не контрактован), строит wiring.json через `trail build` (tree-sitter,
+#   без API-ключей и сети) и рендерит детерминированную раскладку
+#   scripts/trail-viz/gen.py (зависимость: numpy).
 
 name: graphify-pages
 
@@ -39,6 +43,31 @@ jobs:
       - name: Rebuild graph (AST-only, no LLM)
         run: graphify update .
 
+      # --- trail-граф файлов/символов с call-рёбрами ---
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install trail (pinned) and disable telemetry
+        run: |
+          npm install -g @trailhq/trail-code@0.29.0
+          trail telemetry disable
+
+      - name: Build trail wiring graph (tree-sitter, no API key)
+        run: trail build
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install numpy
+        run: pip install numpy
+
+      - name: Generate trail-graph.html
+        run: |
+          mkdir -p site
+          python scripts/trail-viz/gen.py .trail/cache/.graph/wiring.json site/trail-graph.html
+
       - name: Assemble site
         run: |
           mkdir -p site
@@ -61,6 +90,7 @@ jobs:
             <h1>Real Estate Pro — architecture &amp; knowledge graph</h1>
             <ul>
               <li><a href="graph.html">Knowledge graph (graphify)</a> — интерактивный граф кода, доков и ТЗ</li>
+              <li><a href="trail-graph.html">Trail code graph</a> — граф файлов/символов с call-рёбрами</li>
               <li><a href="architecture.html">Architecture diagram (archify)</a> — диаграмма стенда (обновляется вручную)</li>
               <li><a href="GRAPH_REPORT.md">GRAPH_REPORT.md</a> — текстовый отчёт последней сборки</li>
             </ul>
