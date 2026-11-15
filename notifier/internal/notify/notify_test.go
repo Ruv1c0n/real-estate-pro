@@ -111,6 +111,37 @@ func TestHandleDeferWhenLimitReached(t *testing.T) {
 	}
 }
 
+func TestHandleRepublishedDeferredDeliveredOnce(t *testing.T) {
+	// Отложенное по лимиту событие публикуется повторно до доставки
+	// (ТЗ 4.3, at-least-once): журнал дубль не отсечёт (доставка ещё не
+	// была), поэтому дедуп должен давать сама очередь — иначе Flush
+	// доставит объявление дважды (ФТ-3.5, паритет с db-режимом).
+	base := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	d, sender, subs, limiter, _ := newTestDispatcher(2)
+	limiter.nowFunc = func() time.Time { return base }
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
+
+	d.Handle(context.Background(), testEvent(1))
+	d.Handle(context.Background(), testEvent(2))
+	deferred := testEvent(3)
+	d.Handle(context.Background(), deferred) // сверх лимита — в очередь
+	d.Handle(context.Background(), deferred) // повторная публикация до доставки
+
+	if got := sender.sent(); len(got) != 2 {
+		t.Fatalf("sent = %v, want 2 немедленных", got)
+	}
+
+	// Окно освобождается — освобождённых слотов хватает на обе копии,
+	// так что без дедупа дубль уехал бы в этой же доставке.
+	limiter.nowFunc = func() time.Time { return base.Add(61 * time.Minute) }
+	d.Flush(context.Background())
+
+	got := sender.sent()
+	if len(got) != 3 || got[2] != "10:3" {
+		t.Fatalf("sent = %v, want 3 доставки: повторная публикация отложенного не дублирует", got)
+	}
+}
+
 func TestHandleDifferentChatsHaveOwnLimits(t *testing.T) {
 	d, sender, subs, _, _ := newTestDispatcher(1)
 	subs.Add(context.Background(), model.Subscription{ChatID: 10})
@@ -171,6 +202,36 @@ func TestMemoryJournalTTL(t *testing.T) {
 	j.nowFunc = func() time.Time { return base.Add(25 * time.Hour) }
 	if sent, _ := j.Sent(context.Background(), 1, 10); sent {
 		t.Fatal("после TTL запись удаляется")
+	}
+}
+
+func TestMemoryQueuePostponeDeduplicates(t *testing.T) {
+	// Повторное Postpone той же пары (чат, объявление) не создаёт дубль —
+	// паритет с UNIQUE (chat_id, listing_id) db-режима (PgQueue, ON CONFLICT).
+	q := NewMemoryQueue()
+	ctx := context.Background()
+	e := testEvent(1)
+
+	if err := q.Postpone(ctx, 10, e, ModeLog); err != nil {
+		t.Fatalf("Postpone: %v", err)
+	}
+	if err := q.Postpone(ctx, 10, e, ModeLog); err != nil {
+		t.Fatalf("повторное Postpone: %v", err)
+	}
+	// Тот же листинг другому чату и другой листинг тому же чату — не дубли.
+	if err := q.Postpone(ctx, 20, e, ModeLog); err != nil {
+		t.Fatalf("Postpone другому чату: %v", err)
+	}
+	if err := q.Postpone(ctx, 10, testEvent(2), ModeLog); err != nil {
+		t.Fatalf("Postpone другого листинга: %v", err)
+	}
+
+	jobs, err := q.PopBatch(ctx, 10)
+	if err != nil {
+		t.Fatalf("PopBatch: %v", err)
+	}
+	if len(jobs) != 3 {
+		t.Fatalf("заданий в очереди = %d, want 3 (дубль 10:1 не добавлен)", len(jobs))
 	}
 }
 
@@ -794,5 +855,64 @@ func TestChatLockSerializesAllow(t *testing.T) {
 	}
 	if got := sender.sent(); len(got) != 2 {
 		t.Fatalf("sent = %v, want 2 (оба события доставлены)", got)
+	}
+}
+
+// TestMemoryQueuePostponeInflightVisible — повторная публикация события,
+// пока задание «в полёте» (PopBatch без Mark), не создаёт вторую копию:
+// окно PopBatch→Mark невидимо для скана очереди (находка гейт-ревью R8).
+func TestMemoryQueuePostponeInflightVisible(t *testing.T) {
+	q := NewMemoryQueue()
+	ctx := context.Background()
+	e := testEvent(10)
+	if err := q.Postpone(ctx, 100, e, ModeLog); err != nil {
+		t.Fatalf("postpone: %v", err)
+	}
+	jobs, err := q.PopBatch(ctx, 5)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("popbatch: %v, %d заданий", err, len(jobs))
+	}
+	if err := q.Postpone(ctx, 100, e, ModeLog); err != nil {
+		t.Fatalf("postpone inflight: %v", err)
+	}
+	if err := q.Mark(ctx, jobs[0], ModeLog, StatusSent); err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+	if err := q.Postpone(ctx, 100, e, ModeLog); err != nil {
+		t.Fatalf("postpone после mark: %v", err)
+	}
+	jobs, err = q.PopBatch(ctx, 5)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("popbatch после mark: %v, %d заданий", err, len(jobs))
+	}
+}
+
+// TestFlushSkipsAlreadySent — ТЗ 4.3 «Уже записанное состояние sent не
+// отправляется повторно»: задание лежит в очереди, событие уже доставлено
+// другим путём — Flush не отправляет второй раз и закрывает задание как sent.
+func TestFlushSkipsAlreadySent(t *testing.T) {
+	subs := store.NewMemory()
+	if _, err := subs.Add(context.Background(), model.Subscription{ChatID: 100}); err != nil {
+		t.Fatalf("add subscription: %v", err)
+	}
+	j := NewMemoryJournal()
+	q := NewMemoryQueue()
+	l := NewMemoryLimiter(30, time.Hour)
+	sender := &recordingSender{}
+	d := NewDispatcher(subs, j, l, q, ModeLog, sender.send)
+	ctx := context.Background()
+
+	e := testEvent(10)
+	if err := q.Postpone(ctx, 100, e, ModeLog); err != nil {
+		t.Fatalf("postpone: %v", err)
+	}
+	// Событие уже доставлено другим путём (повтор публикации, гонка воркеров).
+	if err := j.Record(ctx, 100, e.ID, e.EventID, e, StatusSent, ModeLog); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+
+	d.Flush(ctx)
+	if got := sender.sent(); len(got) != 0 {
+		t.Fatalf("sent = %v, want пусто — повторная доставка уже sent-события", got)
 	}
 }
