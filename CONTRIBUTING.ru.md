@@ -79,3 +79,18 @@ docker compose exec postgres psql -U app -d realestate -c "CREATE DATABASE reale
 cd notifier
 NOTIFIER_TEST_DSN='host=127.0.0.1 port=5432 user=app password=app dbname=realestate_test' go test ./...
 ```
+
+### Карантин доставки
+
+Задания доставки, не прошедшие валидацию (например, битый payload
+`listings.new`), помечаются `status='failed'` в `notifier.notifications_log` и
+дальше автоматически не повторяются и не выгружаются — очередь продолжает
+работать мимо них. Разобрать их вручную:
+
+```sql
+SELECT chat_id, listing_id, event_id, sent_at, payload
+FROM notifier.notifications_log
+WHERE status = 'failed'
+ORDER BY sent_at DESC;
+```
+

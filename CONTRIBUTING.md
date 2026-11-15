@@ -84,3 +84,18 @@ docker compose exec postgres psql -U app -d realestate -c "CREATE DATABASE reale
 cd notifier
 NOTIFIER_TEST_DSN='host=127.0.0.1 port=5432 user=app password=app dbname=realestate_test' go test ./...
 ```
+
+### Delivery quarantine
+
+Delivery tasks that fail validation (e.g. a malformed `listings.new` payload)
+are marked `status='failed'` in `notifier.notifications_log` and are not retried
+or drained automatically — the queue keeps flowing past them. To inspect them
+by hand:
+
+```sql
+SELECT chat_id, listing_id, event_id, sent_at, payload
+FROM notifier.notifications_log
+WHERE status = 'failed'
+ORDER BY sent_at DESC;
+```
+
