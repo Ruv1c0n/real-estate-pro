@@ -25,8 +25,9 @@ const (
 )
 
 // Статусы записи журнала из схемы 0001 (notifications_log_status_chk).
-// 'failed' не используется: ошибки отправки фиксируются как 'unknown'
-// без автоматического повтора (contracts.md §2).
+// 'failed' пишется только карантином PopBatch для строк с нечитаемым
+// payload; ошибки отправки фиксируются как 'unknown' без автоматического
+// повтора (contracts.md §2).
 const (
 	StatusSent    = "sent"
 	StatusUnknown = "unknown"
