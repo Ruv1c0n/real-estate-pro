@@ -20,6 +20,7 @@ import (
 
 var (
 	testPool *pgxpool.Pool
+	testDSN  string // сохраняется для тестов, открывающих собственный пул
 	hasDB    bool
 )
 
@@ -29,6 +30,7 @@ func TestMain(m *testing.M) {
 		// БД не сконфигурирована — тесты ниже скипнутся по hasDB.
 		os.Exit(m.Run())
 	}
+	testDSN = dsn
 
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dsn)
@@ -91,6 +93,37 @@ func mustAddUser(t *testing.T, chatID int64) {
 	}
 }
 
+// mustAdd вставляет подписку через публичный Add. Подписки в тестах валидны,
+// ошибка означает сбой БД или кода — фаталим с явной проверкой.
+func mustAdd(t *testing.T, p *Postgres, sub model.Subscription) model.Subscription {
+	t.Helper()
+	got, err := p.Add(context.Background(), sub)
+	if err != nil {
+		t.Fatalf("Add(%+v): %v", sub, err)
+	}
+	return got
+}
+
+// mustByChat возвращает подписки чата; ошибка выборки — фатал.
+func mustByChat(t *testing.T, p *Postgres, chatID int64) []model.Subscription {
+	t.Helper()
+	subs, err := p.ByChat(context.Background(), chatID)
+	if err != nil {
+		t.Fatalf("ByChat(%d): %v", chatID, err)
+	}
+	return subs
+}
+
+// mustCount возвращает число подписок чата; ошибка выборки — фатал.
+func mustCount(t *testing.T, p *Postgres, chatID int64) int {
+	t.Helper()
+	n, err := p.CountForChat(context.Background(), chatID)
+	if err != nil {
+		t.Fatalf("CountForChat(%d): %v", chatID, err)
+	}
+	return n
+}
+
 // assertSameSub сравнивает подписки по всем полям кроме ID (ID присваивает БД).
 func assertSameSub(t *testing.T, want, got model.Subscription) {
 	t.Helper()
@@ -135,11 +168,11 @@ func TestPostgresAddReturnsDBID(t *testing.T) {
 	p := newTestStore(t)
 	mustAddUser(t, 100)
 
-	got := p.Add(model.Subscription{ChatID: 100, City: "Minsk"})
+	got := mustAdd(t, p, model.Subscription{ChatID: 100, City: "Minsk"})
 	if got.ID <= 0 {
 		t.Fatalf("Add() вернул ID %d, положительного из БД", got.ID)
 	}
-	if n := p.CountForChat(100); n != 1 {
+	if n := mustCount(t, p, 100); n != 1 {
 		t.Errorf("CountForChat(100) = %d, want 1", n)
 	}
 }
@@ -149,12 +182,12 @@ func TestPostgresByChat(t *testing.T) {
 	mustAddUser(t, 100)
 	mustAddUser(t, 200)
 
-	p.Add(model.Subscription{ChatID: 100, City: "Minsk"})
-	p.Add(model.Subscription{ChatID: 200, City: "Brest"})
-	p.Add(model.Subscription{ChatID: 100, DealType: model.DealRent})
-	p.Add(model.Subscription{ChatID: 100, Country: "PL"})
+	mustAdd(t, p, model.Subscription{ChatID: 100, City: "Minsk"})
+	mustAdd(t, p, model.Subscription{ChatID: 200, City: "Brest"})
+	mustAdd(t, p, model.Subscription{ChatID: 100, DealType: model.DealRent})
+	mustAdd(t, p, model.Subscription{ChatID: 100, Country: "PL"})
 
-	subs := p.ByChat(100)
+	subs := mustByChat(t, p, 100)
 	if len(subs) != 3 {
 		t.Fatalf("len(ByChat(100)) = %d, want 3", len(subs))
 	}
@@ -166,10 +199,10 @@ func TestPostgresByChat(t *testing.T) {
 	if subs[0].City != "Minsk" || subs[1].DealType != model.DealRent || subs[2].Country != "PL" {
 		t.Errorf("неожиданное содержимое ByChat(100): %+v", subs)
 	}
-	if got := p.ByChat(200); len(got) != 1 || got[0].City != "Brest" {
+	if got := mustByChat(t, p, 200); len(got) != 1 || got[0].City != "Brest" {
 		t.Errorf("ByChat(200) = %+v, want одна подписка Brest", got)
 	}
-	if got := p.ByChat(999); len(got) != 0 {
+	if got := mustByChat(t, p, 999); len(got) != 0 {
 		t.Errorf("ByChat(999) = %+v, want пусто", got)
 	}
 }
@@ -179,19 +212,19 @@ func TestPostgresDelete(t *testing.T) {
 	mustAddUser(t, 100)
 	mustAddUser(t, 200)
 
-	a := p.Add(model.Subscription{ChatID: 100, City: "Minsk"})
-	b := p.Add(model.Subscription{ChatID: 200, City: "Brest"})
+	a := mustAdd(t, p, model.Subscription{ChatID: 100, City: "Minsk"})
+	b := mustAdd(t, p, model.Subscription{ChatID: 200, City: "Brest"})
 
-	if !p.Delete(100, a.ID) {
-		t.Error("Delete(100, a.ID) = false, want true")
+	if ok, err := p.Delete(context.Background(), 100, a.ID); err != nil || !ok {
+		t.Errorf("Delete(100, a.ID) = %v, %v; want true, nil", ok, err)
 	}
-	if p.Delete(100, a.ID) {
-		t.Error("повторный Delete(100, a.ID) = true, want false")
+	if ok, err := p.Delete(context.Background(), 100, a.ID); err != nil || ok {
+		t.Errorf("повторный Delete(100, a.ID) = %v, %v; want false, nil", ok, err)
 	}
-	if p.Delete(100, b.ID) {
-		t.Error("Delete(100, b.ID) = true — чужая подписка не должна удаляться")
+	if ok, err := p.Delete(context.Background(), 100, b.ID); err != nil || ok {
+		t.Errorf("Delete(100, b.ID) = %v, %v — чужая подписка не должна удаляться", ok, err)
 	}
-	if n := p.CountForChat(200); n != 1 {
+	if n := mustCount(t, p, 200); n != 1 {
 		t.Errorf("CountForChat(200) = %d, want 1 (подписка b должна остаться)", n)
 	}
 }
@@ -202,17 +235,17 @@ func TestPostgresDeleteAllForChat(t *testing.T) {
 	mustAddUser(t, 200)
 
 	for _, city := range []string{"Minsk", "Brest", "Grodno"} {
-		p.Add(model.Subscription{ChatID: 100, City: city})
+		mustAdd(t, p, model.Subscription{ChatID: 100, City: city})
 	}
-	p.Add(model.Subscription{ChatID: 200, City: "Vitebsk"})
+	mustAdd(t, p, model.Subscription{ChatID: 200, City: "Vitebsk"})
 
-	if n := p.DeleteAllForChat(100); n != 3 {
-		t.Errorf("DeleteAllForChat(100) = %d, want 3", n)
+	if n, err := p.DeleteAllForChat(context.Background(), 100); err != nil || n != 3 {
+		t.Errorf("DeleteAllForChat(100) = %d, %v; want 3, nil", n, err)
 	}
-	if n := p.CountForChat(100); n != 0 {
+	if n := mustCount(t, p, 100); n != 0 {
 		t.Errorf("CountForChat(100) = %d, want 0", n)
 	}
-	if n := p.CountForChat(200); n != 1 {
+	if n := mustCount(t, p, 200); n != 1 {
 		t.Errorf("CountForChat(200) = %d, want 1", n)
 	}
 }
@@ -221,12 +254,12 @@ func TestPostgresCountForChat(t *testing.T) {
 	p := newTestStore(t)
 	mustAddUser(t, 100)
 
-	if n := p.CountForChat(100); n != 0 {
+	if n := mustCount(t, p, 100); n != 0 {
 		t.Fatalf("CountForChat(100) = %d, want 0", n)
 	}
-	p.Add(model.Subscription{ChatID: 100, City: "Minsk"})
-	p.Add(model.Subscription{ChatID: 100, City: "Brest"})
-	if n := p.CountForChat(100); n != 2 {
+	mustAdd(t, p, model.Subscription{ChatID: 100, City: "Minsk"})
+	mustAdd(t, p, model.Subscription{ChatID: 100, City: "Brest"})
+	if n := mustCount(t, p, 100); n != 2 {
 		t.Errorf("CountForChat(100) = %d, want 2", n)
 	}
 }
@@ -236,15 +269,48 @@ func TestPostgresAll(t *testing.T) {
 	mustAddUser(t, 100)
 	mustAddUser(t, 200)
 
-	a := p.Add(model.Subscription{ChatID: 100, City: "Minsk"})
-	b := p.Add(model.Subscription{ChatID: 200, City: "Brest"})
+	a := mustAdd(t, p, model.Subscription{ChatID: 100, City: "Minsk"})
+	b := mustAdd(t, p, model.Subscription{ChatID: 200, City: "Brest"})
 
-	all := p.All()
+	all, err := p.All(context.Background())
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
 	if len(all) != 2 {
 		t.Fatalf("len(All()) = %d, want 2", len(all))
 	}
 	if all[0].ID != a.ID || all[1].ID != b.ID {
 		t.Errorf("All() не отсортирован по id: [%d %d], want [%d %d]", all[0].ID, all[1].ID, a.ID, b.ID)
+	}
+}
+
+func TestPostgresClosedPoolReturnsError(t *testing.T) {
+	// Хранилище недоступно: публичный метод обязан вернуть ошибку, а не
+	// нулевое значение — вызывающий обязан различать «нет данных» и
+	// «хранилище недоступно» (H2).
+	if !hasDB {
+		t.Skip("NOTIFIER_TEST_DSN не задан — тесты PostgreSQL пропущены (в CI это норма)")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, testDSN)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	p := NewPostgres(pool)
+	pool.Close()
+
+	subs, err := p.All(ctx)
+	if err == nil {
+		t.Fatal("All на закрытом пуле: err = nil, want ошибка вместо пустого списка")
+	}
+	if len(subs) != 0 {
+		t.Errorf("All на закрытом пуле вернул %d подписок, want 0", len(subs))
+	}
+	if !strings.Contains(err.Error(), "store:") {
+		t.Errorf("ошибка All без префикса источника: %q", err.Error())
+	}
+	if n, err := p.CountForChat(ctx, 1); err == nil {
+		t.Errorf("CountForChat на закрытом пуле: err = nil (n = %d), want ошибка", n)
 	}
 }
 
@@ -262,12 +328,12 @@ func TestPostgresRoundTripFull(t *testing.T) {
 		MinPriceUSD: model.Int64Ptr(100),
 		MaxPriceUSD: model.Int64Ptr(500),
 	}
-	got := p.Add(want)
+	got := mustAdd(t, p, want)
 	if got.ID <= 0 {
 		t.Fatalf("Add() вернул ID %d", got.ID)
 	}
 
-	subs := p.ByChat(100)
+	subs := mustByChat(t, p, 100)
 	if len(subs) != 1 {
 		t.Fatalf("len(ByChat(100)) = %d, want 1", len(subs))
 	}
@@ -282,12 +348,12 @@ func TestPostgresRoundTripNulls(t *testing.T) {
 	// Полностью пустую подписку БД не примет (subscriptions_not_empty_chk),
 	// поэтому «пустые» поля проверяем на подписке с одним заданным полем.
 	want := model.Subscription{ChatID: 100, City: "Minsk"}
-	got := p.Add(want)
+	got := mustAdd(t, p, want)
 	if got.ID <= 0 {
 		t.Fatalf("Add() вернул ID %d", got.ID)
 	}
 
-	subs := p.ByChat(100)
+	subs := mustByChat(t, p, 100)
 	if len(subs) != 1 {
 		t.Fatalf("len(ByChat(100)) = %d, want 1", len(subs))
 	}
@@ -310,11 +376,13 @@ func TestPostgresConstraintViolationReturnsError(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := p.add(context.Background(), tc.sub); err == nil {
-				t.Errorf("ожидали ошибку констрейнта, получили nil")
+			// Публичный Add возвращает ошибку констрейнта, а не подписку
+			// с нулевым ID: вызывающий обязан видеть сбой вставки.
+			got, err := p.Add(context.Background(), tc.sub)
+			if err == nil {
+				t.Error("ожидали ошибку констрейнта, получили nil")
 			}
-			// Интерфейсный Add не должен паниковать на отказе БД.
-			if got := p.Add(tc.sub); got.ID != 0 {
+			if got.ID != 0 {
 				t.Errorf("Add при ошибке вернул ID %d, want 0", got.ID)
 			}
 		})
@@ -324,10 +392,10 @@ func TestPostgresConstraintViolationReturnsError(t *testing.T) {
 func TestPostgresEnsureUserIdempotent(t *testing.T) {
 	p := newTestStore(t)
 
-	if err := p.EnsureUser(300); err != nil {
+	if err := p.EnsureUser(context.Background(), 300); err != nil {
 		t.Fatalf("EnsureUser: %v", err)
 	}
-	if err := p.EnsureUser(300); err != nil { // повторный — no-op
+	if err := p.EnsureUser(context.Background(), 300); err != nil { // повторный — no-op
 		t.Fatalf("повторный EnsureUser: %v", err)
 	}
 
@@ -343,11 +411,11 @@ func TestPostgresEnsureUserIdempotent(t *testing.T) {
 
 func TestPostgresDeleteUserCascade(t *testing.T) {
 	p := newTestStore(t)
-	if err := p.EnsureUser(100); err != nil {
+	if err := p.EnsureUser(context.Background(), 100); err != nil {
 		t.Fatalf("EnsureUser: %v", err)
 	}
-	p.Add(model.Subscription{ChatID: 100, City: "Minsk"})
-	p.Add(model.Subscription{ChatID: 100, City: "Brest"})
+	mustAdd(t, p, model.Subscription{ChatID: 100, City: "Minsk"})
+	mustAdd(t, p, model.Subscription{ChatID: 100, City: "Brest"})
 	// Строка журнала: каскад по FK должен убрать и её (/stop, ФТ-3.1).
 	if _, err := testPool.Exec(context.Background(), `
 		INSERT INTO notifier.notifications_log (chat_id, listing_id, event_id, status, mode, payload)
@@ -355,7 +423,7 @@ func TestPostgresDeleteUserCascade(t *testing.T) {
 		t.Fatalf("insert log row: %v", err)
 	}
 
-	n, err := p.DeleteUser(100)
+	n, err := p.DeleteUser(context.Background(), 100)
 	if err != nil {
 		t.Fatalf("DeleteUser: %v", err)
 	}
@@ -369,7 +437,7 @@ func TestPostgresAddCreatesUser(t *testing.T) {
 	p := newTestStore(t)
 	// Пользователя для чата 300 нет: Add должен создать его сам —
 	// /subscribe без предварительного /start работает.
-	got := p.Add(model.Subscription{ChatID: 300, City: "Minsk"})
+	got := mustAdd(t, p, model.Subscription{ChatID: 300, City: "Minsk"})
 	if got.ID <= 0 {
 		t.Fatalf("Add() без /start вернул ID %d", got.ID)
 	}

@@ -245,7 +245,18 @@ const deferredBatchSize = 100
 // журнала пара (объявление, чат) закрепляется клеймом; если она уже
 // доставляется параллельным путём — шаг пропускается.
 func (d *Dispatcher) Handle(ctx context.Context, e model.Event) {
-	for _, chatID := range model.Recipients(e, d.subs.All()) {
+	recipients, err := d.subs.All(ctx)
+	if err != nil {
+		// Хранилище подписок недоступно: ошибку нельзя трактовать как
+		// «получателей нет» — это была бы молчаливая потеря событий. Доставку
+		// не начинаем вовсе, чтобы никто не получил частичную рассылку.
+		// До условного XACK (issue #53) событие при этом теряется из стрима —
+		// осознанный шаг к R10: надёжность даёт подтверждение после полной
+		// обработки, а не до неё.
+		log.Printf("dispatch: list subscriptions: %v", err)
+		return
+	}
+	for _, chatID := range model.Recipients(e, recipients) {
 		d.handleRecipient(ctx, chatID, e)
 	}
 }
