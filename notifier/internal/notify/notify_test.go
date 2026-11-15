@@ -62,9 +62,9 @@ func newTestDispatcher(limit int) (*Dispatcher, *recordingSender, *store.Memory,
 
 func TestHandleSendsOncePerChat(t *testing.T) {
 	d, sender, subs, _, _ := newTestDispatcher(1000)
-	subs.Add(model.Subscription{ChatID: 10, City: "Minsk"})
-	subs.Add(model.Subscription{ChatID: 10, Rooms: model.IntPtr(1)}) // тот же чат
-	subs.Add(model.Subscription{ChatID: 20, City: "Brest"})          // не совпал
+	subs.Add(context.Background(), model.Subscription{ChatID: 10, City: "Minsk"})
+	subs.Add(context.Background(), model.Subscription{ChatID: 10, Rooms: model.IntPtr(1)}) // тот же чат
+	subs.Add(context.Background(), model.Subscription{ChatID: 20, City: "Brest"})          // не совпал
 
 	d.Handle(context.Background(), testEvent(1))
 
@@ -76,7 +76,7 @@ func TestHandleSendsOncePerChat(t *testing.T) {
 
 func TestHandleRedeliveryDeduplicated(t *testing.T) {
 	d, sender, subs, _, _ := newTestDispatcher(1000)
-	subs.Add(model.Subscription{ChatID: 10})
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
 
 	e := testEvent(1)
 	d.Handle(context.Background(), e)
@@ -91,7 +91,7 @@ func TestHandleDeferWhenLimitReached(t *testing.T) {
 	base := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
 	d, sender, subs, limiter, _ := newTestDispatcher(2)
 	limiter.nowFunc = func() time.Time { return base }
-	subs.Add(model.Subscription{ChatID: 10})
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
 
 	d.Handle(context.Background(), testEvent(1))
 	d.Handle(context.Background(), testEvent(2))
@@ -112,8 +112,8 @@ func TestHandleDeferWhenLimitReached(t *testing.T) {
 
 func TestHandleDifferentChatsHaveOwnLimits(t *testing.T) {
 	d, sender, subs, _, _ := newTestDispatcher(1)
-	subs.Add(model.Subscription{ChatID: 10})
-	subs.Add(model.Subscription{ChatID: 20})
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
+	subs.Add(context.Background(), model.Subscription{ChatID: 20})
 
 	d.Handle(context.Background(), testEvent(1))
 	d.Handle(context.Background(), testEvent(2))
@@ -248,7 +248,7 @@ func (m *mockQueue) Mark(_ context.Context, job DeferredJob, _, status string) e
 func TestHandlePostponesWhenLimitReached(t *testing.T) {
 	sender := &recordingSender{}
 	subs := store.NewMemory()
-	subs.Add(model.Subscription{ChatID: 10})
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
 	queue := &mockQueue{}
 	d := NewDispatcher(subs, newMockJournal(), &mockLimiter{allowed: false}, queue, ModeLog, sender.send)
 
@@ -267,7 +267,7 @@ func TestHandleLimiterErrorPostpones(t *testing.T) {
 	// уведомление не теряется; Dispatcher не паникует.
 	sender := &recordingSender{}
 	subs := store.NewMemory()
-	subs.Add(model.Subscription{ChatID: 10})
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
 	queue := &mockQueue{}
 	d := NewDispatcher(subs, newMockJournal(), &mockLimiter{err: errors.New("db down")}, queue, ModeLog, sender.send)
 
@@ -344,7 +344,7 @@ func TestHandleSentErrorStillDelivers(t *testing.T) {
 	journal := newMockJournal()
 	journal.sentErr = errors.New("db down")
 	d := NewDispatcher(subs, journal, &mockLimiter{allowed: true}, NewMemoryQueue(), ModeLog, sender.send)
-	subs.Add(model.Subscription{ChatID: 10})
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
 
 	d.Handle(context.Background(), testEvent(1))
 
@@ -361,7 +361,7 @@ func TestHandleRecordErrorNoPanic(t *testing.T) {
 	journal := newMockJournal()
 	journal.recordErr = errors.New("db down")
 	d := NewDispatcher(subs, journal, &mockLimiter{allowed: true}, NewMemoryQueue(), ModeLog, sender.send)
-	subs.Add(model.Subscription{ChatID: 10})
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
 
 	d.Handle(context.Background(), testEvent(1))
 	d.Flush(context.Background())
@@ -378,7 +378,7 @@ func TestHandleRecordsStatusAndMode(t *testing.T) {
 	subs := store.NewMemory()
 	journal := newMockJournal()
 	d := NewDispatcher(subs, journal, &mockLimiter{allowed: true}, NewMemoryQueue(), ModeTelegram, sender.send)
-	subs.Add(model.Subscription{ChatID: 10})
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
 
 	d.Handle(context.Background(), testEvent(1))
 
@@ -393,5 +393,207 @@ func TestHandleRecordsStatusAndMode(t *testing.T) {
 
 	if n := journal.records["unknown/telegram"]; n != 1 {
 		t.Fatalf("записей unknown/telegram = %d, want 1", n)
+	}
+}
+
+// failingStore — Store, у которого All возвращает ошибку: хранилище подписок
+// недоступно в момент обработки события.
+type failingStore struct {
+	store.Store
+	err error
+}
+
+func (f *failingStore) All(context.Context) ([]model.Subscription, error) {
+	return nil, f.err
+}
+
+func TestHandleStoreErrorNoDelivery(t *testing.T) {
+	// Хранилище подписок недоступно: ошибку All нельзя трактовать как
+	// «получателей нет» — доставка не выполняется вовсе (sender не вызван,
+	// в очередь отложенных ничего не попадает). До условного XACK (issue #53)
+	// событие при этом теряется из стрима — см. Handle.
+	mem := store.NewMemory()
+	mem.Add(context.Background(), model.Subscription{ChatID: 10})
+	sender := &recordingSender{}
+	queue := &mockQueue{}
+	d := NewDispatcher(&failingStore{Store: mem, err: errors.New("db down")},
+		newMockJournal(), &mockLimiter{allowed: true}, queue, ModeLog, sender.send)
+
+	d.Handle(context.Background(), testEvent(1))
+
+	if got := sender.sent(); len(got) != 0 {
+		t.Fatalf("sent = %v, want 0 (ошибка хранилища отменяет доставку)", got)
+	}
+	if len(queue.postponed) != 0 {
+		t.Fatalf("postponed = %+v, want пусто", queue.postponed)
+	}
+}
+
+// blockingSender — отправитель, «зависающий» в отправке, чтобы смоделировать
+// конкурентную доставку того же задания другим путём.
+type blockingSender struct {
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	calls   []string
+}
+
+func newBlockingSender() *blockingSender {
+	return &blockingSender{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (s *blockingSender) send(_ context.Context, chatID int64, e model.Event) error {
+	s.mu.Lock()
+	s.calls = append(s.calls, fmt.Sprintf("%d:%d", chatID, e.ID))
+	s.mu.Unlock()
+	s.once.Do(func() { close(s.entered) })
+	<-s.release
+	return nil
+}
+
+func (s *blockingSender) sent() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.calls...)
+}
+
+func queueLen(q *MemoryQueue) int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.jobs)
+}
+
+func TestClaimRelease(t *testing.T) {
+	d, _, _, _, _ := newTestDispatcher(10)
+	key := journalKey{listingID: 1, chatID: 10}
+
+	if !d.claim(key) {
+		t.Fatal("первый клейм должен пройти")
+	}
+	if d.claim(key) {
+		t.Fatal("повторный клейм той же пары должен быть отклонён")
+	}
+	d.release(key)
+	if !d.claim(key) {
+		t.Fatal("после release клейм должен пройти снова")
+	}
+	d.release(key)
+}
+
+func TestHandleConcurrentDeliveryNotDuplicated(t *testing.T) {
+	// Гонка двух путей (consumer ∥ flusher): оба успевают прочитать
+	// journal.Sent == false до записи результата. Клейм «в полёте»
+	// должен оставить ровно одну отправку (ревью #46).
+	sender := newBlockingSender()
+	subs := store.NewMemory()
+	d := NewDispatcher(subs, NewMemoryJournal(), NewMemoryLimiter(10, time.Hour), NewMemoryQueue(), ModeLog, sender.send)
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
+
+	e := testEvent(1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		d.Handle(context.Background(), e)
+	}()
+	<-sender.entered                  // первый путь завис в отправке, клейм удерживается
+	d.Handle(context.Background(), e) // второй путь — пропускает по клейму
+	close(sender.release)
+	wg.Wait()
+
+	if got := sender.sent(); len(got) != 1 {
+		t.Fatalf("sent = %v, want 1 (параллельная доставка не дублируется)", got)
+	}
+}
+
+func TestFlushRequeuesClaimedJob(t *testing.T) {
+	// Задание, занятое параллельной доставкой, возвращается в очередь
+	// пометкой retry, а не отбрасывается (ТЗ 3.6: отложенные не теряются).
+	base := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	d, sender, subs, limiter, queue := newTestDispatcher(1)
+	limiter.nowFunc = func() time.Time { return base }
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
+
+	d.Handle(context.Background(), testEvent(1))
+	d.Handle(context.Background(), testEvent(2)) // отложено
+
+	key := journalKey{listingID: 2, chatID: 10}
+	if !d.claim(key) {
+		t.Fatal("клейм должен пройти до Flush")
+	}
+
+	limiter.nowFunc = func() time.Time { return base.Add(61 * time.Minute) }
+	d.Flush(context.Background())
+
+	if got := sender.sent(); len(got) != 1 {
+		t.Fatalf("sent = %v, want 1 (занятое клеймом задание не отправляется)", got)
+	}
+	if n := queueLen(queue); n != 1 {
+		t.Fatalf("заданий в очереди после Flush = %d, want 1 (задание вернулось по retry)", n)
+	}
+
+	d.release(key)
+	d.Flush(context.Background())
+
+	if got := sender.sent(); len(got) != 2 || got[1] != "10:2" {
+		t.Fatalf("sent = %v, want [10:1 10:2] (после release задание доставлено)", got)
+	}
+	if n := queueLen(queue); n != 0 {
+		t.Fatalf("заданий в очереди после доставки = %d, want 0", n)
+	}
+}
+
+// serialLimiter — Limiter, фиксирующий параллельные вызовы Allow: если
+// второй Allow начался, пока первый не завершился, сериализация доставок
+// одного чата нарушена (ревью #49).
+type serialLimiter struct {
+	mu       sync.Mutex
+	active   int
+	overflow bool
+}
+
+func (m *serialLimiter) Allow(_ context.Context, _ int64, _ string) (bool, error) {
+	m.mu.Lock()
+	m.active++
+	if m.active > 1 {
+		m.overflow = true
+	}
+	m.mu.Unlock()
+	time.Sleep(20 * time.Millisecond) // окно для пересечения без блокировки
+	m.mu.Lock()
+	m.active--
+	m.mu.Unlock()
+	return true, nil
+}
+
+func TestChatLockSerializesAllow(t *testing.T) {
+	// Сериализация доставок одного чата: параллельные Handle разных событий
+	// одного чата не должны одновременно быть внутри Allow → send → Record,
+	// иначе лимитер дважды увидит один свободный слот.
+	sender := &recordingSender{}
+	subs := store.NewMemory()
+	lim := &serialLimiter{}
+	d := NewDispatcher(subs, NewMemoryJournal(), lim, NewMemoryQueue(), ModeLog, sender.send)
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, e := range []model.Event{testEvent(1), testEvent(2)} {
+		wg.Add(1)
+		go func(e model.Event) {
+			defer wg.Done()
+			<-start
+			d.Handle(context.Background(), e)
+		}(e)
+	}
+	close(start)
+	wg.Wait()
+
+	if lim.overflow {
+		t.Fatal("Allow вызывался параллельно для одного чата — чат-лок не сериализует")
+	}
+	if got := sender.sent(); len(got) != 2 {
+		t.Fatalf("sent = %v, want 2 (оба события доставлены)", got)
 	}
 }
