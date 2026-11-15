@@ -1,6 +1,7 @@
 package model
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,72 @@ func baseEvent() Event {
 		Address:   &address,
 		URL:       "https://example.com/123",
 		CreatedAt: time.Date(2026, 10, 28, 10, 0, 0, 0, time.UTC),
+	}
+}
+
+// TestEventMarshalJSONContractForm — MarshalJSON даёт контрактную форму
+// (contracts.md §2, snake_case): все 13 ключей присутствуют, Go-имена полей
+// не просачиваются, ParseEvent разбирает payload обратно без потерь.
+// Юнит-тест без БД: Pg-тест round-trip скипается в CI (нет postgres).
+func TestEventMarshalJSONContractForm(t *testing.T) {
+	address := "ул. Примерная, 2"
+	e := baseEvent()
+	e.Address = &address
+
+	raw, err := json.Marshal(e)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	want := []string{
+		"event_id", "id", "source", "deal_type", "country", "city", "rooms",
+		"price", "currency", "price_usd", "address", "url", "created_at",
+	}
+	if len(keys) != len(want) {
+		t.Fatalf("ключей в payload %d, want %d: %s", len(keys), len(want), raw)
+	}
+	for _, k := range want {
+		if _, ok := keys[k]; !ok {
+			t.Errorf("нет контрактного ключа %q: %s", k, raw)
+		}
+	}
+	for _, k := range []string{"EventID", "PriceUSD", "DealType", "CreatedAt", "Address"} {
+		if _, ok := keys[k]; ok {
+			t.Errorf("Go-имя поля %q просочилось в payload: %s", k, raw)
+		}
+	}
+
+	back, err := ParseEvent(raw)
+	if err != nil {
+		t.Fatalf("ParseEvent: %v", err)
+	}
+	if back.EventID != e.EventID || back.ID != e.ID || back.Source != e.Source ||
+		back.DealType != e.DealType || back.Country != e.Country || back.City != e.City ||
+		back.Rooms != e.Rooms || back.Price != e.Price || back.Currency != e.Currency ||
+		back.PriceUSD != e.PriceUSD || back.URL != e.URL ||
+		back.Address == nil || *back.Address != *e.Address ||
+		!back.CreatedAt.Equal(e.CreatedAt) {
+		t.Fatalf("round-trip потерял данные:\n got %+v\nwant %+v", back, e)
+	}
+
+	// address=nil: ключ присутствует со значением null, ParseEvent проходит.
+	e.Address = nil
+	raw2, err := json.Marshal(e)
+	if err != nil {
+		t.Fatalf("marshal null address: %v", err)
+	}
+	var keys2 map[string]json.RawMessage
+	if err := json.Unmarshal(raw2, &keys2); err != nil {
+		t.Fatalf("unmarshal null address: %v", err)
+	}
+	if _, ok := keys2["address"]; !ok {
+		t.Errorf("address=nil: ключ отсутствует в payload: %s", raw2)
+	}
+	if _, err := ParseEvent(raw2); err != nil {
+		t.Fatalf("ParseEvent с address=nil: %v", err)
 	}
 }
 
