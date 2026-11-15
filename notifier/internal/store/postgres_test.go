@@ -492,3 +492,27 @@ func assertTablesEmpty(t *testing.T, tables ...string) {
 		}
 	}
 }
+
+func TestPostgresUserExists(t *testing.T) {
+	p := newTestStore(t)
+	ctx := context.Background()
+
+	// Пользователя нет (/start ещё не был) — ТЗ 4.2: отправки такому чату
+	// не будет.
+	if ok, err := p.UserExists(ctx, 400); err != nil || ok {
+		t.Fatalf("UserExists без пользователя = %v, %v; want false, nil", ok, err)
+	}
+	if err := p.EnsureUser(ctx, 400); err != nil {
+		t.Fatalf("EnsureUser: %v", err)
+	}
+	if ok, err := p.UserExists(ctx, 400); err != nil || !ok {
+		t.Fatalf("UserExists после /start = %v, %v; want true, nil", ok, err)
+	}
+	// /stop удаляет запись — проверка снова false.
+	if _, err := p.DeleteUser(ctx, 400); err != nil {
+		t.Fatalf("DeleteUser: %v", err)
+	}
+	if ok, err := p.UserExists(ctx, 400); err != nil || ok {
+		t.Fatalf("UserExists после /stop = %v, %v; want false, nil", ok, err)
+	}
+}

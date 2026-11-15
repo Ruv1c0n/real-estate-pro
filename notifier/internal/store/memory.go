@@ -37,6 +37,11 @@ type Store interface {
 	// в Postgres каскадом чистятся подписки и журнал — и возвращает число
 	// удалённых подписок для ответа бота.
 	DeleteUser(ctx context.Context, chatID int64) (int, error)
+	// UserExists проверяет наличие записи пользователя (ТЗ 4.2: «перед
+	// отправкой проверяется существование пользователя»). Вызывается перед
+	// Telegram-отправкой: закрывает гонку «/stop между выборкой получателей
+	// и отправкой» — удалённому чату доставка не нужна.
+	UserExists(ctx context.Context, chatID int64) (bool, error)
 }
 
 // Memory — реализация Store в памяти процесса.
@@ -135,6 +140,17 @@ func (m *Memory) EnsureUser(ctx context.Context, chatID int64) error {
 	defer m.mu.Unlock()
 	m.users[chatID] = struct{}{}
 	return nil
+}
+
+// UserExists проверяет карту пользователей. Пользователи в Memory хранятся
+// (EnsureUser/DeleteUser), и Add создаёт запись сам, поэтому инвариант «есть
+// подписка — есть и пользователь» соблюдается: false честно означает
+// удалённого пользователя, а не «в memory-режиме не проверяем».
+func (m *Memory) UserExists(_ context.Context, chatID int64) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.users[chatID]
+	return ok, nil
 }
 
 // DeleteUser удаляет пользователя вместе с подписками (в Postgres это делает

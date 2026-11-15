@@ -140,7 +140,10 @@ func (q *PgQueue) PopBatch(ctx context.Context, limit int) ([]DeferredJob, error
 }
 
 // Mark фиксирует исход задания: sent/unknown — строка получает статус и
-// sent_at, retry — остаётся deferred (вернётся следующим проходом флешера).
+// sent_at, retry — остаётся deferred (вернётся следующим проходом флешера),
+// drop — deferred-строка удаляется без отправки (получатель удалён, ТЗ 4.2;
+// отдельного статуса журнала для этого нет — набор статусов задан CHECK 0001,
+// а каскад /stop удалил бы строку тем же путём).
 // Любой Mark завершает транзакцию PopBatch: блокировки сняты, следующий
 // проход откроет её заново. Внутри сервиса флешер один, поэтому досрочное
 // снятие блокировок с неотмеченных заданий батча безопасно.
@@ -158,6 +161,18 @@ func (q *PgQueue) Mark(ctx context.Context, job DeferredJob, _ string, status st
 	switch status {
 	case StatusRetry:
 		// UPDATE не нужен: строка уже deferred.
+	case StatusDropped:
+		// Снять с очереди без отправки: DELETE deferred-строки в той же
+		// транзакции, что держит на ней FOR UPDATE (отдельным соединением
+		// упёрлись бы в собственную блокировку — самодедлок, как и карантин
+		// в PopBatch). ТЗ 4.2: пользователь удалён — доставка ему не нужна.
+		if _, err := q.tx.Exec(ctx, `
+			DELETE FROM notifier.notifications_log
+			WHERE chat_id = $1 AND listing_id = $2 AND status = 'deferred'`,
+			job.ChatID, job.Event.ID); err != nil {
+			q.rollbackTx(ctx)
+			return fmt.Errorf("queue drop: %w", err)
+		}
 	case StatusSent, StatusUnknown:
 		if _, err := q.tx.Exec(ctx, `
 			UPDATE notifier.notifications_log
