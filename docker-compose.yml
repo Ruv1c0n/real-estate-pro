@@ -132,10 +132,11 @@ services:
       # notifier ходит в справочники Core API — ждём его готовности.
       core-api:
         condition: service_healthy
-    # alpine содержит busybox wget. GET /health всегда отвечает 200
-    # (degraded отражается только в теле), так что проверяется живость процесса.
+    # alpine содержит busybox wget. /health/ready отвечает 200 только при
+    # живых redis + dicts + db, иначе 503 → wget падает → контейнер
+    # unhealthy: «healthy» означает готовность, а не живость процесса.
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health/ready >/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10

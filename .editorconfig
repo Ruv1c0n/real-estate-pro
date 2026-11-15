@@ -1,0 +1,25 @@
+# .editorconfig — https://editorconfig.org
+# Единые базовые правила для всех редакторов команды:
+# VS Code нужен плагин EditorConfig, GoLand/PyCharm поддерживают из коробки.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.go]
+indent_style = tab
+
+[*.{py,sql}]
+indent_style = space
+indent_size = 4
+
+[*.{yml,yaml,json}]
+indent_style = space
+indent_size = 2
+
+[*.md]
+# в markdown пробелы в конце строки могут быть значимыми (перенос строки)
+trim_trailing_whitespace = false
