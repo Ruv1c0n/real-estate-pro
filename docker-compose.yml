@@ -121,6 +121,9 @@ services:
       POSTGRES_USER: "${POSTGRES_USER:-app}"
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-app}"
       POSTGRES_DB: "${POSTGRES_DB:-realestate}"
+      # Пустое значение допустимо: dsnFromEnv считает незаданный sslmode
+      # пустым и подставляет дефолт disable (notifier/internal/db/db.go).
+      POSTGRES_SSLMODE: "${POSTGRES_SSLMODE:-}"
       CORE_API_URL: http://core-api:8000
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       ADMIN_KEY: ${ADMIN_KEY:-}
