@@ -63,14 +63,15 @@ jobs:
       - name: Install numpy
         run: pip install numpy
 
-      # trail build пишет граф в .trail/cache/.graph/ в репо с инициализированным
-      # .trail/ и в graft/ (свой дефолт) — в свежем checkout без .trail/. Берём то,
-      # что есть.
+      # trail build пишет граф в .trail/cache/.graph/ в репо с .trail/ и в graft/
+      # (свой дефолт, внутренняя раскладка может отличаться) — в свежем checkout
+      # без .trail/. Ищем wiring.json, где бы trail его ни положил.
       - name: Generate trail-graph.html
         run: |
           mkdir -p site
-          W=.trail/cache/.graph/wiring.json
-          [ -f "$W" ] || W=graft/wiring.json
+          W=$(find . -name wiring.json -not -path "./node_modules/*" | head -1)
+          echo "wiring: $W"
+          [ -n "$W" ] || { echo "wiring.json not found after trail build"; exit 1; }
           python scripts/trail-viz/gen.py "$W" site/trail-graph.html
 
       - name: Assemble site
