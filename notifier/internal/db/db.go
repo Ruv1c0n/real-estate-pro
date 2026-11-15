@@ -31,9 +31,14 @@ const pingAttempts = 3
 // так живут CI и локальные тесты без Docker. Сконфигурированная, но
 // недоступная БД — ошибка старта (fail-fast, main.go делает log.Fatal):
 // тихий уход в memory-режим маскировал бы проблему окружения весь аптайм.
+// Частичная конфигурация (задана часть POSTGRES_* без user/password) — тоже
+// ошибка: иначе misconfig молча превращается в подключение app/app@127.0.0.1.
 // Переподключение в процессе работы обеспечивает сам pgxpool.
 func Connect(ctx context.Context) (*pgxpool.Pool, error) {
-	dsn := dsnFromEnv()
+	dsn, err := dsnFromEnv()
+	if err != nil {
+		return nil, err
+	}
 	if dsn == "" {
 		log.Println("DB disabled: running in memory mode")
 		return nil, nil
@@ -85,9 +90,13 @@ func Connect(ctx context.Context) (*pgxpool.Pool, error) {
 // dsnFromEnv собирает DSN из окружения. Задан DATABASE_URL (legacy-вариант
 // с main) — используется как есть, без разбора частей. Ни одной переменной
 // POSTGRES_* нет — БД не сконфигурирована, возвращается пустая строка.
-func dsnFromEnv() string {
+// Задана хоть одна часть POSTGRES_* — user и password обязательны явно:
+// недостающие части подставлялись бы дефолтами, и опечатка в имени
+// переменной (например, задан только POSTGRES_DB) дала бы «рабочее»
+// подключение app/app@127.0.0.1 вместо ошибки конфигурации.
+func dsnFromEnv() (string, error) {
 	if url := os.Getenv("DATABASE_URL"); url != "" {
-		return url
+		return url, nil
 	}
 
 	host := os.Getenv("POSTGRES_HOST")
@@ -97,7 +106,11 @@ func dsnFromEnv() string {
 	name := os.Getenv("POSTGRES_DB")
 
 	if host == "" && port == "" && user == "" && password == "" && name == "" {
-		return ""
+		return "", nil
+	}
+
+	if user == "" || password == "" {
+		return "", fmt.Errorf("db: POSTGRES_USER и POSTGRES_PASSWORD должны быть заданы явно, когда задана любая из переменных POSTGRES_*")
 	}
 
 	if host == "" {
@@ -105,12 +118,6 @@ func dsnFromEnv() string {
 	}
 	if port == "" {
 		port = defaultPort
-	}
-	if user == "" {
-		user = defaultUser
-	}
-	if password == "" {
-		password = defaultPassword
 	}
 	if name == "" {
 		name = defaultDB
@@ -123,7 +130,7 @@ func dsnFromEnv() string {
 		" user=" + quoteValue(user) +
 		" password=" + quoteValue(password) +
 		" dbname=" + quoteValue(name) +
-		" sslmode=disable"
+		" sslmode=disable", nil
 }
 
 // quoteValue экранирует значение по правилам pgx-connstring: значения с
