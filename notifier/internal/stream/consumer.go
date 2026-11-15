@@ -37,13 +37,19 @@ const (
 // (журнал/отложенные задания), после чего консьюмер подтверждает запись.
 type Handler func(ctx context.Context, e model.Event)
 
-// Redis — операции go-redis, нужные консьюмеру; UniversalClient их удовлетворяет.
+// Redis — операции go-redis, нужные консьюмеру и очистителю (reaper.go);
+// UniversalClient их удовлетворяет.
 type Redis interface {
 	XGroupCreateMkStream(ctx context.Context, stream, group, start string) *redis.StatusCmd
 	XReadGroup(ctx context.Context, a *redis.XReadGroupArgs) *redis.XStreamSliceCmd
 	XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimCmd
 	XAck(ctx context.Context, stream, group string, ids ...string) *redis.IntCmd
 	XAdd(ctx context.Context, a *redis.XAddArgs) *redis.StringCmd
+	// Операции безопасной очистки стрима (reaper.go, ТЗ 4.3).
+	XPending(ctx context.Context, stream, group string) *redis.XPendingCmd
+	XInfoGroups(ctx context.Context, stream string) *redis.XInfoGroupsCmd
+	XRange(ctx context.Context, stream, start, stop string) *redis.XMessageSliceCmd
+	XDel(ctx context.Context, stream string, ids ...string) *redis.IntCmd
 }
 
 // Consumer читает стрим группой notifier: цикл XREADGROUP раздаёт записи

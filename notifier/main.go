@@ -114,6 +114,15 @@ func main() {
 		}
 	}()
 
+	// Безопасная очистка стрима (ТЗ 4.3 «Хранение»): удаляет только
+	// подтверждённые записи за границей min-pending. Ошибки прохода
+	// не фатальны — без очистки стрим просто не режется.
+	cleanupEvery, err := envPositiveDuration("NOTIFIER_STREAM_CLEANUP_INTERVAL", stream.DefaultCleanupInterval())
+	if err != nil {
+		log.Fatal(err)
+	}
+	go stream.NewReaper(redisClient, cleanupEvery).Run(ctx)
+
 	srv := &http.Server{
 		Addr:              ":8080",
 		Handler:           newMux(redisClient, dictsClient, pool, mode),
@@ -417,4 +426,23 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// envPositiveDuration читает длительность из окружения с дефолтом (ТЗ 3.6:
+// параметры настраиваются). Некорректное значение (не длительность, <= 0) —
+// ошибка старта (fail-fast): тихий дефолт при опечатке в .env маскировал бы
+// misconfig весь аптайм, как и молчаливое подключение app/app в db.Connect.
+func envPositiveDuration(key string, fallback time.Duration) (time.Duration, error) {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return fallback, nil
+	}
+	v, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %q — не длительность (пример: 5m, 30s)", key, raw)
+	}
+	if v <= 0 {
+		return 0, fmt.Errorf("%s: %q должно быть положительным", key, raw)
+	}
+	return v, nil
 }

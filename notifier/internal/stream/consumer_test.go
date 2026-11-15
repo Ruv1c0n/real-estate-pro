@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,8 @@ const validPayload = `{"event_id":"550e8400-e29b-41d4-a716-446655440000","id":12
 
 // fakeRedis — сценарный двойник Redis: первую пачку сообщений выдаёт XREADGROUP,
 // дальше пусто. Подтверждения и dead-letter пишет в логи для проверок.
+// Состояние стрима (streamIDs/pendingIDs/lastDelivered) используется тестами
+// очистки (reaper_test.go).
 type fakeRedis struct {
 	mu        sync.Mutex
 	groupErr  error
@@ -27,6 +30,11 @@ type fakeRedis struct {
 	dead      []redis.XAddArgs
 	xaddErr   error
 	readCalls int
+
+	streamIDs      []string // содержимое стрима, отсортировано по ID
+	pendingIDs     []string // PEL группы (в работе / не подтверждены)
+	lastDelivered  string   // last-delivered-id группы
+	deleted        []string // записи, удалённые XDel
 }
 
 func (f *fakeRedis) XGroupCreateMkStream(ctx context.Context, stream, group, start string) *redis.StatusCmd {
@@ -90,6 +98,89 @@ func (f *fakeRedis) ackedIDs() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.acked...)
+}
+
+// XPending — summary-форма: Count и границы PEL (Lower — минимальный ID).
+func (f *fakeRedis) XPending(ctx context.Context, stream, group string) *redis.XPendingCmd {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cmd := redis.NewXPendingCmd(ctx)
+	p := &redis.XPending{Consumers: map[string]int64{}}
+	if len(f.pendingIDs) > 0 {
+		p.Count = int64(len(f.pendingIDs))
+		p.Lower = f.pendingIDs[0]
+		p.Higher = f.pendingIDs[len(f.pendingIDs)-1]
+	}
+	cmd.SetVal(p)
+	return cmd
+}
+
+// XInfoGroups отдаёт группу notifier с её last-delivered-id.
+func (f *fakeRedis) XInfoGroups(ctx context.Context, stream string) *redis.XInfoGroupsCmd {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cmd := redis.NewXInfoGroupsCmd(ctx, stream)
+	cmd.SetVal([]redis.XInfoGroup{{Name: GroupName, LastDeliveredID: f.lastDelivered}})
+	return cmd
+}
+
+// XRange фильтрует стрим по диапазону: "-" — с начала, "(" — исключающая
+// граница (Redis 6.2+), как в реальном XRANGE.
+func (f *fakeRedis) XRange(ctx context.Context, stream, start, stop string) *redis.XMessageSliceCmd {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cmd := redis.NewXMessageSliceCmd(ctx)
+	var out []redis.XMessage
+	for _, id := range f.streamIDs {
+		if !inRange(id, start, stop) {
+			continue
+		}
+		out = append(out, redis.XMessage{ID: id, Values: map[string]any{"data": "{}"}})
+	}
+	cmd.SetVal(out)
+	return cmd
+}
+
+// XDel удаляет записи из стрима; PEL не трогает — как реальный Redis
+// (тест очистки проверяет, что pending после XDEL не меняется).
+func (f *fakeRedis) XDel(ctx context.Context, stream string, ids ...string) *redis.IntCmd {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cmd := redis.NewIntCmd(ctx)
+	removed := map[string]bool{}
+	for _, id := range ids {
+		removed[id] = true
+	}
+	var rest []string
+	for _, id := range f.streamIDs {
+		if removed[id] {
+			f.deleted = append(f.deleted, id)
+			continue
+		}
+		rest = append(rest, id)
+	}
+	f.streamIDs = rest
+	cmd.SetVal(int64(len(ids)))
+	return cmd
+}
+
+// inRange проверяет, что id попадает в диапазон XRANGE: "-" — с начала,
+// "+" — до конца; префикс "(" задаёт исключающую границу (Redis 6.2+).
+// Сравнение — как пар (мс, seq), лексикография строк потока не годится.
+func inRange(id, start, stop string) bool {
+	min := start
+	minExclusive := false
+	if s, ok := strings.CutPrefix(start, "("); ok {
+		min, minExclusive = s, true
+	}
+	max := stop
+	maxExclusive := false
+	if s, ok := strings.CutPrefix(stop, "("); ok {
+		max, maxExclusive = s, true
+	}
+	ge := min == "-" || compareStreamIDs(id, min) > 0 || (compareStreamIDs(id, min) == 0 && !minExclusive)
+	le := max == "+" || compareStreamIDs(id, max) < 0 || (compareStreamIDs(id, max) == 0 && !maxExclusive)
+	return ge && le
 }
 
 func (f *fakeRedis) deadCount() int {
