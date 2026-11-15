@@ -1,7 +1,12 @@
 // Тесты сборки DSN из окружения (карточка R7). Табличный тест dsnFromEnv:
-// пустое окружение, дефолты частей при частичной конфигурации, passthrough
-// DATABASE_URL, экранирование спецсимволов quoteValue, sslmode из
-// POSTGRES_SSLMODE и дефолт disable.
+// пустое окружение, частичная конфигурация — ошибка вместо дефолтов app/app
+// (ревью PR #54), passthrough DATABASE_URL и его приоритет над POSTGRES_*,
+// экранирование спецсимволов quoteValue, sslmode из POSTGRES_SSLMODE и
+// дефолт disable. Тесты не требуют БД — матрица проверяется в CI.
+//
+// Известный пробел матрицы: sslmode=require фактически не проверяется —
+// для него нужен TLS-стенд; здесь проверяется только попадание значения
+// в DSN.
 package db
 
 import (
@@ -21,8 +26,9 @@ func TestDsnFromEnv(t *testing.T) {
 	tests := []struct {
 		name    string
 		env     map[string]string
-		want    string // точное значение DSN (пустая строка)
+		want    string // точное значение DSN (пустая строка — БД не сконфигурирована)
 		wantSub string // обязательная подстрока DSN
+		wantErr bool   // ожидается ошибка (частичная конфигурация без user/password)
 	}{
 		{
 			name: "ничего не задано — БД не сконфигурирована",
@@ -30,19 +36,24 @@ func TestDsnFromEnv(t *testing.T) {
 			want: "",
 		},
 		{
-			name:    "POSTGRES_SSLMODE=require попадает в DSN",
+			name: "POSTGRES_SSLMODE=require попадает в DSN",
+			env:  map[string]string{"POSTGRES_USER": "app", "POSTGRES_PASSWORD": "app", "POSTGRES_SSLMODE": "require"},
+			want: "host=127.0.0.1 port=5432 user=app password=app dbname=realestate sslmode=require",
+		},
+		{
+			name:    "только POSTGRES_SSLMODE — ошибка: user/password не заданы",
 			env:     map[string]string{"POSTGRES_SSLMODE": "require"},
-			wantSub: "sslmode=require",
+			wantErr: true,
 		},
 		{
 			name:    "sslmode не задан — дефолт disable",
-			env:     map[string]string{"POSTGRES_HOST": "db"},
+			env:     map[string]string{"POSTGRES_HOST": "db", "POSTGRES_USER": "app", "POSTGRES_PASSWORD": "app"},
 			wantSub: "sslmode=disable",
 		},
 		{
-			name: "только POSTGRES_DB задан — остальные части из дефолтов",
-			env:  map[string]string{"POSTGRES_DB": "realestatetest"},
-			want: "host=127.0.0.1 port=5432 user=app password=app dbname=realestatetest sslmode=disable",
+			name:    "задана только POSTGRES_DB — ошибка, не дефолты app/app",
+			env:     map[string]string{"POSTGRES_DB": "realestatetest"},
+			wantErr: true,
 		},
 		{
 			name: "все POSTGRES_* заданы — значения без дефолтов и без кавычек",
@@ -62,18 +73,27 @@ func TestDsnFromEnv(t *testing.T) {
 			want: "postgres://u:p@db:5432/x?sslmode=require",
 		},
 		{
+			// Ревью PR #60 (P2): DATABASE_URL побеждает POSTGRES_* молча.
+			// Поведение осознанное (legacy-переменная с main), тест фиксирует
+			// его документированно: POSTGRES_* при заданном DATABASE_URL
+			// игнорируются целиком, включая sslmode.
+			name: "DATABASE_URL побеждает POSTGRES_SSLMODE",
+			env:  map[string]string{"DATABASE_URL": "postgres://u:p@db:5432/x", "POSTGRES_SSLMODE": "require"},
+			want: "postgres://u:p@db:5432/x",
+		},
+		{
 			name: "DATABASE_URL пуст, POSTGRES_* нет — БД не сконфигурирована",
 			env:  map[string]string{"DATABASE_URL": ""},
 			want: "",
 		},
 		{
 			name: "пароль с пробелом, кавычкой, обратным слэшем и @ — экранирование quoteValue",
-			env:  map[string]string{"POSTGRES_PASSWORD": `pa ss"w'rd\@`},
+			env:  map[string]string{"POSTGRES_USER": "app", "POSTGRES_PASSWORD": `pa ss"w'rd\@`},
 			want: `host=127.0.0.1 port=5432 user=app password='pa ss\"w\'rd\\@' dbname=realestate sslmode=disable`,
 		},
 		{
 			name: "пароль только с @ — без кавычек: keyword-value формат его не ломает",
-			env:  map[string]string{"POSTGRES_PASSWORD": `p@ss`},
+			env:  map[string]string{"POSTGRES_USER": "app", "POSTGRES_PASSWORD": `p@ss`},
 			want: `host=127.0.0.1 port=5432 user=app password=p@ss dbname=realestate sslmode=disable`,
 		},
 	}
@@ -87,7 +107,16 @@ func TestDsnFromEnv(t *testing.T) {
 				t.Setenv(k, v)
 			}
 
-			dsn := dsnFromEnv()
+			dsn, err := dsnFromEnv()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("dsnFromEnv() = %q, ожидалась ошибка", dsn)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("dsnFromEnv(): неожиданная ошибка: %v", err)
+			}
 			if tt.wantSub != "" {
 				if !strings.Contains(dsn, tt.wantSub) {
 					t.Fatalf("dsn %q не содержит %q", dsn, tt.wantSub)
