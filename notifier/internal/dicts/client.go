@@ -31,6 +31,11 @@ type City struct {
 // Client читает справочники Core API с кэшем (TTL 10 минут, как кэш списков
 // в ТЗ 3.5). Успешно полученный справочник остаётся запасом на случай,
 // если Core API ляжет: устаревший кэш лучше отказа.
+//
+// Блокировки: mu защищает только данные кэша и держится коротко — читатели
+// свежего кэша не ждут сетевой фетч; fetchMu сериализует сами фетчи
+// (single-flight): параллельные запросы при просроченном кэше ждут один
+// сетевой вызов, а не дублируют его, после ожидания повторно проверяют кэш.
 type Client struct {
 	base string
 	http *http.Client
@@ -40,6 +45,8 @@ type Client struct {
 	countries []Country
 	cities    map[string][]City
 	fetched   map[string]time.Time
+
+	fetchMu sync.Mutex
 }
 
 func New(baseURL string) *Client {
@@ -137,50 +144,121 @@ func matchCity(c City, name string) bool {
 // Countries возвращает справочник стран: из кэша, из Core API или из
 // устаревшего кэша, если Core API недоступен.
 func (c *Client) Countries(ctx context.Context) ([]Country, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if fresh(c.fetched["countries"], c.ttl) {
-		return c.countries, nil
+	if out, ok := c.freshCountries(); ok {
+		return out, nil
+	}
+	// Фетч без удержания mu: читатели свежего кэша не блокируются, вторичные
+	// горуты ждут только завершения фетча (см. fetchMu у Client).
+	c.fetchMu.Lock()
+	defer c.fetchMu.Unlock()
+	// Двойная проверка: фетч мог уже выполниться параллельной горутой.
+	if out, ok := c.freshCountries(); ok {
+		return out, nil
 	}
 	var out []Country
 	if err := c.get(ctx, "/api/v1/countries", &out); err != nil {
-		if len(c.countries) > 0 {
-			return c.countries, nil // устаревший кэш лучше отказа
+		if stale := c.staleCountries(); stale != nil {
+			return stale, nil // устаревший кэш лучше отказа
 		}
 		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
-	c.countries = out
-	c.fetched["countries"] = time.Now()
+	c.setCountries(out)
 	return out, nil
 }
 
 // Cities возвращает справочник городов страны.
 func (c *Client) Cities(ctx context.Context, country string) ([]City, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	key := strings.ToUpper(country)
-	if fresh(c.fetched["cities:"+key], c.ttl) {
-		return c.cities[key], nil
+	if out, ok := c.freshCities(key); ok {
+		return out, nil
+	}
+	// Фетч без удержания mu: см. Countries.
+	c.fetchMu.Lock()
+	defer c.fetchMu.Unlock()
+	if out, ok := c.freshCities(key); ok {
+		return out, nil // фетч уже выполнен параллельной горутой
 	}
 	var out []City
 	if err := c.get(ctx, "/api/v1/cities?country="+key, &out); err != nil {
-		if len(c.cities[key]) > 0 {
-			return c.cities[key], nil // устаревший кэш лучше отказа
+		if stale := c.staleCities(key); stale != nil {
+			return stale, nil // устаревший кэш лучше отказа
 		}
 		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
-	c.cities[key] = out
-	c.fetched["cities:"+key] = time.Now()
+	c.setCities(key, out)
 	return out, nil
 }
 
-// Healthy сообщает, доступны ли справочники (для GET /health, ФТ-3.7):
-// свежий или устаревший кэш считается доступностью.
+// Healthy сообщает, доступны ли справочники (для readiness /health/ready,
+// ФТ-3.7): выполняет сетевой вызов при просроченном кэше; свежий или
+// устаревший кэш считается доступностью.
 func (c *Client) Healthy(ctx context.Context) bool {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	_, err := c.Countries(ctx)
 	return err == nil
+}
+
+// CachedHealthy сообщает, есть ли у клиента СВЕЖИЙ (в пределах TTL) кэш
+// справочников, без сетевого вызова к Core API. Используется liveness
+// /health: liveness не должен ходить по сети, чтобы шторм healthcheck'ов
+// не усиливал нагрузку на Core API. В отличие от Healthy (истина по сетевой
+// проверке, включая устаревший кэш), здесь истина означает «данные кэша
+// актуальны прямо сейчас».
+func (c *Client) CachedHealthy() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return fresh(c.fetched["countries"], c.ttl)
+}
+
+func (c *Client) freshCountries() ([]Country, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if fresh(c.fetched["countries"], c.ttl) {
+		return c.countries, true
+	}
+	return nil, false
+}
+
+func (c *Client) staleCountries() []Country {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.countries) > 0 {
+		return c.countries
+	}
+	return nil
+}
+
+func (c *Client) setCountries(out []Country) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.countries = out
+	c.fetched["countries"] = time.Now()
+}
+
+func (c *Client) freshCities(key string) ([]City, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if fresh(c.fetched["cities:"+key], c.ttl) {
+		return c.cities[key], true
+	}
+	return nil, false
+}
+
+func (c *Client) staleCities(key string) []City {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.cities[key]) > 0 {
+		return c.cities[key]
+	}
+	return nil
+}
+
+func (c *Client) setCities(key string, out []City) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cities[key] = out
+	c.fetched["cities:"+key] = time.Now()
 }
 
 func fresh(fetchedAt time.Time, ttl time.Duration) bool {
