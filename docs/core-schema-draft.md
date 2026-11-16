@@ -1,7 +1,9 @@
 # Проект схемы `core` — черновик для обсуждения
 
-Автор: Илья (схема БД). Статус: **черновик, не согласован**. Реализация — только после
-согласования с Тимуром (модели SQLAlchemy, запросы) и Даниилом (outbox-интеграция).
+Автор: Илья (схема БД). Статус: **обновлён по итогам ревью PR #66 (2026-11-15)** —
+все открытые вопросы закрыты ответами Тимура и Даниила; реализация — после
+финального аппрува PR. Согласование: Тимур (модели SQLAlchemy, запросы),
+Даниил (outbox-интеграция).
 Ссылки на ТЗ v1.1: разделы 3.1–3.3, 3.7, 4.2, 4.3. Схема меняется только миграциями
 Alembic (НФТ-6), справочники заполняются миграциями (ТЗ 3.2, 3.7).
 
@@ -21,6 +23,7 @@ Alembic (НФТ-6), справочники заполняются миграци
 | id | BIGINT IDENTITY | PK |
 | country_code | CHAR(2) | NOT NULL FK → countries.code |
 | name | TEXT | NOT NULL, UNIQUE (country_code, name) — каноническое латинское |
+| — | — | UNIQUE (id, country_code) — цель составного FK из listings |
 
 ### city_name_aliases (ТЗ 4.2: «таблица либо поле по решению Ильи» — выбрана таблица)
 
@@ -28,9 +31,11 @@ Alembic (НФТ-6), справочники заполняются миграци
 |---|---|---|
 | id | BIGINT IDENTITY | PK |
 | city_id | BIGINT | NOT NULL FK → cities.id ON DELETE CASCADE |
-| alias | TEXT | NOT NULL, UNIQUE (alias) |
+| alias | TEXT | NOT NULL, UNIQUE (alias) — в колонке хранятся уже нормализованные значения (lower + trim), нормализация при вставке в seed-миграциях |
 
-Аргументы решения: поиск `WHERE alias = lower(trim(вход))` бьёт по индексу; массив в
+Аргументы решения: в колонке лежат уже приведённые к нижнему регистру значения
+(ревью Даниила: иначе `lower()` на стороне колонки не даст индексу работать),
+поиск `WHERE alias = lower(trim(вход))` бьёт по индексу; массив в
 поле потребовал бы GIN и не даёт жёсткой гарантии «одна альтернатива ведёт ровно к
 одному городу» (ТЗ 3.7 запрещает сопоставление по названию без страны — уникальность
 alias это страхует).
@@ -41,6 +46,7 @@ alias это страхует).
 |---|---|---|
 | id | BIGINT IDENTITY | PK |
 | code | TEXT | NOT NULL UNIQUE ('mock', 'avito') |
+| name | TEXT | NOT NULL — человекочитаемое имя источника ('Mock-данные', 'Avito') |
 
 ### currencies (ТЗ 3.2: исходные курсы задаются миграциями)
 
@@ -60,12 +66,13 @@ alias это страхует).
 | url | TEXT | NOT NULL |
 | deal_type | TEXT | NOT NULL CHECK IN ('rent','sale') |
 | country_code | CHAR(2) | NOT NULL FK → countries.code |
-| city_id | BIGINT | NOT NULL FK → cities.id |
+| city_id | BIGINT | NOT NULL FK (city_id, country_code) → cities (id, country_code) — БД гарантирует соответствие города и страны (ревью Даниила) |
 | price | NUMERIC(18,2) | NOT NULL CHECK > 0 |
 | currency_code | CHAR(3) | NOT NULL FK → currencies.code |
 | price_usd | BIGINT | NOT NULL CHECK > 0 — ROUND_HALF_UP до целого USD (ТЗ 3.2) |
 | rooms | INT | NOT NULL CHECK >= 0 — студия = 0, NULL запрещён (ТЗ 3.1) |
-| title, address, floor, description | TEXT | NULL |
+| floor | INT | NULL — этаж числом (ревью Даниила), не текст |
+| title, address, description | TEXT | NULL — лимиты длины валидирует Pydantic, в БД без VARCHAR(n) |
 | area_m2 | NUMERIC(8,2) | CHECK NULL OR > 0 |
 | published_at | TIMESTAMPTZ | NULL |
 | content_hash | CHAR(64) | NOT NULL — SHA-256(city+country+address+rooms+area+deal_type), считает Core API при вставке (ТЗ 3.3) |
@@ -104,29 +111,37 @@ alias это страхует).
 | created_at | TIMESTAMPTZ | NOT NULL DEFAULT now() |
 
 Частичный индекс `ON (published_at) WHERE published_at IS NULL` — очередь фоновой
-задачи Core API. Дубль POST не создаёт нового outbox-задания (ТЗ 4.3) — гарантия
-уровня кода, не БД.
+задачи Core API; чтение с `FOR UPDATE SKIP LOCKED`, чтобы два воркера не схватили
+одно задание одновременно (ревью Даниила). Дубль POST не создаёт нового
+outbox-задания (ТЗ 4.3) — гарантия уровня кода, не БД.
 
-## Индексы (ТЗ 4.2)
+`cache_invalidate` (ТЗ 3.5, решение Даниила): инвалидация **без Redis Stream**,
+силами самого Core API — фоновый воркер читает
+`kind='cache_invalidate' AND published_at IS NULL` → `INCR cache:version` →
+помечает `published_at`. Сброс кэша — одно действие внутри Core API.
+
+## Индексы (ТЗ 4.2 + ревью PR #66)
 
 - `(deal_type, city_id, price_usd)` — фильтры ФТ-2.2
 - `(created_at DESC)` — сортировка по умолчанию date_desc
+- `(content_hash)` на listings — поиск дублей не должен быть full scan (ревью Даниила)
+- `(rooms)` — создаём сразу (Тимур подтвердил, Даниил: «конечно нужно»)
+- `(area_m2)` — создаём сразу, фильтр `area_min/area_max` (ФТ-2.2) Тимуром подтверждён
 - UNIQUE из 3.3 выше
-- Индекс по `rooms` и по `area_m2` — вопрос: нужны ли сразу или после анализа
-  запросов (НФТ-10, 500+ объявлений) — см. вопросы к Тимуру
 
-## Открытые вопросы (нужны ответы до Alembic-миграции)
+## Решения по ревью PR #66 (2026-11-15)
 
-1. **Тимуру**: `photos` отдельной таблицей — ок? (альтернатива — JSONB в listings)
-2. **Тимуру**: фильтр `area_min/area_max` (ФТ-2.2) подтверждён? Тогда индекс на `area_m2`.
-3. **Тимуру**: индекс `rooms` — сразу или после анализа запросов?
-4. **Тимуру**: лимиты длины текстовых полей — в Pydantic, БД без VARCHAR(n)? Предлагаю да.
-5. **Даниилу**: outbox-порядок — фоновая задача Core API читает
-   `WHERE published_at IS NULL`, XADD, затем UPDATE published_at (ТЗ 4.3). Формат
-   payload = контракт listings.new — контракты не меняются.
-6. **Даниилу**: `cache_invalidate` в той же таблице outbox (ТЗ 3.5: «событие
-   инвалидации сохраняется вместе с outbox-заданием») — ок? Consumer инвалидации —
-   только Core API сам (обновление cache:version).
+Открытые вопросы черновика закрыты, менять контракты не требуется:
+
+1. **photos** — отдельная таблица `listing_photos` (Тимур).
+2. **Фильтр `area_min/area_max`** — подтверждён, индекс на `area_m2` сразу (Тимур).
+3. **Индекс `rooms`** — сразу, без ожидания анализа запросов (Тимур, Даниил).
+4. **Лимиты длины текстовых полей** — в Pydantic, БД без VARCHAR(n) (Тимур).
+5. **Outbox-порядок** — воркер Core API читает `WHERE published_at IS NULL`
+   с `FOR UPDATE SKIP LOCKED`, XADD, затем UPDATE published_at (Даниил).
+   payload = контракт `listings.new`, контракты не меняются.
+6. **`cache_invalidate`** — в той же таблице outbox, но инвалидация без stream:
+   воркер внутри Core API → `INCR cache:version` (Даниил).
 
 ## План реализации (после согласования)
 
