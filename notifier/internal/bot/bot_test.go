@@ -13,6 +13,7 @@ import (
 
 	"notifier/internal/dicts"
 	"notifier/internal/model"
+	"notifier/internal/notify"
 	"notifier/internal/store"
 	"notifier/internal/telegram"
 )
@@ -479,5 +480,55 @@ func TestFormatEventGiantCurrencyUnconditionalTier(t *testing.T) {
 	}
 	if !strings.HasSuffix(text, "…") {
 		t.Errorf("сообщение должно заканчиваться многоточием последнего яруса: %q", text)
+	}
+}
+
+// TestStopDropsDeferredJobs — ТЗ 4.2 «/stop удаляет и отложенные задания»:
+// в memory-режиме очередь без очистки «доставила» бы отложенные задания
+// в лог уже удалённому пользователю; задания других чатов остаются.
+func TestStopDropsDeferredJobs(t *testing.T) {
+	api := &fakeAPI{}
+	queue := notify.NewMemoryQueue()
+	ctx := context.Background()
+	if err := queue.Postpone(ctx, 10, model.Event{ID: 1, EventID: "550e8400-e29b-41d4-a716-446655440000"}, notify.ModeLog); err != nil {
+		t.Fatalf("postpone chat 10: %v", err)
+	}
+	if err := queue.Postpone(ctx, 20, model.Event{ID: 2, EventID: "550e8400-e29b-41d4-a716-446655440001"}, notify.ModeLog); err != nil {
+		t.Fatalf("postpone chat 20: %v", err)
+	}
+
+	subs := store.NewMemory()
+	if _, err := subs.Add(ctx, model.Subscription{ChatID: 10, City: "Minsk"}); err != nil {
+		t.Fatalf("add subscription: %v", err)
+	}
+	b := New(api, subs, stubValidator{}).WithChatCleaner(queue)
+
+	b.handle(ctx, 10, "/stop")
+
+	if got := api.last(); !strings.Contains(got, "удалено подписок — 1") {
+		t.Errorf("ответ /stop: %q", got)
+	}
+	jobs, err := queue.PopBatch(ctx, 10)
+	if err != nil {
+		t.Fatalf("popbatch: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].ChatID != 20 {
+		t.Fatalf("после /stop в очереди %v, want одно задание чата 20", jobs)
+	}
+}
+
+// TestStopWithoutCleanerStillWorks — боту без очистителя (nil, прежние
+// вызовы New) /stop продолжает работать.
+func TestStopWithoutCleanerStillWorks(t *testing.T) {
+	b, api, subs := newTestBot(stubValidator{})
+	b.handle(context.Background(), 10, "/subscribe city=Minsk")
+
+	b.handle(context.Background(), 10, "/stop")
+
+	if !strings.Contains(api.last(), "удалено подписок — 1") {
+		t.Errorf("ответ /stop без очистителя: %q", api.last())
+	}
+	if n, _ := subs.CountForChat(context.Background(), 10); n != 0 {
+		t.Errorf("после /stop подписок %d, want 0", n)
 	}
 }

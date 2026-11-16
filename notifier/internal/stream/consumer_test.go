@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,8 @@ const validPayload = `{"event_id":"550e8400-e29b-41d4-a716-446655440000","id":12
 
 // fakeRedis — сценарный двойник Redis: первую пачку сообщений выдаёт XREADGROUP,
 // дальше пусто. Подтверждения и dead-letter пишет в логи для проверок.
+// Состояние стрима (streamIDs/pendingIDs/lastDelivered) используется тестами
+// очистки (reaper_test.go).
 type fakeRedis struct {
 	mu        sync.Mutex
 	groupErr  error
@@ -27,6 +30,11 @@ type fakeRedis struct {
 	dead      []redis.XAddArgs
 	xaddErr   error
 	readCalls int
+
+	streamIDs     []string // содержимое стрима, отсортировано по ID
+	pendingIDs    []string // PEL группы (в работе / не подтверждены)
+	lastDelivered string   // last-delivered-id группы
+	deleted       []string // записи, удалённые XDel
 }
 
 func (f *fakeRedis) XGroupCreateMkStream(ctx context.Context, stream, group, start string) *redis.StatusCmd {
@@ -92,6 +100,98 @@ func (f *fakeRedis) ackedIDs() []string {
 	return append([]string(nil), f.acked...)
 }
 
+// XPending — summary-форма: Count и границы PEL (Lower — минимальный ID).
+func (f *fakeRedis) XPending(ctx context.Context, stream, group string) *redis.XPendingCmd {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cmd := redis.NewXPendingCmd(ctx)
+	p := &redis.XPending{Consumers: map[string]int64{}}
+	if len(f.pendingIDs) > 0 {
+		p.Count = int64(len(f.pendingIDs))
+		p.Lower = f.pendingIDs[0]
+		p.Higher = f.pendingIDs[len(f.pendingIDs)-1]
+	}
+	cmd.SetVal(p)
+	return cmd
+}
+
+// XInfoGroups отдаёт группу notifier с её last-delivered-id.
+func (f *fakeRedis) XInfoGroups(ctx context.Context, stream string) *redis.XInfoGroupsCmd {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cmd := redis.NewXInfoGroupsCmd(ctx, stream)
+	cmd.SetVal([]redis.XInfoGroup{{Name: GroupName, LastDeliveredID: f.lastDelivered}})
+	return cmd
+}
+
+// XRange фильтрует стрим по диапазону: "-" — с начала, "(" — исключающая
+// граница (Redis 6.2+), как в реальном XRANGE.
+func (f *fakeRedis) XRange(ctx context.Context, stream, start, stop string) *redis.XMessageSliceCmd {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cmd := redis.NewXMessageSliceCmd(ctx)
+	var out []redis.XMessage
+	for _, id := range f.streamIDs {
+		if !inRange(id, start, stop) {
+			continue
+		}
+		out = append(out, redis.XMessage{ID: id, Values: map[string]any{"data": "{}"}})
+	}
+	cmd.SetVal(out)
+	return cmd
+}
+
+// XDel удаляет записи из стрима; PEL не трогает — как реальный Redis
+// (тест очистки проверяет, что pending после XDEL не меняется).
+func (f *fakeRedis) XDel(ctx context.Context, stream string, ids ...string) *redis.IntCmd {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cmd := redis.NewIntCmd(ctx)
+	removed := map[string]bool{}
+	for _, id := range ids {
+		removed[id] = true
+	}
+	var rest []string
+	for _, id := range f.streamIDs {
+		if removed[id] {
+			f.deleted = append(f.deleted, id)
+			continue
+		}
+		rest = append(rest, id)
+	}
+	f.streamIDs = rest
+	cmd.SetVal(int64(len(ids)))
+	return cmd
+}
+
+// XLen — длина стрима двойника (используется проверкой мягкого порога WARN).
+func (f *fakeRedis) XLen(ctx context.Context, stream string) *redis.IntCmd {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cmd := redis.NewIntCmd(ctx)
+	cmd.SetVal(int64(len(f.streamIDs)))
+	return cmd
+}
+
+// inRange проверяет, что id попадает в диапазон XRANGE: "-" — с начала,
+// "+" — до конца; префикс "(" задаёт исключающую границу (Redis 6.2+).
+// Сравнение — как пар (мс, seq), лексикография строк потока не годится.
+func inRange(id, start, stop string) bool {
+	min := start
+	minExclusive := false
+	if s, ok := strings.CutPrefix(start, "("); ok {
+		min, minExclusive = s, true
+	}
+	max := stop
+	maxExclusive := false
+	if s, ok := strings.CutPrefix(stop, "("); ok {
+		max, maxExclusive = s, true
+	}
+	ge := min == "-" || compareStreamIDs(id, min) > 0 || (compareStreamIDs(id, min) == 0 && !minExclusive)
+	le := max == "+" || compareStreamIDs(id, max) < 0 || (compareStreamIDs(id, max) == 0 && !maxExclusive)
+	return ge && le
+}
+
 func (f *fakeRedis) deadCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -109,7 +209,7 @@ func runConsumer(t *testing.T, rdb *fakeRedis, handle Handler, ready func() bool
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- NewConsumer(rdb, "test-1", handle).Run(ctx) }()
+	go func() { done <- NewConsumer(rdb, "test-1", 2, lenWarnThreshold, handle).Run(ctx) }()
 
 	deadline := time.Now().Add(3 * time.Second)
 	for !ready() && time.Now().Before(deadline) {
@@ -142,8 +242,9 @@ func TestConsumerDeliversAndAcks(t *testing.T) {
 	}}
 
 	handled := make(chan model.Event, 1)
-	err := runConsumer(t, rdb, func(_ context.Context, e model.Event) {
+	err := runConsumer(t, rdb, func(_ context.Context, e model.Event) error {
 		handled <- e
+		return nil
 	}, func() bool { return len(rdb.ackedIDs()) == 1 })
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -171,7 +272,7 @@ func TestConsumerDeadLetterOnBadPayload(t *testing.T) {
 	}}
 
 	handlerCalled := false
-	err := runConsumer(t, rdb, func(context.Context, model.Event) { handlerCalled = true },
+	err := runConsumer(t, rdb, func(context.Context, model.Event) error { handlerCalled = true; return nil },
 		func() bool { return rdb.deadCount() == 1 && len(rdb.ackedIDs()) == 1 })
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -197,7 +298,7 @@ func TestConsumerDeadLetterOnMissingData(t *testing.T) {
 	rdb := &fakeRedis{msgs: []redis.XMessage{
 		{ID: "3-1", Values: map[string]any{"other": "x"}},
 	}}
-	err := runConsumer(t, rdb, func(context.Context, model.Event) {},
+	err := runConsumer(t, rdb, func(context.Context, model.Event) error { return nil },
 		func() bool { return rdb.deadCount() == 1 })
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -209,7 +310,7 @@ func TestConsumerKeepsPendingWhenDeadLetterFails(t *testing.T) {
 		msgs:    []redis.XMessage{{ID: "4-1", Values: map[string]any{"data": `{oops`}}},
 		xaddErr: errors.New("redis unavailable"),
 	}
-	err := runConsumer(t, rdb, func(context.Context, model.Event) {},
+	err := runConsumer(t, rdb, func(context.Context, model.Event) error { return nil },
 		func() bool { return true }) // сразу останавливаем
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -220,12 +321,42 @@ func TestConsumerKeepsPendingWhenDeadLetterFails(t *testing.T) {
 	}
 }
 
+// TestConsumerKeepsPendingWhenHandlerFails — issue #53 (ТЗ 4.3): ошибка
+// хендлера — временный инфраструктурный сбой (Postgres/Redis), XACK не
+// выполняется, запись остаётся в pending и повторяется через XAUTOCLAIM.
+func TestConsumerKeepsPendingWhenHandlerFails(t *testing.T) {
+	rdb := &fakeRedis{msgs: []redis.XMessage{
+		{ID: "6-1", Values: map[string]any{"data": validPayload}},
+	}}
+	handled := make(chan struct{}, 1)
+	err := runConsumer(t, rdb, func(context.Context, model.Event) error {
+		handled <- struct{}{}
+		return errors.New("db down")
+	}, func() bool {
+		select {
+		case <-handled:
+			return true
+		default:
+			return false
+		}
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// Небольшая пауза: ошибочный XACK (если бы он был) успел бы пройти
+	// до проверки — в корректной реализации его просто нет.
+	time.Sleep(50 * time.Millisecond)
+	if got := rdb.ackedIDs(); len(got) != 0 {
+		t.Errorf("acked = %v, want none (handler error must keep record pending)", got)
+	}
+}
+
 func TestConsumerToleratesExistingGroup(t *testing.T) {
 	rdb := &fakeRedis{
 		groupErr: errors.New("BUSYGROUP Consumer Group name already exists"),
 		msgs:     []redis.XMessage{{ID: "5-1", Values: map[string]any{"data": validPayload}}},
 	}
-	err := runConsumer(t, rdb, func(context.Context, model.Event) {},
+	err := runConsumer(t, rdb, func(context.Context, model.Event) error { return nil },
 		func() bool { return len(rdb.ackedIDs()) == 1 })
 	if err != nil {
 		t.Fatalf("Run must tolerate BUSYGROUP: %v", err)
@@ -234,7 +365,7 @@ func TestConsumerToleratesExistingGroup(t *testing.T) {
 
 func TestConsumerGroupCreateFailureIsFatal(t *testing.T) {
 	rdb := &fakeRedis{groupErr: errors.New("WRONGTYPE bad kind")}
-	err := runConsumer(t, rdb, func(context.Context, model.Event) {}, func() bool { return true })
+	err := runConsumer(t, rdb, func(context.Context, model.Event) error { return nil }, func() bool { return true })
 	if err == nil {
 		t.Fatal("group create failure must be returned as error")
 	}

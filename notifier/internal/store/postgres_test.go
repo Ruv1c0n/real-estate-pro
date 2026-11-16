@@ -56,13 +56,36 @@ func TestMain(m *testing.M) {
 // applyMigration применяет notifier/migrations/0001_init.sql одним Exec
 // (внутри файла есть собственные BEGIN/COMMIT). Повторный запуск для тестов
 // не фатален: «already exists» означает, что схема уже применена.
+//
+// Параллельные пакеты go test (notify, store) накатывают 0001 в одну БД
+// одновременно; даже с IF NOT EXISTS конкурентный CREATE TABLE даёт
+// pg_type duplicate key, который проверкой «already exists» не ловится.
+// Сериализуем через advisory-лок на одном соединении из пула.
 func applyMigration(ctx context.Context, pool *pgxpool.Pool) {
 	sql, err := os.ReadFile("../../migrations/0001_init.sql")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "pg tests: read migration: %v\n", err)
 		os.Exit(1)
 	}
-	if _, err := pool.Exec(ctx, string(sql)); err != nil &&
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pg tests: acquire: %v\n", err)
+		pool.Close()
+		os.Exit(1)
+	}
+	defer conn.Release()
+	const migrationLock = 0x6e6f7469 // произвольный ключ: "noti"
+	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", migrationLock); err != nil {
+		fmt.Fprintf(os.Stderr, "pg tests: advisory lock: %v\n", err)
+		pool.Close()
+		os.Exit(1)
+	}
+	defer func() {
+		if _, err := conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", migrationLock); err != nil {
+			fmt.Fprintf(os.Stderr, "pg tests: advisory unlock: %v\n", err)
+		}
+	}()
+	if _, err := conn.Exec(ctx, string(sql)); err != nil &&
 		!strings.Contains(err.Error(), "already exists") {
 		fmt.Fprintf(os.Stderr, "pg tests: apply migration: %v\n", err)
 		pool.Close()
@@ -372,8 +395,10 @@ func TestPostgresConstraintViolationReturnsError(t *testing.T) {
 		{"min больше max (price_range_chk)", model.Subscription{ChatID: 100, MinPriceUSD: model.Int64Ptr(500), MaxPriceUSD: model.Int64Ptr(100)}},
 		{"country не alpha-2 (country_chk)", model.Subscription{ChatID: 100, Country: "blr"}},
 		{"все поля пустые (not_empty_chk)", model.Subscription{ChatID: 100}},
-		{"нет пользователя (FK)", model.Subscription{ChatID: 777, City: "Minsk"}},
 	}
+	// Кейс «нет пользователя (FK)» убран: Add сознательно сам создаёт
+	// пользователя (ensureUser внутри Add — /subscribe работает без /start),
+	// FK-нарушение по chat_id из Add недостижимо по дизайну.
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Публичный Add возвращает ошибку констрейнта, а не подписку

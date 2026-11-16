@@ -4,6 +4,7 @@ package notify
 import (
 	"context"
 	"strconv"
+	"strings"
 	"sync"
 
 	"notifier/internal/model"
@@ -91,5 +92,28 @@ func (q *MemoryQueue) Mark(_ context.Context, job DeferredJob, _, status string)
 			}
 		}
 	}
+	return nil
+}
+
+// DropChatJobs удаляет отложенные задания чата (ТЗ 4.2: «/stop удаляет и
+// отложенные задания») и снимает пометку «в полёте» с его пар — иначе после
+// /stop очередь «доставила» бы их в лог уже удалённому пользователю.
+// Идемпотентно: чат без заданий — тоже успех.
+func (q *MemoryQueue) DropChatJobs(_ context.Context, chatID int64) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	prefix := strconv.FormatInt(chatID, 10) + ":"
+	for k := range q.inflight {
+		if strings.HasPrefix(k, prefix) {
+			delete(q.inflight, k)
+		}
+	}
+	jobs := q.jobs[:0]
+	for _, j := range q.jobs {
+		if j.ChatID != chatID {
+			jobs = append(jobs, j)
+		}
+	}
+	q.jobs = jobs
 	return nil
 }

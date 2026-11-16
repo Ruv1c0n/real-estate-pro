@@ -96,6 +96,10 @@ With `.env` filled in, startup is a single `docker compose up --build`.
 | `DATABASE_URL` | For local Core API only (`postgresql+asyncpg`); notifier checks it first — before `POSTGRES_*` — as a legacy DSN. Only pgx-parseable formats work: the `+asyncpg` value from `.env.example` fails a local notifier startup |
 | `REDIS_URL` | Redis address; currently set in Compose |
 | `CORE_API_URL` | Core API address for collector and notifier reference data |
+| `NOTIFIER_NOTIFICATIONS_PER_HOUR` | Per-user rolling-hour limit for Telegram notifications (spec 3.6; default matches the spec — 30). A junk or non-positive value fails the startup |
+| `NOTIFIER_WORKERS` | Worker pool size for the `listings.new` consumer (spec 3.6; default matches the spec — 8) |
+| `NOTIFIER_STREAM_LEN_THRESHOLD` | Soft WARN threshold for `listings.new` stream length (a sign of consumer lag; default 10000); the WARN does not affect delivery and does not trim the stream |
+| `NOTIFIER_STREAM_CLEANUP_INTERVAL` | Period of the safe stream cleanup — only confirmed records behind the min-pending boundary are deleted (spec 4.3; default 5m) |
 | `MOCK_MODE` | `true` by default; still needs to be wired into collector configuration |
 | `MOCK_PUBLISH_MODE` | `batch` by default or `stream`; to be implemented |
 | Admin key | Variable `ADMIN_KEY`, header `X-Admin-Key`; an empty value disables `/debug/event` |
