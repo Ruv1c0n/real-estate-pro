@@ -139,8 +139,11 @@ services:
       - "8080:8080"
     environment:
       REDIS_URL: redis://redis:6379/0
-      # Подключение к Postgres отдельными переменными, как у core-api:
-      # notifier сам собирает адрес, спецсимволы пароля не ломают URL.
+      # notifier работает с Postgres: SQL-миграция 0001 применяется
+      # встроенным раннером при старте. БД недоступна на старте —
+      # сервис завершается с ошибкой (fail-fast); POSTGRES_* не заданы —
+      # memory-режим (в логе "DB disabled"). Данные передаются отдельными
+      # переменными, чтобы спецсимволы пароля не ломали подключение.
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
       POSTGRES_USER: "${POSTGRES_USER:-app}"
