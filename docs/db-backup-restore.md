@@ -65,6 +65,28 @@ scripts/db/restore-verify.sh backups/realestate-YYYYmmdd-HHMMSS.dump
   не в репозитории (`.gitignore`). Дампы могут содержать пользовательские
   данные — не выкладывать их наружу.
 - Восстановление на живой стек — вручную, со остановленными сервисами:
-  `docker compose stop core-api collector notifier`, затем
-  `pg_restore -h 127.0.0.1 -p 5432 -U app -d realestate --clean --if-exists <dump>`,
-  затем `docker compose start core-api collector notifier`.
+
+  ```bash
+  docker compose stop core-api collector notifier
+  # структура и данные из дампа (--clean делает DROP ... CASCADE,
+  # в том числе схем — с ними теряются и GRANT'ы, см. шаг 2)
+  pg_restore -h 127.0.0.1 -p 5432 -U app -d realestate \
+      --clean --if-exists --no-owner --no-privileges <dump>
+  # шаг 2: переустановка ролей и прав кодом миграции 0002 —
+  # после DROP ... CASCADE GRANT'ы и default privileges на схемах
+  # потеряны, сервисы без этого не заработают
+  cd core-api && alembic downgrade 0001 && alembic upgrade head && cd ..
+  # шаг 3: выдать пароли ролей (значения из .env, как при депое)
+  # шаг 4: запуск сервисов
+  docker compose start core-api collector notifier
+  ```
+
+- Полная потеря volume (свежая база): тот же порядок, что и на живом стеке,
+  но сначала `alembic upgrade head` на пустой БД (структура + роли),
+  затем `pg_restore --clean --if-exists --no-owner --no-privileges`,
+  затем `alembic downgrade 0001 && alembic upgrade head` и пароли ролей.
+  Проверено на postgres:16: после цикла данные целы, `core_api`/`notifier`
+  имеют все права, default privileges на месте. Runner notifier свои
+  SQL-миграции повторно применять не будет, если `notifier.schema_migrations`
+  приехал в дампе; если дамп старше запуска runner'а — миграции применятся
+  заново и завершатся no-op'ом благодаря IF NOT EXISTS.
