@@ -101,8 +101,11 @@ jobs:
         run: |
           cd core-api
           python -m uvicorn app.main:app --port 8000 &
+          # Ждём /health/live (без обращений к зависимостям, всегда 200):
+          # /health при недоступных postgres/redis честно даёт 503 (ФТ-2.7),
+          # а гейту схема нужна независимо от состояния БД.
           for i in $(seq 1 30); do
-            curl -sf http://localhost:8000/health > /dev/null && break
+            curl -sf http://localhost:8000/health/live > /dev/null && break
             sleep 1
           done
           curl -sf http://localhost:8000/openapi.json | python ../scripts/qa/openapi-check.py
