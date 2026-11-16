@@ -8,7 +8,9 @@
   - CREATE TABLE [IF NOT EXISTS] [схема.]имя ( ... ):
     колонки с типом, inline PRIMARY KEY / UNIQUE / NOT NULL,
     inline REFERENCES [таблица (колонка)] -> FK,
-    табличные CONSTRAINT ... PRIMARY KEY / UNIQUE / FOREIGN KEY,
+    табличные CONSTRAINT ... PRIMARY KEY / UNIQUE / FOREIGN KEY
+    (в т.ч. составные FOREIGN KEY (a, b) REFERENCES p (x, y) — одной
+    связью с подписью «a + b (составной FK)»),
     CHECK и DEFAULT пропускаются (тело со скобками и строками аккуратно
     вырезается);
   - ALTER TABLE [ONLY] ... ADD CONSTRAINT ... FOREIGN KEY (col) REFERENCES ...;
@@ -331,22 +333,50 @@ def parse_table_constraint(item: str, table: Table, model: Model, source: str) -
                     c["uk"] = True
         return
     if up.startswith("FOREIGN"):
-        m = re.search(
-            r"FOREIGN\s+KEY\s*\(\s*\"?([\w$]+)\"?\s*\)\s*REFERENCES\s+"
-            r"(?:ONLY\s+)?(?:\"?[\w$]+\"?\.)?\"?([\w$]+)\"?"
-            r"(?:\s*\(\s*\"?([\w$]+)\"?\s*\))?",
-            item, re.IGNORECASE)
+        m = re.search(r"FOREIGN\s+KEY\s*\(([^)]*)\)", item, re.IGNORECASE)
         if not m:
             warn(f"FOREIGN KEY не распознан: {item[:70]!r} ({source})")
             return
-        model.fks.append({"child": table.name, "child_col": m.group(1),
-                          "parent": entity_name(m.group(2)),
-                          "parent_col": m.group(3) or m.group(1)})
-        c = table.col(m.group(1))
-        if c:
-            c["fk"] = True
+        cols = [c.strip().strip('"') for c in m.group(1).split(",")]
+        add_foreign_key(cols, item, table, model, source)
         return
     # CHECK — просто пропускаем
+
+
+def add_foreign_key(cols: list[str], ref_txt: str, table: Table,
+                    model: Model, source: str) -> None:
+    """FK из табличного ограничения/ALTER.
+
+    Одиночный FK — одна связь с подписью колонки; составной (несколько
+    колонок в одном FOREIGN KEY) — одна связь с подписью
+    «кол1 + кол2 (составной FK)», Mermaid составные связи не выражает.
+    """
+    m = re.search(
+        r"REFERENCES\s+(?:ONLY\s+)?(?:\"?[\w$]+\"?\.)?\"?([\w$]+)\"?"
+        r"(?:\s*\(([^)]*)\))?",
+        ref_txt, re.IGNORECASE)
+    if not m:
+        warn(f"REFERENCES не распознан в FK: {ref_txt[:70]!r} ({source})")
+        return
+    parent = entity_name(m.group(1))
+    ref_cols = ([c.strip().strip('"') for c in m.group(2).split(",")]
+                if m.group(2) else [])
+    if len(cols) == 1:
+        model.fks.append({"child": table.name, "child_col": cols[0],
+                          "parent": parent,
+                          "parent_col": ref_cols[0] if ref_cols else cols[0]})
+    else:
+        pairs = [(col, ref_cols[i] if i < len(ref_cols) else col)
+                 for i, col in enumerate(cols)]
+        model.fks.append({
+            "child": table.name, "parent": parent, "composite": pairs,
+            "child_col": " + ".join(cols),
+            "parent_col": " + ".join(p for _, p in pairs),
+        })
+    for col in cols:
+        c = table.col(col)
+        if c:
+            c["fk"] = True
 
 
 def parse_alter_table(stmt: str, model: Model, source: str) -> None:
@@ -381,16 +411,7 @@ def parse_alter_table(stmt: str, model: Model, source: str) -> None:
                     c["uk"] = True
             return
         ref_txt = m2.group(4) or ""
-        r = parse_references(ref_txt)
-        if not r:
-            warn(f"FOREIGN KEY без распознанного REFERENCES: {stmt[:70]!r} ({source})")
-            return
-        for col in cols:
-            model.fks.append({"child": table.name, "child_col": col,
-                              "parent": r[0], "parent_col": r[1] or col})
-            c = table.col(col)
-            if c:
-                c["fk"] = True
+        add_foreign_key(cols, ref_txt, table, model, source)
         return
 
     # ADD [COLUMN] [IF NOT EXISTS] имя тип ...
@@ -436,7 +457,11 @@ def render(model: Model) -> str:
         lines.append("")
     for fk in model.fks:
         # один-ко-многим: у родителя ||, у ребёнка o{ (FK обычно nullable/множественный)
-        lines.append(f'    {fk["parent"]} ||--o{{ {fk["child"]} : {fk["child_col"]}')
+        if fk.get("composite"):
+            label = " + ".join(c for c, _ in fk["composite"]) + " (составной FK)"
+            lines.append(f'    {fk["parent"]} ||--o{{ {fk["child"]} : "{label}"')
+        else:
+            lines.append(f'    {fk["parent"]} ||--o{{ {fk["child"]} : {fk["child_col"]}')
     return "\n".join(lines) + "\n"
 
 

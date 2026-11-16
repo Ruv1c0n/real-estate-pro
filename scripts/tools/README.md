@@ -17,8 +17,11 @@ python -I scripts/tools/sql-to-er.py notifier/migrations/*.sql   # stdout
 
 - `CREATE TABLE [IF NOT EXISTS] [схема.]имя (...)` — колонки с типом,
   inline `PRIMARY KEY` / `UNIQUE` / `NOT NULL`, inline `REFERENCES` (FK),
-  табличные `CONSTRAINT ... PRIMARY KEY / UNIQUE / FOREIGN KEY`;
-- `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY (col) REFERENCES ...`;
+  табличные `CONSTRAINT ... PRIMARY KEY / UNIQUE / FOREIGN KEY`
+  (в т.ч. составные `FOREIGN KEY (a, b) REFERENCES p (x, y)` — одной
+  связью с подписью «a + b (составной FK)»);
+- `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY (col) REFERENCES ...`
+  (в т.ч. составные — аналогично);
 - `ALTER TABLE ... ADD [COLUMN] [IF NOT EXISTS] имя тип ...` (в т.ч. с FK);
 - `CHECK` / `DEFAULT` аккуратно пропускаются (учитываются скобки и строки
   в кавычках — например, regex в CHECK не ломает разбор).
