@@ -18,8 +18,8 @@ REQUIRED = {
     "/health",
     "/health/live",
     "/health/ready",
-    "/openapi.json",
 }
+# /openapi.json и /docs — документы схемы, в paths не перечислены.
 
 # Пока не реализованы — предупреждаём, не валим (снимается при мерже ФТ-2.1–2.4).
 EXPECTED_SOON = {
