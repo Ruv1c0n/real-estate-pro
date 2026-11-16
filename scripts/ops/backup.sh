@@ -27,7 +27,7 @@ ts=$(date +%Y%m%d-%H%M%S)
 out="$BACKUP_DIR/realestate-$ts.sql.gz"
 
 docker exec "$POSTGRES_CONTAINER" \
-    pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --schemas=core,notifier \
+    pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -n core -n notifier \
     | gzip > "$out"
 
 size=$(du -h "$out" | cut -f1)
