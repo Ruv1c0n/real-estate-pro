@@ -77,12 +77,20 @@ func main() {
 
 	subs, journal, limiter, queue := buildStores(pool)
 
+	// /stop чистит отложенные задания чата (ТЗ 4.2), если очередь реализует
+	// ChatCleaner (MemoryQueue и PgQueue реализуют); боту передаётся
+	// структурный интерфейс — bot не импортирует notify.
+	var chatCleaner bot.ChatCleaner
+	if cc, ok := queue.(notify.ChatCleaner); ok {
+		chatCleaner = cc
+	}
+
 	var sender notify.Sender
 	var mode string
 	var tgBot *bot.Bot
 	if token := os.Getenv("TELEGRAM_BOT_TOKEN"); token != "" {
 		mode = notify.ModeTelegram
-		tgBot = bot.New(telegram.NewClient(token), subs, dictsClient)
+		tgBot = bot.New(telegram.NewClient(token), subs, dictsClient).WithChatCleaner(chatCleaner)
 		go tgBot.Run(ctx)
 		sender = tgBot.Send
 	} else {
