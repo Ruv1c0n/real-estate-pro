@@ -91,29 +91,40 @@ def upgrade() -> None:
 def downgrade() -> None:
     # Отзываем то, что выдали, включая дефолтные права, затем удаляем роли.
     # Роли без паролей и без созданных ими объектов — DROP безопасен.
+    # REVOKE по несуществующей роли падает с ошибкой, а при её удалении
+    # выданные ей права снимаются автоматически — поэтому каждый блок
+    # отзыва защищён проверкой существования роли: downgrade остаётся
+    # безопасным даже после ручного удаления роли.
     op.execute(
-        "ALTER DEFAULT PRIVILEGES IN SCHEMA core REVOKE ALL ON TABLES FROM core_api"
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'core_api') THEN
+                ALTER DEFAULT PRIVILEGES IN SCHEMA core REVOKE ALL ON TABLES FROM core_api;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA core REVOKE ALL ON SEQUENCES FROM core_api;
+                REVOKE SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA core FROM core_api;
+                REVOKE USAGE, SELECT ON ALL SEQUENCES IN SCHEMA core FROM core_api;
+                REVOKE USAGE ON SCHEMA core FROM core_api;
+            END IF;
+        END
+        $$;
+        """
     )
     op.execute(
-        "ALTER DEFAULT PRIVILEGES IN SCHEMA core REVOKE ALL ON SEQUENCES FROM core_api"
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'notifier') THEN
+                ALTER DEFAULT PRIVILEGES IN SCHEMA notifier REVOKE ALL ON TABLES FROM notifier;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA notifier REVOKE ALL ON SEQUENCES FROM notifier;
+                REVOKE SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA notifier FROM notifier;
+                REVOKE USAGE, SELECT ON ALL SEQUENCES IN SCHEMA notifier FROM notifier;
+                REVOKE USAGE ON SCHEMA notifier FROM notifier;
+            END IF;
+        END
+        $$;
+        """
     )
-    op.execute(
-        "REVOKE SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA core FROM core_api"
-    )
-    op.execute("REVOKE USAGE, SELECT ON ALL SEQUENCES IN SCHEMA core FROM core_api")
-    op.execute("REVOKE USAGE ON SCHEMA core FROM core_api")
-
-    op.execute(
-        "ALTER DEFAULT PRIVILEGES IN SCHEMA notifier REVOKE ALL ON TABLES FROM notifier"
-    )
-    op.execute(
-        "ALTER DEFAULT PRIVILEGES IN SCHEMA notifier REVOKE ALL ON SEQUENCES FROM notifier"
-    )
-    op.execute(
-        "REVOKE SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA notifier FROM notifier"
-    )
-    op.execute("REVOKE USAGE, SELECT ON ALL SEQUENCES IN SCHEMA notifier FROM notifier")
-    op.execute("REVOKE USAGE ON SCHEMA notifier FROM notifier")
 
     op.execute("DROP ROLE IF EXISTS core_api")
     op.execute("DROP ROLE IF EXISTS notifier")
