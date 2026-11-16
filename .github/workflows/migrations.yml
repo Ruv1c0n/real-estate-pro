@@ -6,16 +6,24 @@
 # поправить paths ниже и команду в шаге).
 # Джоба alembic ниже активируется автоматически, как только в репо появится
 # alembic.ini (пока его нет — job в UI вообще не создаётся, это чисто).
+# Alembic идёт из core-api/requirements.txt (запинен с PR #81) — отдельный
+# шаг установки не нужен.
 name: migrations
 on:
   pull_request:
     paths:
       - notifier/migrations/**
+      - core-api/alembic.ini
+      - core-api/alembic/**
+      - core-api/requirements.txt
       - .github/workflows/migrations.yml
   push:
     branches: [main]
     paths:
       - notifier/migrations/**
+      - core-api/alembic.ini
+      - core-api/alembic/**
+      - core-api/requirements.txt
   workflow_dispatch:
 
 jobs:
@@ -78,10 +86,6 @@ jobs:
           python-version: "3.12"
       - name: Зависимости core-api
         run: python -m pip install -r core-api/requirements.txt
-      # alembic пока не запинен в core-api/requirements.txt — ставим отдельным шагом
-      # (убрать, когда Тимур запинит alembic в requirements)
-      - name: Установить alembic
-        run: python -m pip install alembic
       - name: alembic upgrade head (миграции схемы core)
         working-directory: core-api
         env:
