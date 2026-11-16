@@ -6,6 +6,7 @@ package notify
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -273,17 +274,24 @@ const eventBudget = 25 * time.Second
 // отправляет сразу или откладывает при исчерпании лимита. Перед проверкой
 // журнала пара (объявление, чат) закрепляется клеймом; если она уже
 // доставляется параллельным путём — шаг пропускается.
-func (d *Dispatcher) Handle(ctx context.Context, e model.Event) {
+//
+// Ошибка возвращается ТОЛЬКО при временном инфраструктурном сбое (Postgres/
+// Redis, ТЗ 4.3 «Временные ошибки БД/Redis повторяются»): недоступны подписки
+// (subs.All), журнал дедупа до отправки (journal.Sent), лимитер (Allow) или
+// очередь отложенных (Postpone). Консьюмер при ошибке не выполняет XACK —
+// событие остаётся в pending и повторяется через XAUTOCLAIM (issue #53).
+// Ошибки Telegram-отправки (429/network) и journal.Record после успешной
+// отправки обрабатываются внутри и ошибкой события не являются — см. deliver.
+func (d *Dispatcher) Handle(ctx context.Context, e model.Event) error {
 	recipients, err := d.subs.All(ctx)
 	if err != nil {
 		// Хранилище подписок недоступно: ошибку нельзя трактовать как
 		// «получателей нет» — это была бы молчаливая потеря событий. Доставку
 		// не начинаем вовсе, чтобы никто не получил частичную рассылку.
-		// До условного XACK (issue #53) событие при этом теряется из стрима —
-		// осознанный шаг к R10: надёжность даёт подтверждение после полной
-		// обработки, а не до неё.
-		log.Printf("dispatch: list subscriptions: %v", err)
-		return
+		// Ошибка уходит консьюмеру: событие остаётся в pending до XAUTOCLAIM
+		// (issue #53, ТЗ 4.3), при повторе доставленные ранее получатели
+		// отсекаются дедупом журнала (ФТ-3.5).
+		return fmt.Errorf("list subscriptions: %w", err)
 	}
 	ectx, cancel := context.WithTimeout(ctx, eventBudget)
 	defer cancel()
@@ -293,12 +301,17 @@ func (d *Dispatcher) Handle(ctx context.Context, e model.Event) {
 			// продолжать доставку значило бы выйти за eventBudget, и живой
 			// воркер был бы перезабран XAUTOCLAIM (см. eventBudget).
 			if perr := d.postpone(ectx, chatID, e); perr != nil {
-				log.Printf("postpone listing %d chat %d: %v", e.ID, chatID, perr)
+				// Задание не записано: ни журнала, ни очереди — уведомление
+				// потеряно после XACK. Ошибка события → повтор через pending.
+				return fmt.Errorf("postpone listing %d chat %d: %w", e.ID, chatID, perr)
 			}
 			continue
 		}
-		d.deliverRecipient(ectx, chatID, e)
+		if err := d.deliverRecipient(ectx, chatID, e); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // deliverRecipient доставляет событие одному получателю в рамках его
@@ -309,13 +322,17 @@ func (d *Dispatcher) Handle(ctx context.Context, e model.Event) {
 // ничего не записывалось, и событие терялось после XACK. Свой дедлайн у
 // каждого получателя гарантирует, что хвост получает полный бюджет
 // независимо от размера списка.
-func (d *Dispatcher) deliverRecipient(ctx context.Context, chatID int64, e model.Event) {
+//
+// Временные инфраструктурные ошибки (журнал до отправки, лимитер, очередь
+// отложенных) возвращаются как error — консьюмер не выполнит XACK и событие
+// будет повторено (issue #53, ТЗ 4.3).
+func (d *Dispatcher) deliverRecipient(ctx context.Context, chatID int64, e model.Event) error {
 	rctx, cancel := context.WithTimeout(ctx, d.perRecipient)
 	defer cancel()
 
 	key := journalKey{listingID: e.ID, chatID: chatID}
 	if !d.claim(key) {
-		return // уже доставляется другим путём — не дублируем (ФТ-3.5)
+		return nil // уже доставляется другим путём — не дублируем (ФТ-3.5)
 	}
 	defer d.release(key)
 	unlockChat := d.lockChat(chatID)
@@ -323,29 +340,30 @@ func (d *Dispatcher) deliverRecipient(ctx context.Context, chatID int64, e model
 
 	sent, err := d.journal.Sent(rctx, e.ID, chatID)
 	if err != nil {
-		// Журнал недоступен — не паникуем и не прерываем доставку
-		// остальных получателей: at-least-once допускает повтор.
-		log.Printf("journal check listing %d chat %d: %v", e.ID, chatID, err)
+		// Журнал дедупа недоступен: доставку не начинаем. Отправка без
+		// проверки Sent задвоила бы доставку (ФТ-3.5), а пропуск получателя —
+		// потерял бы уведомление после XACK. Ошибка события → повтор через
+		// pending (issue #53, ТЗ 4.3).
+		return fmt.Errorf("journal check listing %d chat %d: %w", e.ID, chatID, err)
 	}
 	if sent {
-		return // событие доставлено повторно — не дублируем (ФТ-3.5)
+		return nil // событие доставлено повторно — не дублируем (ФТ-3.5)
 	}
 	ok, err := d.limiter.Allow(rctx, chatID, d.mode)
 	if err != nil {
-		// Ошибка лимитера трактуется как «слот занят»: задание
-		// откладывается и будет повторено флешером.
-		log.Printf("limiter check listing %d chat %d: %v", e.ID, chatID, err)
-		ok = false
+		// Окно лимитера не подтверждено: трактовать как «слот занят» нельзя —
+		// Postpone пишет в ту же БД и с высокой вероятностью упадёт тоже,
+		// безвозвратно потеряв задание. Ошибка события → повтор через pending.
+		return fmt.Errorf("limiter check listing %d chat %d: %w", e.ID, chatID, err)
 	}
 	if ok {
-		d.deliver(rctx, chatID, e)
-		return
+		return d.deliver(rctx, chatID, e)
 	}
 	if err := d.postpone(rctx, chatID, e); err != nil {
-		log.Printf("postpone listing %d chat %d: %v", e.ID, chatID, err)
-		return
+		return fmt.Errorf("postpone listing %d chat %d: %w", e.ID, chatID, err)
 	}
 	log.Printf("hourly limit reached: listing %d to chat %d deferred", e.ID, chatID)
+	return nil
 }
 
 // postpone возвращает уведомление в очередь отложенных. Запись идёт на
@@ -400,7 +418,7 @@ func (d *Dispatcher) pauseRateLimited(ctx context.Context, err error) {
 	}
 }
 
-func (d *Dispatcher) deliver(ctx context.Context, chatID int64, e model.Event) {
+func (d *Dispatcher) deliver(ctx context.Context, chatID int64, e model.Event) error {
 	status := StatusSent
 	if err := d.send(ctx, chatID, e); err != nil {
 		// 429 — явный отказ Telegram с рекомендованной паузой (ТЗ 4.3
@@ -412,21 +430,32 @@ func (d *Dispatcher) deliver(ctx context.Context, chatID int64, e model.Event) {
 		if errors.Is(err, telegram.ErrRateLimited) {
 			logRateLimited(err, e.ID, chatID)
 			if perr := d.postpone(ctx, chatID, e); perr != nil {
-				// Postpone тоже упал — лог и выходим (как в deliverRecipient).
-				log.Printf("postpone listing %d chat %d: %v", e.ID, chatID, perr)
+				// Postpone тоже упал: ни задания в очереди, ни записи журнала —
+				// уведомление потеряно после XACK. Ошибка события → повтор
+				// через pending (issue #53, ТЗ 4.3).
+				return fmt.Errorf("postpone listing %d chat %d after 429: %w", e.ID, chatID, perr)
 			}
-			return
+			return nil
 		}
 		// Ошибка отправки фиксируется в журнале как unknown: автоматический
 		// повтор не выполняется (contracts.md §2 — статус unknown без повтора).
+		// Ошибкой события НЕ возвращается: повтор всего события привёл бы к
+		// повторной отправке.
 		log.Printf("send listing %d to chat %d: %v", e.ID, chatID, err)
 		status = StatusUnknown
 	}
 	if err := d.journal.Record(ctx, chatID, e.ID, e.EventID, e, status, d.mode); err != nil {
-		// Недоступная БД не должна валить сервис: доставка уже прошла,
-		// повтор будет только при следующей публикации события.
+		// Решение по issue #53 (ФТ-3.5, ТЗ 4.3, contracts.md §2): ошибка
+		// фиксации ПОСЛЕ успешной отправки не становится ошибкой события.
+		// Возврат ошибки заставил бы консьюмер оставить запись в pending и
+		// повторить событие, а Sent-проверка при повторе не отсечёт доставку
+		// (записи в журнале нет) — получился бы автоповтор отправки с дублем
+		// у пользователя. Неопределённый исход отправки имеет статус unknown
+		// и автоповтору не подлежит (contracts.md §2); повтор возможен только
+		// при явной повторной публикации события.
 		log.Printf("journal record listing %d chat %d: %v", e.ID, chatID, err)
 	}
+	return nil
 }
 
 // RunFlusher периодически отправляет отложенные уведомления,

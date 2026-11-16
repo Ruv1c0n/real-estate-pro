@@ -242,8 +242,9 @@ func TestConsumerDeliversAndAcks(t *testing.T) {
 	}}
 
 	handled := make(chan model.Event, 1)
-	err := runConsumer(t, rdb, func(_ context.Context, e model.Event) {
+	err := runConsumer(t, rdb, func(_ context.Context, e model.Event) error {
 		handled <- e
+		return nil
 	}, func() bool { return len(rdb.ackedIDs()) == 1 })
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -271,7 +272,7 @@ func TestConsumerDeadLetterOnBadPayload(t *testing.T) {
 	}}
 
 	handlerCalled := false
-	err := runConsumer(t, rdb, func(context.Context, model.Event) { handlerCalled = true },
+	err := runConsumer(t, rdb, func(context.Context, model.Event) error { handlerCalled = true; return nil },
 		func() bool { return rdb.deadCount() == 1 && len(rdb.ackedIDs()) == 1 })
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -297,7 +298,7 @@ func TestConsumerDeadLetterOnMissingData(t *testing.T) {
 	rdb := &fakeRedis{msgs: []redis.XMessage{
 		{ID: "3-1", Values: map[string]any{"other": "x"}},
 	}}
-	err := runConsumer(t, rdb, func(context.Context, model.Event) {},
+	err := runConsumer(t, rdb, func(context.Context, model.Event) error { return nil },
 		func() bool { return rdb.deadCount() == 1 })
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -309,7 +310,7 @@ func TestConsumerKeepsPendingWhenDeadLetterFails(t *testing.T) {
 		msgs:    []redis.XMessage{{ID: "4-1", Values: map[string]any{"data": `{oops`}}},
 		xaddErr: errors.New("redis unavailable"),
 	}
-	err := runConsumer(t, rdb, func(context.Context, model.Event) {},
+	err := runConsumer(t, rdb, func(context.Context, model.Event) error { return nil },
 		func() bool { return true }) // сразу останавливаем
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -320,12 +321,42 @@ func TestConsumerKeepsPendingWhenDeadLetterFails(t *testing.T) {
 	}
 }
 
+// TestConsumerKeepsPendingWhenHandlerFails — issue #53 (ТЗ 4.3): ошибка
+// хендлера — временный инфраструктурный сбой (Postgres/Redis), XACK не
+// выполняется, запись остаётся в pending и повторяется через XAUTOCLAIM.
+func TestConsumerKeepsPendingWhenHandlerFails(t *testing.T) {
+	rdb := &fakeRedis{msgs: []redis.XMessage{
+		{ID: "6-1", Values: map[string]any{"data": validPayload}},
+	}}
+	handled := make(chan struct{}, 1)
+	err := runConsumer(t, rdb, func(context.Context, model.Event) error {
+		handled <- struct{}{}
+		return errors.New("db down")
+	}, func() bool {
+		select {
+		case <-handled:
+			return true
+		default:
+			return false
+		}
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// Небольшая пауза: ошибочный XACK (если бы он был) успел бы пройти
+	// до проверки — в корректной реализации его просто нет.
+	time.Sleep(50 * time.Millisecond)
+	if got := rdb.ackedIDs(); len(got) != 0 {
+		t.Errorf("acked = %v, want none (handler error must keep record pending)", got)
+	}
+}
+
 func TestConsumerToleratesExistingGroup(t *testing.T) {
 	rdb := &fakeRedis{
 		groupErr: errors.New("BUSYGROUP Consumer Group name already exists"),
 		msgs:     []redis.XMessage{{ID: "5-1", Values: map[string]any{"data": validPayload}}},
 	}
-	err := runConsumer(t, rdb, func(context.Context, model.Event) {},
+	err := runConsumer(t, rdb, func(context.Context, model.Event) error { return nil },
 		func() bool { return len(rdb.ackedIDs()) == 1 })
 	if err != nil {
 		t.Fatalf("Run must tolerate BUSYGROUP: %v", err)
@@ -334,7 +365,7 @@ func TestConsumerToleratesExistingGroup(t *testing.T) {
 
 func TestConsumerGroupCreateFailureIsFatal(t *testing.T) {
 	rdb := &fakeRedis{groupErr: errors.New("WRONGTYPE bad kind")}
-	err := runConsumer(t, rdb, func(context.Context, model.Event) {}, func() bool { return true })
+	err := runConsumer(t, rdb, func(context.Context, model.Event) error { return nil }, func() bool { return true })
 	if err == nil {
 		t.Fatal("group create failure must be returned as error")
 	}

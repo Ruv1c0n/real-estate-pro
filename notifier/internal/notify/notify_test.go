@@ -324,22 +324,45 @@ func TestHandlePostponesWhenLimitReached(t *testing.T) {
 	}
 }
 
-func TestHandleLimiterErrorPostpones(t *testing.T) {
-	// Ошибка лимитера трактуется как «слот занят»: задание откладывается,
-	// уведомление не теряется; Dispatcher не паникует.
+func TestHandleLimiterErrorReturnsEventError(t *testing.T) {
+	// Ошибка лимитера — окно не подтверждено: трактовать как «слот занят»
+	// нельзя, потому что Postpone пишет в ту же БД и, скорее всего, тоже
+	// упадёт, потеряв задание. Ошибка уходит консьюмеру: событие остаётся
+	// в pending и будет повторено (issue #53, ТЗ 4.3).
 	sender := &recordingSender{}
 	subs := store.NewMemory()
 	subs.Add(context.Background(), model.Subscription{ChatID: 10})
 	queue := &mockQueue{}
 	d := NewDispatcher(subs, newMockJournal(), &mockLimiter{err: errors.New("db down")}, queue, ModeLog, sender.send)
 
-	d.Handle(context.Background(), testEvent(1))
-
+	err := d.Handle(context.Background(), testEvent(1))
+	if err == nil {
+		t.Fatal("ошибка лимитера должна становиться ошибкой события (без XACK)")
+	}
 	if got := sender.sent(); len(got) != 0 {
 		t.Fatalf("sent = %v, want 0", got)
 	}
-	if len(queue.postponed) != 1 {
-		t.Fatalf("postponed = %+v, want одно задание в очереди", queue.postponed)
+	if len(queue.postponed) != 0 {
+		t.Fatalf("postponed = %+v, want пусто (Postpone в упавшую БД не вызывается)", queue.postponed)
+	}
+}
+
+func TestHandlePostponeErrorReturnsEventError(t *testing.T) {
+	// Ошибка Postpone — задание не записано: ни журнала, ни очереди,
+	// уведомление было бы потеряно после XACK. Ошибка уходит консьюмеру:
+	// событие остаётся в pending (issue #53, ТЗ 4.3).
+	sender := &recordingSender{}
+	subs := store.NewMemory()
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
+	queue := &mockQueue{postponeErr: errors.New("db down")}
+	d := NewDispatcher(subs, newMockJournal(), &mockLimiter{allowed: false}, queue, ModeLog, sender.send)
+
+	err := d.Handle(context.Background(), testEvent(1))
+	if err == nil {
+		t.Fatal("ошибка Postpone должна становиться ошибкой события (без XACK)")
+	}
+	if got := sender.sent(); len(got) != 0 {
+		t.Fatalf("sent = %v, want 0", got)
 	}
 }
 
@@ -398,9 +421,11 @@ func TestFlushPopErrorNoPanic(t *testing.T) {
 	}
 }
 
-func TestHandleSentErrorStillDelivers(t *testing.T) {
-	// Журнал недоступен (Sent падает): Dispatcher не паникует, доставка
-	// продолжается — at-least-once допускает повтор (contracts.md §2).
+func TestHandleSentErrorAbortsDelivery(t *testing.T) {
+	// Журнал дедупа недоступен (Sent падает): доставку не начинаем —
+	// без проверки Sent она могла бы задвоиться (ФТ-3.5), а пропуск
+	// получателя потерял бы уведомление после XACK. Ошибка уходит
+	// консьюмеру: событие остаётся в pending (issue #53, ТЗ 4.3).
 	sender := &recordingSender{}
 	subs := store.NewMemory()
 	journal := newMockJournal()
@@ -408,16 +433,21 @@ func TestHandleSentErrorStillDelivers(t *testing.T) {
 	d := NewDispatcher(subs, journal, &mockLimiter{allowed: true}, NewMemoryQueue(), ModeLog, sender.send)
 	subs.Add(context.Background(), model.Subscription{ChatID: 10})
 
-	d.Handle(context.Background(), testEvent(1))
-
-	if got := sender.sent(); len(got) != 1 {
-		t.Fatalf("sent = %v, want 1 (ошибка журнала не отменяет доставку)", got)
+	err := d.Handle(context.Background(), testEvent(1))
+	if err == nil {
+		t.Fatal("ошибка journal.Sent должна становиться ошибкой события (без XACK)")
+	}
+	if got := sender.sent(); len(got) != 0 {
+		t.Fatalf("sent = %v, want 0 (доставка без дедупа не начинается)", got)
 	}
 }
 
-func TestHandleRecordErrorNoPanic(t *testing.T) {
+func TestHandleRecordErrorDoesNotFailEvent(t *testing.T) {
 	// Record падает (БД недоступна) после успешной отправки: Dispatcher
-	// логирует и продолжает, повтор — только при следующей публикации.
+	// логирует и НЕ возвращает ошибку события — возврат ошибки заставил бы
+	// консьюмер повторить событие, а Sent-проверка не отсекла бы повторную
+	// отправку (записи в журнале нет): автоповтор unknown запрещён
+	// (ФТ-3.5, ТЗ 4.3, contracts.md §2). Решение issue #53.
 	sender := &recordingSender{}
 	subs := store.NewMemory()
 	journal := newMockJournal()
@@ -425,7 +455,9 @@ func TestHandleRecordErrorNoPanic(t *testing.T) {
 	d := NewDispatcher(subs, journal, &mockLimiter{allowed: true}, NewMemoryQueue(), ModeLog, sender.send)
 	subs.Add(context.Background(), model.Subscription{ChatID: 10})
 
-	d.Handle(context.Background(), testEvent(1))
+	if err := d.Handle(context.Background(), testEvent(1)); err != nil {
+		t.Fatalf("ошибка Record после отправки не должна становиться ошибкой события: %v", err)
+	}
 	d.Flush(context.Background())
 
 	if got := sender.sent(); len(got) != 1 {
@@ -472,8 +504,8 @@ func (f *failingStore) All(context.Context) ([]model.Subscription, error) {
 func TestHandleStoreErrorNoDelivery(t *testing.T) {
 	// Хранилище подписок недоступно: ошибку All нельзя трактовать как
 	// «получателей нет» — доставка не выполняется вовсе (sender не вызван,
-	// в очередь отложенных ничего не попадает). До условного XACK (issue #53)
-	// событие при этом теряется из стрима — см. Handle.
+	// в очередь отложенных ничего не попадает). Ошибка возвращается
+	// консьюмеру: событие остаётся в pending до XAUTOCLAIM (issue #53).
 	mem := store.NewMemory()
 	mem.Add(context.Background(), model.Subscription{ChatID: 10})
 	sender := &recordingSender{}
@@ -481,8 +513,10 @@ func TestHandleStoreErrorNoDelivery(t *testing.T) {
 	d := NewDispatcher(&failingStore{Store: mem, err: errors.New("db down")},
 		newMockJournal(), &mockLimiter{allowed: true}, queue, ModeLog, sender.send)
 
-	d.Handle(context.Background(), testEvent(1))
-
+	err := d.Handle(context.Background(), testEvent(1))
+	if err == nil {
+		t.Fatal("ошибка subs.All должна становиться ошибкой события (без XACK)")
+	}
 	if got := sender.sent(); len(got) != 0 {
 		t.Fatalf("sent = %v, want 0 (ошибка хранилища отменяет доставку)", got)
 	}
@@ -713,7 +747,6 @@ func TestFlushRateLimitedRetries(t *testing.T) {
 		t.Fatalf("marks = %v, want [10:1=retry]", queue.marks)
 	}
 	if n := journal.records["unknown/telegram"]; n != 0 {
-		t.Fatalf("unknown/telegram = %d, want 0", n)
 		t.Fatalf("unknown/telegram = %d, want 0", n)
 	}
 }
