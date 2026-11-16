@@ -25,12 +25,13 @@ const (
 	// DeadStream — стрим для некорректных payload'ов.
 	DeadStream = "listings.dead"
 
-	workerCount = 8                // пул воркеров, ТЗ 3.6
-	minIdle     = 30 * time.Second // pending старше этого срока забирает XAUTOCLAIM
-	claimEvery  = 15 * time.Second // период обхода pending
-	readBlock   = 5 * time.Second  // блокирующее чтение XREADGROUP
-	readCount   = int64(16)        // сообщений за одно чтение
-	retryDelay  = 3 * time.Second  // пауза при ошибке Redis
+	workerCount      = 8                // пул воркеров, ТЗ 3.6 (дефолт NOTIFIER_WORKERS)
+	lenWarnThreshold = int64(10000)     // мягкий порог WARN длины стрима (дефолт NOTIFIER_STREAM_LEN_THRESHOLD)
+	minIdle          = 30 * time.Second // pending старше этого срока забирает XAUTOCLAIM
+	claimEvery       = 15 * time.Second // период обхода pending
+	readBlock        = 5 * time.Second  // блокирующее чтение XREADGROUP
+	readCount        = int64(16)        // сообщений за одно чтение
+	retryDelay       = 3 * time.Second  // пауза при ошибке Redis
 )
 
 // Handler обрабатывает одно событие. Обработка фиксирует доставку
@@ -50,19 +51,32 @@ type Redis interface {
 	XInfoGroups(ctx context.Context, stream string) *redis.XInfoGroupsCmd
 	XRange(ctx context.Context, stream, start, stop string) *redis.XMessageSliceCmd
 	XDel(ctx context.Context, stream string, ids ...string) *redis.IntCmd
+	XLen(ctx context.Context, stream string) *redis.IntCmd
 }
 
 // Consumer читает стрим группой notifier: цикл XREADGROUP раздаёт записи
 // пулу воркеров, фоновый XAUTOCLAIM забирает зависшие pending-записи.
+// Число воркеров и мягкий порог WARN длины стрима настраиваются из main
+// (NOTIFIER_WORKERS, NOTIFIER_STREAM_LEN_THRESHOLD; ТЗ 3.6), дефолты —
+// константы workerCount и lenWarnThreshold.
 type Consumer struct {
-	rdb    Redis
-	name   string
-	handle Handler
+	rdb     Redis
+	name    string
+	handle  Handler
+	workers int
+	lenWarn int64 // мягкий порог: длина стрима больше него — WARN, не фатально
 }
 
-func NewConsumer(rdb Redis, consumerName string, handle Handler) *Consumer {
-	return &Consumer{rdb: rdb, name: consumerName, handle: handle}
+// NewConsumer создаёт консьюмер: workers — размер пула воркеров, lenWarn —
+// порог WARN длины стрима.
+func NewConsumer(rdb Redis, consumerName string, workers int, lenWarn int64, handle Handler) *Consumer {
+	return &Consumer{rdb: rdb, name: consumerName, handle: handle, workers: workers, lenWarn: lenWarn}
 }
+
+// DefaultWorkers и DefaultLenWarnThreshold — дефолты по ТЗ 3.6 для параметров,
+// читаемых из окружения в main.
+func DefaultWorkers() int            { return workerCount }
+func DefaultLenWarnThreshold() int64 { return lenWarnThreshold }
 
 // ConsumerName делает имя consumer'а уникальным для экземпляра (contracts.md §2).
 func ConsumerName() string {
@@ -85,7 +99,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 	jobs := make(chan redis.XMessage, readCount)
 
 	var wg sync.WaitGroup
-	for i := 0; i < workerCount; i++ {
+	for i := 0; i < c.workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -158,6 +172,15 @@ func (c *Consumer) claimLoop(ctx context.Context, jobs chan<- redis.XMessage) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+		}
+		// Мягкий порог длины стрима (ТЗ 3.6, порог настраивается): рост
+		// длины — симптом отставания группы от публикации (события копятся
+		// непрочитанными). Это WARN-телеметрия: доставку не прерывает и
+		// обрезку не запускает — до безопасной границы стрим не режется.
+		if l, err := c.rdb.XLen(context.WithoutCancel(ctx), StreamName).Result(); err != nil {
+			log.Printf("xlen: %v", err)
+		} else if l > c.lenWarn {
+			log.Printf("WARN: stream %s length %d exceeds threshold %d — consumer may be lagging", StreamName, l, c.lenWarn)
 		}
 		cursor := "0-0"
 		for {

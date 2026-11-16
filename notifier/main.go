@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -29,11 +30,13 @@ import (
 	"notifier/internal/telegram"
 )
 
-// Параметры доставки (ТЗ 3.6 и contracts.md §2).
+// Параметры доставки (ТЗ 3.6 и contracts.md §2). Численные параметры
+// (лимит 30/час, воркеры, порог WARN, период очистки) читаются из
+// окружения с дефолтами по ТЗ — см. envPositiveInt/envPositiveDuration.
 const (
-	notificationsPerHour = 30
-	flushInterval        = 30 * time.Second
-	debugBodyLimit       = 1 << 20 // 1 МБ на демо-событие
+	defaultNotificationsPerHour = 30
+	flushInterval               = 30 * time.Second
+	debugBodyLimit              = 1 << 20 // 1 МБ на демо-событие
 )
 
 // Тайминги health-проверок: у каждой проверки свой дедлайн, сбор результатов
@@ -48,6 +51,27 @@ const (
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Численные параметры (ТЗ 3.6 «настраиваются»): дефолты совпадают со
+	// значениями ТЗ, мусорные значения — fail-fast до поднятия компонентов.
+	perHour, err := envPositiveInt("NOTIFIER_NOTIFICATIONS_PER_HOUR", defaultNotificationsPerHour)
+	if err != nil {
+		log.Fatal(err)
+	}
+	workers, err := envPositiveInt("NOTIFIER_WORKERS", stream.DefaultWorkers())
+	if err != nil {
+		log.Fatal(err)
+	}
+	lenWarn, err := envPositiveInt64("NOTIFIER_STREAM_LEN_THRESHOLD", stream.DefaultLenWarnThreshold())
+	if err != nil {
+		log.Fatal(err)
+	}
+	cleanupEvery, err := envPositiveDuration("NOTIFIER_STREAM_CLEANUP_INTERVAL", stream.DefaultCleanupInterval())
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("config: notifications/hour=%d, workers=%d, stream len warn threshold=%d, stream cleanup interval=%s",
+		perHour, workers, lenWarn, cleanupEvery)
 
 	// Пул БД создаётся первым и передаётся компонентам по мере перевода
 	// хранилищ на Postgres (issue #31, этап 2).
@@ -75,7 +99,7 @@ func main() {
 
 	dictsClient := dicts.New(env("CORE_API_URL", "http://localhost:8000"))
 
-	subs, journal, limiter, queue := buildStores(pool)
+	subs, journal, limiter, queue := buildStores(pool, perHour)
 
 	// /stop чистит отложенные задания чата (ТЗ 4.2), если очередь реализует
 	// ChatCleaner (MemoryQueue и PgQueue реализуют); боту передаётся
@@ -114,7 +138,7 @@ func main() {
 	consumerErr := make(chan error, 1)
 	go func() {
 		defer close(consumerDone)
-		if err := stream.NewConsumer(redisClient, stream.ConsumerName(), dispatcher.Handle).Run(ctx); err != nil && ctx.Err() == nil {
+		if err := stream.NewConsumer(redisClient, stream.ConsumerName(), workers, lenWarn, dispatcher.Handle).Run(ctx); err != nil && ctx.Err() == nil {
 			// Ошибка шлётся в main только если ctx ещё жив: при штатной
 			// остановке (SIGTERM) Run завершается «context canceled» — это
 			// не фатальный сбой, и ложный exit 1 портить не нужно.
@@ -125,10 +149,6 @@ func main() {
 	// Безопасная очистка стрима (ТЗ 4.3 «Хранение»): удаляет только
 	// подтверждённые записи за границей min-pending. Ошибки прохода
 	// не фатальны — без очистки стрим просто не режется.
-	cleanupEvery, err := envPositiveDuration("NOTIFIER_STREAM_CLEANUP_INTERVAL", stream.DefaultCleanupInterval())
-	if err != nil {
-		log.Fatal(err)
-	}
 	go stream.NewReaper(redisClient, cleanupEvery).Run(ctx)
 
 	srv := &http.Server{
@@ -177,10 +197,12 @@ func main() {
 // buildStores — точка wiring хранилищ: db-режим (pool != nil) обязан
 // использовать Pg-стек (подписки и users — ФТ-3.1, ФТ-3.2; журнал, лимит
 // 30/час и очередь отложенных — ФТ-3.5, ТЗ 3.6), memory-режим — in-memory
-// реализации. Класс бага #51: wiring в main разъезжается с ветками db/memory,
-// и db-режим молча работает in-memory — уехало на e2e-прогоне. Вынесено из
-// main, чтобы обе ветки wiring проверялись тестами напрямую.
-func buildStores(pool *pgxpool.Pool) (
+// реализации. perHour — лимит уведомлений за скользящий час, читаемый
+// из NOTIFIER_NOTIFICATIONS_PER_HOUR. Класс бага #51: wiring в main
+// разъезжается с ветками db/memory, и db-режим молча работает in-memory —
+// уехало на e2e-прогоне. Вынесено из main, чтобы обе ветки wiring
+// проверялись тестами напрямую.
+func buildStores(pool *pgxpool.Pool, perHour int) (
 	subs store.Store,
 	journal notify.Journal,
 	limiter notify.Limiter,
@@ -189,12 +211,12 @@ func buildStores(pool *pgxpool.Pool) (
 	if pool != nil {
 		return store.NewPostgres(pool),
 			notify.NewPgJournal(pool),
-			notify.NewPgLimiter(pool, notificationsPerHour),
+			notify.NewPgLimiter(pool, perHour),
 			notify.NewPgQueue(pool)
 	}
 	return store.NewMemory(),
 		notify.NewMemoryJournal(),
-		notify.NewMemoryLimiter(notificationsPerHour, time.Hour),
+		notify.NewMemoryLimiter(perHour, time.Hour),
 		notify.NewMemoryQueue()
 }
 
@@ -448,6 +470,31 @@ func envPositiveDuration(key string, fallback time.Duration) (time.Duration, err
 	v, err := time.ParseDuration(raw)
 	if err != nil {
 		return 0, fmt.Errorf("%s: %q — не длительность (пример: 5m, 30s)", key, raw)
+	}
+	if v <= 0 {
+		return 0, fmt.Errorf("%s: %q должно быть положительным", key, raw)
+	}
+	return v, nil
+}
+
+// envPositiveInt — чтение положительного целого из окружения с дефолтом;
+// мусорное значение — ошибка старта (fail-fast), как и у длительностей выше.
+func envPositiveInt(key string, fallback int) (int, error) {
+	v64, err := envPositiveInt64(key, int64(fallback))
+	if err != nil {
+		return 0, err
+	}
+	return int(v64), nil
+}
+
+func envPositiveInt64(key string, fallback int64) (int64, error) {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return fallback, nil
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %q — не целое число", key, raw)
 	}
 	if v <= 0 {
 		return 0, fmt.Errorf("%s: %q должно быть положительным", key, raw)

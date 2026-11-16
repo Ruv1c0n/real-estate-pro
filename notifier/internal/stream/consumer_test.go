@@ -31,10 +31,10 @@ type fakeRedis struct {
 	xaddErr   error
 	readCalls int
 
-	streamIDs      []string // содержимое стрима, отсортировано по ID
-	pendingIDs     []string // PEL группы (в работе / не подтверждены)
-	lastDelivered  string   // last-delivered-id группы
-	deleted        []string // записи, удалённые XDel
+	streamIDs     []string // содержимое стрима, отсортировано по ID
+	pendingIDs    []string // PEL группы (в работе / не подтверждены)
+	lastDelivered string   // last-delivered-id группы
+	deleted       []string // записи, удалённые XDel
 }
 
 func (f *fakeRedis) XGroupCreateMkStream(ctx context.Context, stream, group, start string) *redis.StatusCmd {
@@ -164,6 +164,15 @@ func (f *fakeRedis) XDel(ctx context.Context, stream string, ids ...string) *red
 	return cmd
 }
 
+// XLen — длина стрима двойника (используется проверкой мягкого порога WARN).
+func (f *fakeRedis) XLen(ctx context.Context, stream string) *redis.IntCmd {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cmd := redis.NewIntCmd(ctx)
+	cmd.SetVal(int64(len(f.streamIDs)))
+	return cmd
+}
+
 // inRange проверяет, что id попадает в диапазон XRANGE: "-" — с начала,
 // "+" — до конца; префикс "(" задаёт исключающую границу (Redis 6.2+).
 // Сравнение — как пар (мс, seq), лексикография строк потока не годится.
@@ -200,7 +209,7 @@ func runConsumer(t *testing.T, rdb *fakeRedis, handle Handler, ready func() bool
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- NewConsumer(rdb, "test-1", handle).Run(ctx) }()
+	go func() { done <- NewConsumer(rdb, "test-1", 2, lenWarnThreshold, handle).Run(ctx) }()
 
 	deadline := time.Now().Add(3 * time.Second)
 	for !ready() && time.Now().Before(deadline) {
