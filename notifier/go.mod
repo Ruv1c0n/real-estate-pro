@@ -3,7 +3,7 @@ module notifier
 go 1.26.0
 
 require (
-	github.com/jackc/pgx/v5 v5.12.0
+	github.com/jackc/pgx/v5 v5.13.0
 	github.com/redis/go-redis/v9 v9.23.0
 )
 
