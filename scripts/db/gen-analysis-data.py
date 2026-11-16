@@ -170,7 +170,6 @@ async def main() -> None:
             else None
         )
         source = rng.choice(("mock", "avito"))
-        published = None if rng.random() < 0.12 else rng.random()
         ext_id = f"gen-{args.seed}-{i:06d}"
         rows.append(
             {
