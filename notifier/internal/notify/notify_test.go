@@ -10,6 +10,7 @@ import (
 
 	"notifier/internal/model"
 	"notifier/internal/store"
+	"notifier/internal/telegram"
 )
 
 const testUUID = "550e8400-e29b-41d4-a716-446655440000"
@@ -110,6 +111,37 @@ func TestHandleDeferWhenLimitReached(t *testing.T) {
 	}
 }
 
+func TestHandleRepublishedDeferredDeliveredOnce(t *testing.T) {
+	// Отложенное по лимиту событие публикуется повторно до доставки
+	// (ТЗ 4.3, at-least-once): журнал дубль не отсечёт (доставка ещё не
+	// была), поэтому дедуп должен давать сама очередь — иначе Flush
+	// доставит объявление дважды (ФТ-3.5, паритет с db-режимом).
+	base := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	d, sender, subs, limiter, _ := newTestDispatcher(2)
+	limiter.nowFunc = func() time.Time { return base }
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
+
+	d.Handle(context.Background(), testEvent(1))
+	d.Handle(context.Background(), testEvent(2))
+	deferred := testEvent(3)
+	d.Handle(context.Background(), deferred) // сверх лимита — в очередь
+	d.Handle(context.Background(), deferred) // повторная публикация до доставки
+
+	if got := sender.sent(); len(got) != 2 {
+		t.Fatalf("sent = %v, want 2 немедленных", got)
+	}
+
+	// Окно освобождается — освобождённых слотов хватает на обе копии,
+	// так что без дедупа дубль уехал бы в этой же доставке.
+	limiter.nowFunc = func() time.Time { return base.Add(61 * time.Minute) }
+	d.Flush(context.Background())
+
+	got := sender.sent()
+	if len(got) != 3 || got[2] != "10:3" {
+		t.Fatalf("sent = %v, want 3 доставки: повторная публикация отложенного не дублирует", got)
+	}
+}
+
 func TestHandleDifferentChatsHaveOwnLimits(t *testing.T) {
 	d, sender, subs, _, _ := newTestDispatcher(1)
 	subs.Add(context.Background(), model.Subscription{ChatID: 10})
@@ -170,6 +202,36 @@ func TestMemoryJournalTTL(t *testing.T) {
 	j.nowFunc = func() time.Time { return base.Add(25 * time.Hour) }
 	if sent, _ := j.Sent(context.Background(), 1, 10); sent {
 		t.Fatal("после TTL запись удаляется")
+	}
+}
+
+func TestMemoryQueuePostponeDeduplicates(t *testing.T) {
+	// Повторное Postpone той же пары (чат, объявление) не создаёт дубль —
+	// паритет с UNIQUE (chat_id, listing_id) db-режима (PgQueue, ON CONFLICT).
+	q := NewMemoryQueue()
+	ctx := context.Background()
+	e := testEvent(1)
+
+	if err := q.Postpone(ctx, 10, e, ModeLog); err != nil {
+		t.Fatalf("Postpone: %v", err)
+	}
+	if err := q.Postpone(ctx, 10, e, ModeLog); err != nil {
+		t.Fatalf("повторное Postpone: %v", err)
+	}
+	// Тот же листинг другому чату и другой листинг тому же чату — не дубли.
+	if err := q.Postpone(ctx, 20, e, ModeLog); err != nil {
+		t.Fatalf("Postpone другому чату: %v", err)
+	}
+	if err := q.Postpone(ctx, 10, testEvent(2), ModeLog); err != nil {
+		t.Fatalf("Postpone другого листинга: %v", err)
+	}
+
+	jobs, err := q.PopBatch(ctx, 10)
+	if err != nil {
+		t.Fatalf("PopBatch: %v", err)
+	}
+	if len(jobs) != 3 {
+		t.Fatalf("заданий в очереди = %d, want 3 (дубль 10:1 не добавлен)", len(jobs))
 	}
 }
 
@@ -429,6 +491,95 @@ func TestHandleStoreErrorNoDelivery(t *testing.T) {
 	}
 }
 
+// slowSender — отправитель, который «работает» дольше пер-получательского
+// бюджета и уважает контекст (как реальный HTTP-вызов Telegram).
+type slowSender struct {
+	delay time.Duration
+
+	mu    sync.Mutex
+	calls []string
+}
+
+func (s *slowSender) send(ctx context.Context, chatID int64, e model.Event) error {
+	s.mu.Lock()
+	s.calls = append(s.calls, fmt.Sprintf("%d:%d", chatID, e.ID))
+	s.mu.Unlock()
+	select {
+	case <-time.After(s.delay):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *slowSender) sent() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.calls...)
+}
+
+func TestHandlePerRecipientBudgetKeepsAllRecipients(t *testing.T) {
+	// 20 получателей, каждая отправка дольше пер-получательского бюджета:
+	// бюджет одного получателя не должен ограничивать остальных. Все 20
+	// обрабатываются и фиксируются в журнале — никто не теряется по бюджету.
+	// Раньше общий бюджет события (5 с) кончался на середине списка: у хвоста
+	// отменялись Allow/Postpone, и после XACK уведомления терялись молча.
+	subs := store.NewMemory()
+	for i := int64(1); i <= 20; i++ {
+		subs.Add(context.Background(), model.Subscription{ChatID: i})
+	}
+	journal := newMockJournal()
+	slow := &slowSender{delay: 100 * time.Millisecond}
+	d := NewDispatcher(subs, journal, NewMemoryLimiter(1000, time.Hour), NewMemoryQueue(), ModeLog, slow.send)
+	d.perRecipient = 50 * time.Millisecond
+
+	start := time.Now()
+	d.Handle(context.Background(), testEvent(1))
+	elapsed := time.Since(start)
+
+	// Каждый получатель обработан в своём бюджете: отправка срезана дедлайном
+	// (50 мс < 100 мс) и зафиксирована как unknown — ни один не пропущен.
+	if n := journal.records["unknown/log"]; n != 20 {
+		t.Fatalf("unknown/log = %d, want 20 (каждый получатель получил свой бюджет)", n)
+	}
+	if n := journal.records["sent/log"]; n != 0 {
+		t.Fatalf("sent/log = %d, want 0", n)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("Handle занял %s, want ~20 × 50 мс (дедлайн срезает каждый вызов)", elapsed)
+	}
+}
+
+// hangingSender — отправитель, зависающий на одном чате до отмены контекста:
+// имитация зависшего HTTP-вызова, который сам не завершается.
+type hangingSender struct {
+	hangChat int64
+
+	mu    sync.Mutex
+	calls []string
+}
+
+func (s *hangingSender) send(ctx context.Context, chatID int64, e model.Event) error {
+	s.mu.Lock()
+	s.calls = append(s.calls, fmt.Sprintf("%d:%d", chatID, e.ID))
+	s.mu.Unlock()
+	if chatID == s.hangChat {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second): // страховка: без пер-получательского бюджета тест упадёт по времени
+			return errors.New("sender: hang budget exceeded")
+		}
+	}
+	return nil
+}
+
+func (s *hangingSender) sent() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.calls...)
+}
+
 // blockingSender — отправитель, «зависающий» в отправке, чтобы смоделировать
 // конкурентную доставку того же задания другим путём.
 type blockingSender struct {
@@ -456,6 +607,115 @@ func (s *blockingSender) sent() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string(nil), s.calls...)
+}
+
+func TestHandleRecipientTimeoutDoesNotAffectOthers(t *testing.T) {
+	// Зависший отправитель первого чата срезается его пер-получательским
+	// бюджетом (unknown), второй чат получает свой полный бюджет и
+	// доставляется — таймаут одного получателя не валит остальных.
+	subs := store.NewMemory()
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
+	subs.Add(context.Background(), model.Subscription{ChatID: 20})
+	journal := newMockJournal()
+	hanging := &hangingSender{hangChat: 10}
+	d := NewDispatcher(subs, journal, NewMemoryLimiter(1000, time.Hour), NewMemoryQueue(), ModeLog, hanging.send)
+	d.perRecipient = 50 * time.Millisecond
+
+	start := time.Now()
+	d.Handle(context.Background(), testEvent(1))
+	elapsed := time.Since(start)
+
+	if n := journal.records["unknown/log"]; n != 1 {
+		t.Fatalf("unknown/log = %d, want 1 (зависший чат срезан бюджетом)", n)
+	}
+	if n := journal.records["sent/log"]; n != 1 {
+		t.Fatalf("sent/log = %d, want 1 (второй чат доставлен после таймаута первого)", n)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("Handle занял %s, want <2с (пер-получательский дедлайн срезает зависшего)", elapsed)
+	}
+}
+
+func TestHandleRateLimitedReturnsToQueue(t *testing.T) {
+	// 429 — явный отказ Telegram (ТЗ 4.3), а не неопределённый исход:
+	// терминального unknown в журнале быть не должно, уведомление
+	// возвращается в очередь отложенных и будет повторено флешером.
+	sender := &recordingSender{}
+	sender.mu.Lock()
+	sender.err = fmt.Errorf("telegram sendMessage: %w", &telegram.RateLimitError{RetryAfter: 3 * time.Second})
+	sender.mu.Unlock()
+	subs := store.NewMemory()
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
+	journal := newMockJournal()
+	queue := &mockQueue{}
+	d := NewDispatcher(subs, journal, &mockLimiter{allowed: true}, queue, ModeLog, sender.send)
+
+	d.Handle(context.Background(), testEvent(1))
+
+	if got := sender.sent(); len(got) != 1 {
+		t.Fatalf("send вызовов = %v, want 1", got)
+	}
+	if n := journal.records["unknown/log"]; n != 0 {
+		t.Fatalf("unknown/log = %d, want 0 (429 — не терминальный исход)", n)
+	}
+	if n := journal.records["sent/log"]; n != 0 {
+		t.Fatalf("sent/log = %d, want 0", n)
+	}
+	if len(queue.postponed) != 1 || queue.postponed[0].ChatID != 10 || queue.postponed[0].Event.ID != 1 {
+		t.Fatalf("postponed = %+v, want задание 10:1 в очереди отложенных", queue.postponed)
+	}
+}
+
+func TestHandleRateLimitedSentinelWithoutWrapper(t *testing.T) {
+	// Сырая дозорная telegram.ErrRateLimited без обёртки с паузой
+	// распознаётся так же: задание откладывается, unknown не пишется.
+	sender := &recordingSender{}
+	sender.mu.Lock()
+	sender.err = telegram.ErrRateLimited
+	sender.mu.Unlock()
+	subs := store.NewMemory()
+	subs.Add(context.Background(), model.Subscription{ChatID: 10})
+	journal := newMockJournal()
+	queue := &mockQueue{}
+	d := NewDispatcher(subs, journal, &mockLimiter{allowed: true}, queue, ModeLog, sender.send)
+
+	d.Handle(context.Background(), testEvent(1))
+
+	if n := journal.records["unknown/log"]; n != 0 {
+		t.Fatalf("unknown/log = %d, want 0", n)
+	}
+	if len(queue.postponed) != 1 {
+		t.Fatalf("postponed = %+v, want одно задание в очереди", queue.postponed)
+	}
+}
+
+func TestFlushRateLimitedRetries(t *testing.T) {
+	// 429 при доставке отложенного задания возвращает его в очередь (retry):
+	// терминальный unknown прервал бы цепочку повторов (ТЗ 4.3).
+	e := testEvent(1)
+	queue := &mockQueue{popResult: []DeferredJob{{ChatID: 10, Event: e}}}
+	journal := newMockJournal()
+	sender := &recordingSender{}
+	sender.mu.Lock()
+	// RetryAfter крошечный: Flush выдерживает паузу Retry-After, не надо
+	// делать тест пяти­секундным (потолок паузы проверяется отдельно).
+	sender.err = &telegram.RateLimitError{RetryAfter: 10 * time.Millisecond}
+	sender.mu.Unlock()
+	subs := store.NewMemory()
+	d := NewDispatcher(subs, journal, &mockLimiter{allowed: true}, queue, ModeTelegram, sender.send)
+
+	d.Flush(context.Background())
+
+	if got := sender.sent(); len(got) != 1 {
+		t.Fatalf("send вызовов = %v, want 1", got)
+	}
+	if len(queue.marks) != 1 || queue.marks[0] != "10:1=retry" {
+		t.Fatalf("marks = %v, want [10:1=retry]", queue.marks)
+	}
+	if n := journal.records["unknown/telegram"]; n != 0 {
+		t.Fatalf("unknown/telegram = %d, want 0", n)
+		t.Fatalf("unknown/telegram = %d, want 0", n)
+	}
 }
 
 func queueLen(q *MemoryQueue) int {
@@ -595,5 +855,64 @@ func TestChatLockSerializesAllow(t *testing.T) {
 	}
 	if got := sender.sent(); len(got) != 2 {
 		t.Fatalf("sent = %v, want 2 (оба события доставлены)", got)
+	}
+}
+
+// TestMemoryQueuePostponeInflightVisible — повторная публикация события,
+// пока задание «в полёте» (PopBatch без Mark), не создаёт вторую копию:
+// окно PopBatch→Mark невидимо для скана очереди (находка гейт-ревью R8).
+func TestMemoryQueuePostponeInflightVisible(t *testing.T) {
+	q := NewMemoryQueue()
+	ctx := context.Background()
+	e := testEvent(10)
+	if err := q.Postpone(ctx, 100, e, ModeLog); err != nil {
+		t.Fatalf("postpone: %v", err)
+	}
+	jobs, err := q.PopBatch(ctx, 5)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("popbatch: %v, %d заданий", err, len(jobs))
+	}
+	if err := q.Postpone(ctx, 100, e, ModeLog); err != nil {
+		t.Fatalf("postpone inflight: %v", err)
+	}
+	if err := q.Mark(ctx, jobs[0], ModeLog, StatusSent); err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+	if err := q.Postpone(ctx, 100, e, ModeLog); err != nil {
+		t.Fatalf("postpone после mark: %v", err)
+	}
+	jobs, err = q.PopBatch(ctx, 5)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("popbatch после mark: %v, %d заданий", err, len(jobs))
+	}
+}
+
+// TestFlushSkipsAlreadySent — ТЗ 4.3 «Уже записанное состояние sent не
+// отправляется повторно»: задание лежит в очереди, событие уже доставлено
+// другим путём — Flush не отправляет второй раз и закрывает задание как sent.
+func TestFlushSkipsAlreadySent(t *testing.T) {
+	subs := store.NewMemory()
+	if _, err := subs.Add(context.Background(), model.Subscription{ChatID: 100}); err != nil {
+		t.Fatalf("add subscription: %v", err)
+	}
+	j := NewMemoryJournal()
+	q := NewMemoryQueue()
+	l := NewMemoryLimiter(30, time.Hour)
+	sender := &recordingSender{}
+	d := NewDispatcher(subs, j, l, q, ModeLog, sender.send)
+	ctx := context.Background()
+
+	e := testEvent(10)
+	if err := q.Postpone(ctx, 100, e, ModeLog); err != nil {
+		t.Fatalf("postpone: %v", err)
+	}
+	// Событие уже доставлено другим путём (повтор публикации, гонка воркеров).
+	if err := j.Record(ctx, 100, e.ID, e.EventID, e, StatusSent, ModeLog); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+
+	d.Flush(ctx)
+	if got := sender.sent(); len(got) != 0 {
+		t.Fatalf("sent = %v, want пусто — повторная доставка уже sent-события", got)
 	}
 }

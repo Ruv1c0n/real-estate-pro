@@ -1,8 +1,12 @@
-// Тесты сборки DSN из окружения. Табличный тест dsnFromEnv: пустое
-// окружение, частичная конфигурация (ошибка вместо дефолтов app/app —
-// ревью PR #54), passthrough DATABASE_URL, экранирование спецсимволов
-// quoteValue, sslmode из POSTGRES_SSLMODE и дефолт disable.
-// Тесты не требуют БД — матрица проверяется в CI.
+// Тесты сборки DSN из окружения (карточка R7). Табличный тест dsnFromEnv:
+// пустое окружение, частичная конфигурация — ошибка вместо дефолтов app/app
+// (ревью PR #54), passthrough DATABASE_URL и его приоритет над POSTGRES_*,
+// экранирование спецсимволов quoteValue, sslmode из POSTGRES_SSLMODE и
+// дефолт disable. Тесты не требуют БД — матрица проверяется в CI.
+//
+// Известный пробел матрицы: sslmode=require фактически не проверяется —
+// для него нужен TLS-стенд; здесь проверяется только попадание значения
+// в DSN.
 package db
 
 import (
@@ -47,7 +51,12 @@ func TestDsnFromEnv(t *testing.T) {
 			wantSub: "sslmode=disable",
 		},
 		{
-			name: "полная конфигурация — значения без дефолтов",
+			name:    "задана только POSTGRES_DB — ошибка, не дефолты app/app",
+			env:     map[string]string{"POSTGRES_DB": "realestatetest"},
+			wantErr: true,
+		},
+		{
+			name: "все POSTGRES_* заданы — значения без дефолтов и без кавычек",
 			env: map[string]string{
 				"POSTGRES_HOST":     "db",
 				"POSTGRES_PORT":     "6543",
@@ -59,29 +68,18 @@ func TestDsnFromEnv(t *testing.T) {
 			want: "host=db port=6543 user=notifier password=secret dbname=notifier sslmode=require",
 		},
 		{
-			name:    "задана только POSTGRES_DB — ошибка, не дефолты app/app",
-			env:     map[string]string{"POSTGRES_DB": "realestate"},
-			wantErr: true,
-		},
-		{
-			name:    "задан только POSTGRES_HOST — ошибка",
-			env:     map[string]string{"POSTGRES_HOST": "db"},
-			wantErr: true,
-		},
-		{
-			name:    "user без password — ошибка",
-			env:     map[string]string{"POSTGRES_USER": "u", "POSTGRES_HOST": "db"},
-			wantErr: true,
-		},
-		{
-			name:    "password без user — ошибка",
-			env:     map[string]string{"POSTGRES_PASSWORD": "p", "POSTGRES_DB": "realestate"},
-			wantErr: true,
-		},
-		{
 			name: "DATABASE_URL задан — passthrough как есть, части не разбираются",
 			env:  map[string]string{"DATABASE_URL": "postgres://u:p@db:5432/x?sslmode=require"},
 			want: "postgres://u:p@db:5432/x?sslmode=require",
+		},
+		{
+			// Ревью PR #60 (P2): DATABASE_URL побеждает POSTGRES_* молча.
+			// Поведение осознанное (legacy-переменная с main), тест фиксирует
+			// его документированно: POSTGRES_* при заданном DATABASE_URL
+			// игнорируются целиком, включая sslmode.
+			name: "DATABASE_URL побеждает POSTGRES_SSLMODE",
+			env:  map[string]string{"DATABASE_URL": "postgres://u:p@db:5432/x", "POSTGRES_SSLMODE": "require"},
+			want: "postgres://u:p@db:5432/x",
 		},
 		{
 			name: "DATABASE_URL пуст, POSTGRES_* нет — БД не сконфигурирована",

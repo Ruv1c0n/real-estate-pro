@@ -69,6 +69,7 @@ Once the skeleton is up:
 
 - `http://localhost:8000` and `http://localhost:8001` — temporary HTTP servers; the real applications are not implemented yet.
 - `http://localhost:8080/health` — notifier health check: Redis and Core API reference data availability, delivery mode (telegram/log).
+- `http://localhost:8080/health/ready` — readiness check: 200 only when Redis, Core API reference data and, in db mode, PostgreSQL are available; otherwise 503 with the same JSON body.
 - `POST http://localhost:8080/debug/event` with the `X-Admin-Key` header — a demo event: the body is validated and published to the `listings.new` stream, going through the regular delivery path. If `ADMIN_KEY` is not set, the endpoint responds with 404.
 
 Logs and shutdown:
@@ -82,12 +83,17 @@ docker compose down
 
 ## Target configuration (per the spec)
 
-`.env.example`, Redis volume/AOF/noeviction and notifier readiness checks have been added. What remains are migrations for the `notifier` schema (SQL migrations are prepared by Ilya), after which subscriptions, the journal and deferred jobs move from in-process memory to PostgreSQL. With `.env` filled in, startup is a single `docker compose up --build`.
+`.env.example`, Redis volume/AOF/noeviction and notifier readiness checks have been added. Notifier stage 2 is in place: the embedded runner applies SQL migration `0001` of the `notifier` schema (prepared by Ilya) automatically at startup, and subscriptions, the notification journal, the 30-per-hour limit counters and deferred jobs are stored in PostgreSQL. If neither `DATABASE_URL` nor the `POSTGRES_*` variables are set, notifier runs in memory mode (fallback: subscriptions survive only until restart); if the variables are set but PostgreSQL is unreachable at startup, the service exits with a fatal error (fail-fast).
+
+How to tell the modes apart: at startup in memory mode notifier logs `DB disabled: running in memory mode`, and the `db` field in the `GET /health` and `GET /health/ready` response bodies reflects the PostgreSQL pool. `db: false` with no pool (`nil`) is memory mode, not an outage, and does not degrade readiness.
+
+With `.env` filled in, startup is a single `docker compose up --build`.
 
 | Setting | Purpose / value |
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Without a token — log mode; implemented in notifier |
-| `DATABASE_URL` | PostgreSQL address; different permissions per service schema |
+| `POSTGRES_*` | PostgreSQL address in parts (`HOST`, `PORT`, `USER`, `PASSWORD`, `DB`); this is how notifier and core-api receive it in Compose |
+| `DATABASE_URL` | For local Core API only (`postgresql+asyncpg`); notifier checks it first — before `POSTGRES_*` — as a legacy DSN. Only pgx-parseable formats work: the `+asyncpg` value from `.env.example` fails a local notifier startup |
 | `REDIS_URL` | Redis address; currently set in Compose |
 | `CORE_API_URL` | Core API address for collector and notifier reference data |
 | `MOCK_MODE` | `true` by default; still needs to be wired into collector configuration |
@@ -112,6 +118,7 @@ Default parameters: cache TTL 600 s, collection every 15 minutes, up to five del
 | `GET /collect/runs/{run_id}` | Batch collection status |
 | `POST /debug/event` | Validation and adding a test event to Streams |
 | `GET /health` | Service and dependency health |
+| `GET /health/ready` | Readiness: 200 only when Redis, reference data and (in db mode) PostgreSQL are available; otherwise 503 with the same body |
 
 Collector's utility routes and `/debug/*` are protected by `X-Admin-Key`. Core API serves OpenAPI at `/docs`.
 
