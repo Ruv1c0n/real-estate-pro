@@ -2,6 +2,12 @@
 
 [English](README.md) | [Русский](README.ru.md)
 
+![CI](https://github.com/Ruv1c0n/real-estate-pro/actions/workflows/ci.yml/badge.svg)
+![python-ci](https://github.com/Ruv1c0n/real-estate-pro/actions/workflows/python-ci.yml/badge.svg)
+![migrations](https://github.com/Ruv1c0n/real-estate-pro/actions/workflows/migrations.yml/badge.svg)
+![docs-links](https://github.com/Ruv1c0n/real-estate-pro/actions/workflows/docs-links.yml/badge.svg)
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+
 Учебный командный проект (4 человека): микросервисный агрегатор объявлений об аренде и продаже квартир с поиском и Telegram-уведомлениями.
 
 Моя часть: нотификатор на Go (Telegram Bot API, Redis Streams), Telegram-бот, совместный запуск сервисов.
@@ -20,6 +26,18 @@
 
 ## Поток данных
 
+```mermaid
+flowchart LR
+    S[Источник / mock] --> C[Collector]
+    C -- POST /api/v1/listings --> A[Core API]
+    A <--> DB[(PostgreSQL<br/>listings + outbox)]
+    A -- XADD listings.new --> R[(Redis Streams)]
+    A --> CACHE[Кэш]
+    R --> NT[Notifier]
+    NT <--> NDB[(PostgreSQL<br/>журнал + очередь)]
+    NT --> TG[Telegram]
+```
+
 1. Адаптер преобразует ответ источника во внутренний `RawListing`. Mock-адаптер читает тот же внутренний формат из локального дампа.
 2. Collector нормализует данные и вызывает `POST /api/v1/listings`.
 3. Core API одной транзакцией сохраняет объявление и outbox-задание. Повторная отправка возвращает существующую запись.
@@ -35,7 +53,7 @@ Collector и notifier не обращаются к схеме `core` напря�
 
 Реальный адаптер реализуется по конкретному документированному методу API Авито с необходимыми правами и авторизацией. Доступ к глобальному поиску, тариф или способ передачи учётных данных не предполагаются без проверки документации метода. Без реквизитов адаптер проверяется на фикстурах; это не заменяет проверку на реальном API. Демонстрация не требует покупки аккаунта.
 
-Дамп содержит минимум 500 синтетических объявлений для 5 стран и 10 городов. Он хранит внутренний `RawListing`; образцы внешнего ответа API используются отдельно для тестов адаптера. Многострановые mock-данные не выдаются за ответ Авито.
+Дамп содержит минимум 500 синтетических объявлений для 5 стран и 10 городов. Он хранит внутренний `RawListing`; образцы внешнего ответа API используются отдельно для тестов адаптера. Mock-данные для нескольких стран не выдаются за ответ Авито.
 
 Два режима mock:
 
@@ -84,7 +102,7 @@ docker compose down
 
 ## Целевая конфигурация по ТЗ
 
-Добавлены `.env.example`, Redis volume/AOF/noeviction и проверки готовности notifier. Этап 2 notifier реализован: встроенный раннер автоматически применяет при старте SQL-миграцию `0001` схемы `notifier` (готовит Илья), а подписки, журнал уведомлений, счётчики лимита 30/час и отложенные задания хранятся в PostgreSQL. Если не заданы ни `DATABASE_URL`, ни переменные `POSTGRES_*`, notifier работает в memory-режиме (fallback: подписки живут до рестарта); если переменные заданы, но PostgreSQL недоступен на старте, сервис завершается фатальной ошибкой (fail-fast).
+Добавлены `.env.example`, Redis volume/AOF/noeviction и проверки готовности notifier. Этап 2 notifier реализован: встроенный раннер автоматически применяет при старте SQL-миграции схемы `notifier` из `notifier/migrations/` (готовит Илья; сейчас `0001`, `0002`), а подписки, журнал уведомлений, счётчики лимита 30/час и отложенные задания хранятся в PostgreSQL. Если не заданы ни `DATABASE_URL`, ни переменные `POSTGRES_*`, notifier работает в memory-режиме (fallback: подписки живут до рестарта); если переменные заданы, но PostgreSQL недоступен на старте, сервис завершается фатальной ошибкой (fail-fast).
 
 Как понять режим: при старте в memory-режиме notifier пишет в лог `DB disabled: running in memory mode`, а поле `db` в телах `GET /health` и `GET /health/ready` отражает наличие пула PostgreSQL. `db: false` при отсутствии пула (`nil`) — это memory-режим, а не авария, и readiness он не понижает.
 
@@ -194,6 +212,12 @@ docker compose down
 - [Real_Estate_Pro_TZ.pdf](docs/Real_Estate_Pro_TZ.pdf) — ТЗ (требования пронумерованы: ФТ-x.x функциональные, НФТ-x нефункциональные).
 - [docs/contracts.md](docs/contracts.md) — актуальные контракты между сервисами (Redis Streams, справочники, outbox). При расхождении с этим README приоритет у contracts.md.
 - [Contributing](CONTRIBUTING.ru.md) — правила веток и коммитов, CI и требования ТЗ к изменению контрактов.
+
+### Архитектура и диаграммы (GitHub Pages)
+
+- [Диаграмма архитектуры](https://ruv1c0n.github.io/real-estate-pro/architecture.html) — сервисы, порты, потоки данных; пунктирные рёбра — контракты, заявленные, но ещё не реализованные.
+- [Trail-граф](https://ruv1c0n.github.io/real-estate-pro/trail-graph.html) — интерактивный граф разработки репозитория: issues, PR, коммиты, сообщества.
+- [Graphify-граф](https://ruv1c0n.github.io/real-estate-pro/graph.html) — граф зависимости страниц/сборок, пересобирается в CI.
 
 ## Лицензия
 
