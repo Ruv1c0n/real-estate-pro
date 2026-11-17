@@ -192,6 +192,7 @@ docker compose down
 - [Real_Estate_Pro_TZ.pdf](docs/Real_Estate_Pro_TZ.pdf) — ТЗ (требования пронумерованы: ФТ-x.x функциональные, НФТ-x нефункциональные).
 - [docs/contracts.md](docs/contracts.md) — актуальные контракты между сервисами (Redis Streams, справочники, outbox). При расхождении с этим README приоритет у contracts.md.
 - [Contributing](CONTRIBUTING.ru.md) — правила веток и коммитов, CI и требования ТЗ к изменению контрактов.
+- Доки сервисов: [notifier](notifier/README.md), [core-api](core-api/README.md), [collector](collector/README.md).
 
 ## Лицензия
 
