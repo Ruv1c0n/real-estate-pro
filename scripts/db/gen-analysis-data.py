@@ -48,7 +48,7 @@ CITIES = [
 ]
 # Демонстрационные курсы из seed (миграция 0001, ТЗ 3.2)
 RATES = {
-    "USD": Decimal("1"),
+    "USD": Decimal(1),
     "BYN": Decimal("0.31"),
     "RUB": Decimal("0.011"),
     "PLN": Decimal("0.25"),
@@ -147,10 +147,10 @@ async def main() -> None:
             base_price_usd = max(150, base_price_usd // 3)
         currency = rng.choice(currencies)
         price = (Decimal(base_price_usd) / RATES[currency]).quantize(
-            Decimal("1"), rounding=ROUND_HALF_UP
+            Decimal(1), rounding=ROUND_HALF_UP
         )
         price_usd = (price * RATES[currency]).quantize(
-            Decimal("1"), rounding=ROUND_HALF_UP
+            Decimal(1), rounding=ROUND_HALF_UP
         )
         floor = rng.randint(1, 16) if rng.random() > 0.1 else None
         address = (
