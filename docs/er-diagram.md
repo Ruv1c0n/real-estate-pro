@@ -86,6 +86,14 @@ erDiagram
 
 Примечания:
 
+- **Составные уникальности**: Mermaid не умеет составные UK, поэтому пометки
+  `UK` на колонках читаются с оговоркой (ревью PR #86):
+  - `listings.external_id` уникален только **внутри источника** — составной
+    `UNIQUE (source_id, external_id)`, не глобально;
+  - `cities.name` уникален только **внутри страны** — составной
+    `UNIQUE (country_code, name)`, не глобально;
+  - `cities.id` в паре с `country_code` (`UNIQUE (id, country_code)`) —
+    цель составного FK, не самостоятельное ограничение.
 - **Составной FK** `listings (city_id, country_code) → cities (id, country_code)`
   гарантирует на уровне БД, что выбранный город принадлежит указанной стране
   (ревью PR #66); у `cities` для этого есть `UNIQUE (id, country_code)`.
