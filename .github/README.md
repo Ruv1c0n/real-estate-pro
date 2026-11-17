@@ -9,8 +9,8 @@ CI/CD репозитория: GitHub Actions, гварды ссылок, шаб�
 | [ci.yml](workflows/ci.yml) | notifier: `gofmt`, `go vet`, `go test` + джоба `notifier-pg-tests` (postgres/redis services, интеграционные Pg-тесты с `-race -p 1`); сборка docker-образов; gitleaks |
 | [python-ci.yml](workflows/python-ci.yml) | `ruff` и `pytest` для core-api и collector (ruff гоняется из корня — конфиг один на репо) |
 | [migrations.yml](workflows/migrations.yml) | Накат SQL-миграций notifier с нуля на чистой PostgreSQL; авто-job Alembic для схемы `core` активируется сама при появлении `alembic.ini` |
-| [docs-links.yml](docs-links.yml) | Все относительные ссылки в markdown ведут на существующие файлы (якоря `#section` сознательно не проверяются) |
-| [graphify-pages.yml](graphify-pages.yml) | Пересборка графа knowledge-graph и публикация GitHub Pages |
+| [docs-links.yml](workflows/docs-links.yml) | Все относительные ссылки в markdown ведут на существующие файлы (якоря `#section` сознательно не проверяются) |
+| [graphify-pages.yml](workflows/graphify-pages.yml) | Пересборка графа knowledge-graph и публикация GitHub Pages |
 
 ## Скрипты и конфиги
 
