@@ -23,7 +23,12 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # URL подставляем программно — alembic.ini хранится без секретов.
-config.set_main_option("sqlalchemy.url", settings.database_url)
+# Знаки % экранируются (%%): set_main_option хранит значение через
+# configparser, который при чтении секции интерполирует %XX как токены —
+# пароль с percent-encoding (например, '@' -> %40) уронил бы миграции
+# ещё до их запуска (ревью Даниила, PR #81; та же история, что и с
+# паролями в POSTGRES_* на #39).
+config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
 
 target_metadata = None
 
