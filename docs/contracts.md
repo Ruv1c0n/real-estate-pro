@@ -1,3 +1,16 @@
+# Контракты между сервисами
+
+Обновлено: 2026-10-29 (PR #24), раздел 4 — mock-avito (PR #63). При расхождении с README приоритет у этого документа.
+
+Содержание:
+
+- [Общие соглашения](#общие-соглашения)
+- [Поток данных](#поток-данных)
+- [1. POST /api/v1/listings (Collector → Core API)](#1-post-apiv1listings-collector--core-api)
+- [2. Событие listings.new (Core API → Redis Streams → Notifier)](#2-событие-listingsnew-core-api--redis-streams--notifier)
+- [3. Справочники, чтение и mock](#3-справочники-чтение-и-mock)
+- [4. Mock-источник mock-avito (Collector → mock-avito)](#4-mock-источник-mock-avito-collector--mock-avito)
+
 ## Общие соглашения
 
 | Тема | Решение |
