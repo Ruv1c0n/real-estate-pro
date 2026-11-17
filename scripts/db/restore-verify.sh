@@ -62,8 +62,10 @@ if [ "$READY" -ne 1 ]; then
 fi
 
 echo "Восстановление дампа..."
+# --exit-on-error: частично битый дамп сразу FAIL с сырой ошибкой pg_restore,
+# а не «восстановилось всё, кроме куска» (ревью Даниила, PR #83)
 docker exec -i "$CONTAINER" pg_restore -U "$PG_USER" -d "$PG_DB" \
-    --no-owner --no-privileges < "$DUMP_FILE"
+    --exit-on-error --no-owner --no-privileges < "$DUMP_FILE"
 
 # Пересчёт строк в восстановленной копии — тот же двухшаговый запрос,
 # что и в backup.sh, поэтому сверяются одинаковые множества таблиц
