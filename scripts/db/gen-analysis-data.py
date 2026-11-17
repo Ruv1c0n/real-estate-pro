@@ -198,9 +198,12 @@ async def main() -> None:
             }
         )
 
-    # Дубли: копия существующего объявления под другим source/external_id
+    # Дубли: копия существующего объявления под другим source/external_id;
+    # партнёром пары всегда её оригинал — content_hash у обоих совпадает
+    # (ревью Даниила: случайный партнёр мог не совпадать по хэшу)
     for j in range(n_dup):
-        src = dict(rng.choice(rows))
+        parent = dict(rng.choice(rows))
+        src = dict(parent)
         src["external_id"] = f"gen-{args.seed}-dup{j:05d}"
         src["source_id"] = sources["avito" if rng.random() < 0.5 else "mock"]
         src["url_hash"] = hashlib.sha256(
@@ -208,7 +211,7 @@ async def main() -> None:
         ).hexdigest()
         src["url"] = f"https://example.com/dup/{j}"
         dup_pairs.append(
-            (rng.choice(rows)["external_id"], src["external_id"], src["content_hash"])
+            (parent["external_id"], src["external_id"], parent["content_hash"])
         )
         rows.append(src)
 
@@ -245,11 +248,14 @@ async def main() -> None:
     )
 
     # outbox: объявление + задание в одной транзакции (ТЗ 4.3); 30% заданий
-    # оставляем unpublished — имитация очереди фоновой публикации
+    # оставляем unpublished — имитация очереди фоновой публикации.
+    # event_id колонки и payload.event_id — один и тот же UUID:
+    # «устойчивый ID задания» по ФТ-2.5, notifier парсит payload
     outbox = []
     for r in rng.sample(rows, k=max(1, int(len(rows) * 0.6))):
+        event_id = uuid.uuid4()
         payload = {
-            "event_id": str(uuid.uuid4()),
+            "event_id": str(event_id),
             "id": id_by_ext[r["external_id"]],
             "source": "mock",
             "deal_type": r["deal_type"],
@@ -265,7 +271,7 @@ async def main() -> None:
         }
         outbox.append(
             (
-                uuid.uuid4(),
+                event_id,
                 "listing_new",
                 json.dumps(payload, ensure_ascii=False),
                 id_by_ext[r["external_id"]],
