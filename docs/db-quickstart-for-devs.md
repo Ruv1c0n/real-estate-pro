@@ -2,9 +2,11 @@
 
 Для Тимура (модели SQLAlchemy, запросы) и Димы (дамп, UI): как поднять базу,
 как её читать и писать, какие правила зашиты в схеме. Автор схемы: Илья.
-Полные источники: [core-schema-draft.md](core-schema-draft.md) (решения ревью),
-[er-diagram.md](er-diagram.md) (картинка), [query-analysis.md](query-analysis.md)
-(индексы и планы), [db-backup-restore.md](db-backup-restore.md) (бэкапы).
+Полные источники: `docs/core-schema-draft.md` (решения ревью, в main),
+`docs/er-diagram.md` (картинка, PR #86), `docs/query-analysis.md` (индексы
+и планы, PR #84), `docs/db-backup-restore.md` (бэкапы, PR #83) — соседние
+документы приезжают в main вместе со своими PR, поэтому здесь они даны
+путями, без ссылок (линтер ссылок гоняется на merge-состоянии одного PR).
 
 ## Подъём базы
 
@@ -123,7 +125,7 @@ SELECT has_schema_privilege('notifier', 'core', 'USAGE');            -- false
 - `alembic_version` лежит в `public` — служебная, не удалять и не переносить.
 - `pg_restore --clean` сносит гранты вместе со схемой: после него обязателен
   цикл `alembic downgrade 0001 && alembic upgrade head` — см.
-  [db-backup-restore.md](db-backup-restore.md).
+  `docs/db-backup-restore.md` (PR #83).
 - Вставка города/страны из кода — нарушение ТЗ 3.7; расширение справочников —
   новая миграция.
 - `price_usd`/`rooms`/`area_m2`/`price` защищены CHECK'ами (`> 0`, `rooms >= 0`,
