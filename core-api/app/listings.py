@@ -1,10 +1,13 @@
+from decimal import Decimal
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request, Response, status
-from pydantic import BaseModel
+import simplejson
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from pydantic import BaseModel, WithJsonSchema
 
+from app.listing_filters import ListingFilters
 from app.listing_models import ListingCreate
-from app.listing_store import ListingStore
+from app.listing_store import ListingStore, StoredListing
 
 router = APIRouter(prefix="/api/v1/listings", tags=["listings"])
 
@@ -12,6 +15,31 @@ router = APIRouter(prefix="/api/v1/listings", tags=["listings"])
 class ListingCreateResponse(BaseModel):
     id: int
     created: bool
+
+
+JsonDecimal = Annotated[
+    Decimal,
+    WithJsonSchema({"type": "number"}, mode="serialization"),
+]
+
+
+class ListingDetail(StoredListing):
+    price: JsonDecimal
+    area_m2: JsonDecimal | None = None
+
+
+class ListingPage(BaseModel):
+    items: list[ListingDetail]
+    total: int
+    page: int
+    size: int
+
+
+def _listing_data(listing: StoredListing) -> dict[str, object]:
+    data = listing.model_dump(mode="json", exclude={"price", "area_m2"})
+    data["price"] = listing.price
+    data["area_m2"] = listing.area_m2
+    return data
 
 
 async def get_listing_store(request: Request) -> ListingStore:
@@ -54,3 +82,45 @@ async def create_listing(
         response.status_code = status.HTTP_200_OK
 
     return ListingCreateResponse(id=result.listing.id, created=result.created)
+
+
+@router.get(
+    "/{listing_id}",
+    response_model=ListingDetail,
+    responses={404: {"description": "Объявление не найдено"}},
+)
+async def get_listing(
+    listing_id: int,
+    store: Annotated[ListingStore, Depends(get_listing_store)],
+) -> Response:
+    listing = await store.get(listing_id)
+    if listing is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Объявление не найдено",
+        )
+
+    return Response(
+        content=simplejson.dumps(
+            _listing_data(listing), use_decimal=True, ensure_ascii=False
+        ),
+        media_type="application/json",
+    )
+
+
+@router.get("", response_model=ListingPage)
+async def list_listings(
+    filters: Annotated[ListingFilters, Query()],
+    store: Annotated[ListingStore, Depends(get_listing_store)],
+) -> Response:
+    result = await store.search(filters)
+    data = {
+        "items": [_listing_data(listing) for listing in result.items],
+        "total": result.total,
+        "page": filters.page,
+        "size": filters.size,
+    }
+    return Response(
+        content=simplejson.dumps(data, use_decimal=True, ensure_ascii=False),
+        media_type="application/json",
+    )
