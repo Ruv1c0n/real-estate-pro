@@ -2,11 +2,13 @@ import asyncio
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from operator import attrgetter
 from typing import Literal
 from uuid import UUID, uuid4
 
+from app.listing_filters import ListingFilters
 from app.listing_models import ListingCreate
-from app.listing_store import CreateListingResult, StoredListing
+from app.listing_store import CreateListingResult, ListingSearchResult, StoredListing
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,32 @@ def build_listing_event(listing: StoredListing) -> OutboxEvent:
             "created_at": listing.created_at.isoformat(),
         },
         created_at=listing.created_at,
+    )
+
+
+def _matches_filters(listing: StoredListing, filters: ListingFilters) -> bool:
+    if filters.deal_type is not None and listing.deal_type != filters.deal_type:
+        return False
+    if filters.country is not None and listing.country != filters.country:
+        return False
+    if filters.city is not None and listing.city != filters.city:
+        return False
+    if filters.source is not None and listing.source != filters.source:
+        return False
+    if filters.rooms is not None and listing.rooms != filters.rooms:
+        return False
+
+    if filters.price_min is not None and listing.price_usd < filters.price_min:
+        return False
+    if filters.price_max is not None and listing.price_usd > filters.price_max:
+        return False
+
+    area = listing.area_m2
+    if area is None:
+        return filters.area_min is None and filters.area_max is None
+
+    return (filters.area_min is None or area >= filters.area_min) and (
+        filters.area_max is None or area <= filters.area_max
     )
 
 
@@ -97,3 +125,28 @@ class InMemoryListingStore:
         """Вернуть независимую копию outbox для проверок."""
         async with self._lock:
             return deepcopy(self._outbox)
+
+    async def search(self, filters: ListingFilters) -> ListingSearchResult:
+        async with self._lock:
+            matches = [
+                listing
+                for listing in self._listings.values()
+                if _matches_filters(listing, filters)
+            ]
+
+            sort_field = (
+                "price_usd" if filters.sort.startswith("price_") else "created_at"
+            )
+            matches.sort(
+                key=attrgetter(sort_field, "id"),
+                reverse=filters.sort.endswith("_desc"),
+            )
+
+            total = len(matches)
+            start = (filters.page - 1) * filters.size
+            page_items = matches[start : start + filters.size]
+
+            return ListingSearchResult(
+                items=[listing.model_copy(deep=True) for listing in page_items],
+                total=total,
+            )
