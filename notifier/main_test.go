@@ -241,7 +241,7 @@ func TestHealthReadyRedisDown(t *testing.T) {
 // buildStores в memory-режиме (pool == nil): все четыре реализации — memory-*.
 // Полностью офлайн, живая БД не нужна.
 func TestBuildStoresMemoryMode(t *testing.T) {
-	subs, journal, limiter, queue := buildStores(nil)
+	subs, journal, limiter, queue := buildStores(nil, 30)
 
 	if _, ok := subs.(*store.Memory); !ok {
 		t.Fatalf("subs в memory-режиме: %T, ожидается *store.Memory", subs)
@@ -266,7 +266,7 @@ func TestBuildStoresDbModePgStack(t *testing.T) {
 	pool := testPool(t)
 	defer pool.Close()
 
-	subs, journal, limiter, queue := buildStores(pool)
+	subs, journal, limiter, queue := buildStores(pool, 30)
 
 	if _, ok := subs.(*store.Postgres); !ok {
 		t.Fatalf("subs в db-режиме: %T, ожидается *store.Postgres", subs)
@@ -279,5 +279,45 @@ func TestBuildStoresDbModePgStack(t *testing.T) {
 	}
 	if _, ok := queue.(*notify.PgQueue); !ok {
 		t.Fatalf("queue в db-режиме: %T, ожидается *notify.PgQueue", queue)
+	}
+}
+
+// Тесты env-параметров (ТЗ 3.6 «настраиваются»): дефолты, валидные значения,
+// fail-fast на мусор и неположительные числа.
+func TestEnvPositiveInt(t *testing.T) {
+	t.Setenv("NOTIFIER_X", "42")
+	if v, err := envPositiveInt("NOTIFIER_X", 30); err != nil || v != 42 {
+		t.Fatalf("envPositiveInt = %d, %v; want 42, nil", v, err)
+	}
+
+	if v, err := envPositiveInt("NOTIFIER_MISSING", 30); err != nil || v != 30 {
+		t.Fatalf("дефолт = %d, %v; want 30, nil", v, err)
+	}
+
+	t.Setenv("NOTIFIER_JUNK", "abc")
+	if _, err := envPositiveInt("NOTIFIER_JUNK", 30); err == nil {
+		t.Fatal("мусорное значение должно давать ошибку (fail-fast)")
+	}
+	t.Setenv("NOTIFIER_ZERO", "0")
+	if _, err := envPositiveInt("NOTIFIER_ZERO", 30); err == nil {
+		t.Fatal("0 должно давать ошибку (fail-fast)")
+	}
+	t.Setenv("NOTIFIER_NEG", "-3")
+	if _, err := envPositiveInt("NOTIFIER_NEG", 30); err == nil {
+		t.Fatal("отрицательное значение должно давать ошибку (fail-fast)")
+	}
+}
+
+func TestEnvPositiveDuration(t *testing.T) {
+	t.Setenv("NOTIFIER_T", "90s")
+	if v, err := envPositiveDuration("NOTIFIER_T", 5*time.Minute); err != nil || v != 90*time.Second {
+		t.Fatalf("envPositiveDuration = %s, %v; want 1m30s, nil", v, err)
+	}
+	if v, err := envPositiveDuration("NOTIFIER_MISSING", 5*time.Minute); err != nil || v != 5*time.Minute {
+		t.Fatalf("дефолт = %s, %v; want 5m, nil", v, err)
+	}
+	t.Setenv("NOTIFIER_JUNK", "five")
+	if _, err := envPositiveDuration("NOTIFIER_JUNK", 5*time.Minute); err == nil {
+		t.Fatal("мусорное значение должно давать ошибку (fail-fast)")
 	}
 }
