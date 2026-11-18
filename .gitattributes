@@ -28,3 +28,4 @@
 *.ico   binary
 *.pdf   binary
 *.zip   binary
+*.sh    text eol=lf
