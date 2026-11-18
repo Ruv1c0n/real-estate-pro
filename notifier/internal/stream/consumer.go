@@ -35,7 +35,12 @@ const (
 
 // Handler обрабатывает одно событие. Обработка фиксирует доставку
 // (журнал/отложенные задания), после чего консьюмер подтверждает запись.
-type Handler func(ctx context.Context, e model.Event)
+// Ошибка возвращается ТОЛЬКО при временной инфраструктурной сбое (Postgres,
+// Redis) — ТЗ 4.3 «Временные ошибки БД/Redis повторяются»: консьюмер не
+// выполняет XACK, запись остаётся в pending и повторяется через XAUTOCLAIM.
+// Ошибки, обработанные внутри (отказ Telegram 429/сеть, статус unknown
+// после отправки), ошибкой события не являются.
+type Handler func(ctx context.Context, e model.Event) error
 
 // Redis — операции go-redis, нужные консьюмеру; UniversalClient их удовлетворяет.
 type Redis interface {
@@ -215,11 +220,18 @@ func (c *Consumer) process(ctx context.Context, msg redis.XMessage) {
 	// получателей уходит в deferred-очередь (потери нет), продлевать владение
 	// не требуется. От зависшей обработки защиту даёт тот же eventBudget +
 	// XAUTOCLAIM; конкурентный повтор гасит дедуп по журналу (ФТ-3.5).
-	c.handle(ctx, event)
+	// Ошибка хендлера — временный инфраструктурный сбой (Postgres/Redis),
+	// ТЗ 4.3: подтверждать нельзя — запись остаётся в pending и будет
+	// подхвачена XAUTOCLAIM (minIdle 30 с; eventBudget 25 с меньше порога,
+	// поэтому живой воркер не перезабирается — см. notify.eventBudget).
+	if err := c.handle(ctx, event); err != nil {
+		log.Printf("handle %s (event %s): %v — не подтверждено, запись остаётся в pending", msg.ID, event.EventID, err)
+		return
+	}
 
-	// XACK — только после обработки; redis-операции не должны зависеть от
-	// отмены контекста обработки (в т.ч. при остановке сервиса), поэтому
-	// отдельный контекст.
+	// XACK — только после успешной обработки; redis-операции не должны
+	// зависеть от отмены контекста обработки (в т.ч. при остановке сервиса),
+	// поэтому отдельный контекст.
 	if err := c.rdb.XAck(context.WithoutCancel(ctx), StreamName, GroupName, msg.ID).Err(); err != nil {
 		// Не подтверждено: запись останется в pending, XAUTOCLAIM вернёт её.
 		log.Printf("xack %s: %v", msg.ID, err)
