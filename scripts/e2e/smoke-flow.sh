@@ -31,6 +31,14 @@ DEAL="${DEAL:-rent}"
 WAIT_SEC="${WAIT_SEC:-15}"
 POLL_STEP="${POLL_STEP:-0.2}"
 
+# Число опросов из бюджета ожидания и шага опроса (не хардкодим ×5 под 0.2).
+poll_count() { awk "BEGIN{printf \"%d\", $1 / $POLL_STEP}" 2>/dev/null || echo 0; }
+
+# Значения подписки попадают в SQL/JSON напрямую — кавычки запрещаем сразу.
+for _v in "$CITY" "$COUNTRY" "$DEAL"; do
+    case "$_v" in *"'"*|*'"'*|*';'*) echo "FAIL: CITY/COUNTRY/DEAL не должны содержать кавычек/точки с запятой: $_v"; exit 1;; esac
+done
+
 fails=0
 step() { printf '\n== %s\n' "$*"; }
 ok()   { printf '   OK: %s\n' "$*"; }
@@ -40,16 +48,19 @@ psql_q() { psql "$NOTIFIER_TEST_DSN" -v ON_ERROR_STOP=1 -qAt -c "$1"; }
 
 # listings.dead живёт в Redis, а не в БД; redis-cli берём из PATH или из
 # контейнера redis (если запущен compose-стенд).
-redis_xlen() {
+redis_cli() {
     if command -v redis-cli > /dev/null; then
-        redis-cli -u "${REDIS_URL:-redis://127.0.0.1:6379/0}" XLEN listings.dead 2>/dev/null
+        redis-cli -u "${REDIS_URL:-redis://127.0.0.1:6379/0}" "$@"
     else
-        docker compose exec -T redis redis-cli XLEN listings.dead 2>/dev/null
+        docker compose exec -T redis redis-cli "$@"
     fi
 }
 
+redis_xlen() { redis_cli XLEN listings.dead 2>/dev/null; }
+
 wait_sent() { # $1 = listing_id; печатает sent_at или пусто
-    local i end=$(( WAIT_SEC * 5 )) sid
+    local i end sid
+    end=$(poll_count "$WAIT_SEC")
     for ((i=0; i<end; i++)); do
         sid=$(psql_q "SELECT to_char(sent_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
                       FROM notifier.notifications_log
@@ -104,18 +115,32 @@ dead_before=${dead_before:-0}
 bad_payload='{"event_id":"not-a-uuid","id":-1}'
 http=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$NOTIFIER_BASE_URL/debug/event" \
     -H "X-Admin-Key: $ADMIN_KEY" -H 'Content-Type: application/json' -d "$bad_payload")
-# /debug/event может отклонить мусор сам (422) — тогда до стрима не доходит,
-# это тоже корректно; проверяем оба варианта.
-if [ "$http" = "202" ]; then
-    sleep 2
-    dead_after=$(redis_xlen || echo 0)
-    dead_after=${dead_after:-0}
-    [ "$dead_after" -gt "$dead_before" ] && ok "listings.dead вырос: $dead_before → $dead_after" \
-        || bad "202 принят, но listings.dead не вырос ($dead_before → $dead_after)"
-elif [ "$http" = "422" ] || [ "$http" = "400" ]; then
+# /debug/event сам валидирует payload тем же ParseEvent и отдаёт 422 — мусор
+# до стрима не доходит, dead-letter через него недостижим. Поэтому битое
+# событие кладём в стрим напрямую: consumer забракует его и уйдёт в
+# listings.dead (ТЗ 4.3). POST-проверку оставляем как smoke-гейт валидации.
+if [ "$http" = "422" ] || [ "$http" = "400" ]; then
     ok "битый payload отклонён самим /debug/event: $http"
+elif [ "$http" = "202" ]; then
+    ok "/debug/event принял невалидный payload (мягче, чем ожидали)"
 else
     bad "неожиданный ответ на битый payload: $http"
+fi
+# Прямой XADD мусора в стрим → consumer должен уйти в listings.dead.
+garbage='{"event_id":"not-a-uuid","id":-1}'
+if redis_cli XADD listings.new '*' data "$garbage" > /dev/null 2>&1; then
+    i=0; end=$(poll_count "$WAIT_SEC")
+    dead_after="$dead_before"
+    while [ "$i" -lt "$end" ]; do
+        dead_after=$(redis_xlen || echo 0)
+        dead_after=${dead_after:-0}
+        [ "$dead_after" -gt "$dead_before" ] && break
+        sleep "$POLL_STEP"; i=$((i+1))
+    done
+    [ "$dead_after" -gt "$dead_before" ] && ok "listings.dead вырос: $dead_before → $dead_after" \
+        || bad "listings.dead не вырос за ${WAIT_SEC}s ($dead_before → $dead_after)"
+else
+    bad "не удалось XADD мусор в listings.new (redis недоступен?)"
 fi
 
 step "S2.5 Без X-Admin-Key → отказ (НФТ-3)"
