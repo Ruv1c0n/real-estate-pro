@@ -48,9 +48,10 @@ func TestPgQueuePopBatchOldestFirst(t *testing.T) {
 	for _, id := range []int64{1, 2, 3} {
 		mustPostpone(t, q, 100, id)
 	}
-	// created_at ставится БД; для детерминизма задаём порядок явно.
+	// available_at ставится БД (DEFAULT now(), миграция 0002); для
+	// детерминизма задаём порядок явно.
 	if _, err := testPool.Exec(ctx,
-		`UPDATE notifier.notifications_log SET created_at = now() - (interval '1 minute' * listing_id)`); err != nil {
+		`UPDATE notifier.notifications_log SET available_at = now() - (interval '1 minute' * listing_id)`); err != nil {
 		t.Fatalf("backdate: %v", err)
 	}
 
@@ -61,7 +62,7 @@ func TestPgQueuePopBatchOldestFirst(t *testing.T) {
 	if len(jobs) != 2 {
 		t.Fatalf("len(jobs) = %d, want 2", len(jobs))
 	}
-	// Самые старые первыми: 3 (минус 3 минуты), затем 2.
+	// Самые старые доступные первыми: 3 (минус 3 минуты), затем 2.
 	if jobs[0].Event.ID != 3 || jobs[1].Event.ID != 2 {
 		t.Errorf("порядок = [%d %d], want [3 2]", jobs[0].Event.ID, jobs[1].Event.ID)
 	}
@@ -74,6 +75,44 @@ func TestPgQueuePopBatchOldestFirst(t *testing.T) {
 	}
 	// Транзакция PopBatch не закрыта Mark-ом — откатываем, чтобы TRUNCATE
 	// следующего теста не ждал блокировку.
+	q.rollbackTx(ctx)
+}
+
+// TestPgQueuePopBatchOrdersByAvailableAt — миграция 0002: PopBatch выбирает
+// только строки с available_at <= now() в порядке available_at, поэтому
+// deferred-строка с available_at в будущем не возвращается, даже если она
+// старее остальных.
+func TestPgQueuePopBatchOrdersByAvailableAt(t *testing.T) {
+	resetTestDB(t)
+	mustAddUser(t, 100)
+	q := NewPgQueue(testPool)
+	ctx := context.Background()
+
+	for _, id := range []int64{1, 2, 3} {
+		mustPostpone(t, q, 100, id)
+	}
+	// id 1 — самая ранняя доступность, id 2 — позже, id 3 — ещё не доступно
+	// (backoff в будущем, как после Mark(retry)).
+	if _, err := testPool.Exec(ctx,
+		`UPDATE notifier.notifications_log SET available_at = now() - interval '2 minutes' WHERE listing_id = 1`); err != nil {
+		t.Fatalf("backdate 1: %v", err)
+	}
+	if _, err := testPool.Exec(ctx,
+		`UPDATE notifier.notifications_log SET available_at = now() - interval '1 minute' WHERE listing_id = 2`); err != nil {
+		t.Fatalf("backdate 2: %v", err)
+	}
+	if _, err := testPool.Exec(ctx,
+		`UPDATE notifier.notifications_log SET available_at = now() + interval '1 hour' WHERE listing_id = 3`); err != nil {
+		t.Fatalf("future 3: %v", err)
+	}
+
+	jobs, err := q.PopBatch(ctx, 10)
+	if err != nil {
+		t.Fatalf("PopBatch: %v", err)
+	}
+	if len(jobs) != 2 || jobs[0].Event.ID != 1 || jobs[1].Event.ID != 2 {
+		t.Fatalf("PopBatch = %+v, want [1 2] (3 ещё не доступен)", jobs)
+	}
 	q.rollbackTx(ctx)
 }
 
@@ -116,6 +155,67 @@ func TestPgQueuePopBatchSkipLocked(t *testing.T) {
 	q2.rollbackTx(ctx)
 }
 
+// TestPgQueueMarkRetryMovesAvailableAt — миграция 0002_available_at: Mark(retry)
+// не отбрасывает задание (ТЗ 3.6), а сдвигает его available_at вперёд на
+// retryBackoff — строка вернётся в выборку PopBatch, когда backoff истечёт,
+// а не следующим проходом флешера («тугая петля»).
+func TestPgQueueMarkRetryMovesAvailableAt(t *testing.T) {
+	resetTestDB(t)
+	mustAddUser(t, 100)
+	q := NewPgQueue(testPool)
+	ctx := context.Background()
+
+	mustPostpone(t, q, 100, 1)
+
+	jobs, err := q.PopBatch(ctx, 5)
+	if err != nil {
+		t.Fatalf("PopBatch: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("len(jobs) = %d, want 1", len(jobs))
+	}
+	if err := q.Mark(ctx, jobs[0], ModeLog, StatusRetry); err != nil {
+		t.Fatalf("Mark(retry): %v", err)
+	}
+
+	var availableAt time.Time
+	if err := testPool.QueryRow(ctx,
+		"SELECT available_at FROM notifier.notifications_log WHERE chat_id = 100 AND listing_id = 1").
+		Scan(&availableAt); err != nil {
+		t.Fatalf("select available_at: %v", err)
+	}
+	// available_at = now() + retryBackoff (взято в Mark); допуск — на
+	// расхождение часов Go и Postgres.
+	want := time.Now().Add(retryBackoff)
+	delta := 5 * time.Second
+	if availableAt.Before(want.Add(-delta)) || availableAt.After(want.Add(delta)) {
+		t.Errorf("available_at = %v, want ~%v (+/-%v)", availableAt, want, delta)
+	}
+
+	// Пока backoff не истёк, PopBatch задание не возвращает.
+	empty, err := q.PopBatch(ctx, 5)
+	if err != nil {
+		t.Fatalf("PopBatch (в backoff): %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("PopBatch во время backoff = %+v, want пусто", empty)
+	}
+
+	// Backoff истёк (сдвигаем available_at в прошлое) — задание вернулось.
+	if _, err := testPool.Exec(ctx,
+		`UPDATE notifier.notifications_log SET available_at = now() - interval '1 second' WHERE chat_id = 100 AND listing_id = 1`); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+	jobs, err = q.PopBatch(ctx, 5)
+	if err != nil {
+		t.Fatalf("повторный PopBatch: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].Event.ID != 1 {
+		t.Fatalf("после истечения backoff PopBatch = %+v, want то же задание", jobs)
+	}
+	q.rollbackTx(ctx)
+}
+
 func TestPgQueueMarkRetryKeepsJob(t *testing.T) {
 	resetTestDB(t)
 	mustAddUser(t, 100)
@@ -135,7 +235,13 @@ func TestPgQueueMarkRetryKeepsJob(t *testing.T) {
 		t.Fatalf("Mark(retry): %v", err)
 	}
 
-	// retry — задание остаётся в очереди (статус не менялся).
+	// retry — задание остаётся в очереди (статус не менялся, ТЗ 3.6: отложенные
+	// не отбрасываются). available_at ушёл вперёд на retryBackoff — возвращаем
+	// в прошлое, имитируя истёкший backoff.
+	if _, err := testPool.Exec(ctx,
+		`UPDATE notifier.notifications_log SET available_at = now() - interval '1 second' WHERE chat_id = 100 AND listing_id = 1`); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
 	jobs, err = q.PopBatch(ctx, 5)
 	if err != nil {
 		t.Fatalf("повторный PopBatch: %v", err)
@@ -335,5 +441,44 @@ func TestPgThirtyPerHourScenario(t *testing.T) {
 	}
 	if status != "sent" {
 		t.Errorf("после флеша status = %q, want sent", status)
+	}
+}
+
+// TestPgQueueDropChatJobs — ТЗ 4.2 «/stop удаляет и отложенные задания»:
+// DELETE deferred-строк чата, идемпотентно; deferred-строки других чатов
+// и уже отправленные записи журнала остаются.
+func TestPgQueueDropChatJobs(t *testing.T) {
+	resetTestDB(t)
+	mustAddUser(t, 100)
+	mustAddUser(t, 200)
+	q := NewPgQueue(testPool)
+	mustPostpone(t, q, 100, 1)
+	mustPostpone(t, q, 100, 2)
+	mustPostpone(t, q, 200, 3)
+	ctx := context.Background()
+
+	if err := q.DropChatJobs(ctx, 100); err != nil {
+		t.Fatalf("DropChatJobs: %v", err)
+	}
+
+	var n int
+	if err := testPool.QueryRow(ctx,
+		"SELECT count(*) FROM notifier.notifications_log WHERE chat_id = 100 AND status = 'deferred'").Scan(&n); err != nil {
+		t.Fatalf("count chat 100: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("после drop deferred-строк чата 100 = %d, want 0", n)
+	}
+	if err := testPool.QueryRow(ctx,
+		"SELECT count(*) FROM notifier.notifications_log WHERE chat_id = 200 AND status = 'deferred'").Scan(&n); err != nil {
+		t.Fatalf("count chat 200: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("deferred-строки чата 200 = %d, want 1", n)
+	}
+
+	// Идемпотентность: повторный drop без строк — тоже успех.
+	if err := q.DropChatJobs(ctx, 100); err != nil {
+		t.Fatalf("повторный DropChatJobs: %v", err)
 	}
 }
