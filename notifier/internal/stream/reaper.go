@@ -110,10 +110,26 @@ func (r *Reaper) boundary(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("xinfo groups: %w", err)
 	}
+	var lastDelivered string
 	for _, g := range groups {
 		if g.Name == GroupName && g.LastDeliveredID != "" && g.LastDeliveredID != "0-0" {
-			return g.LastDeliveredID, nil
+			lastDelivered = g.LastDeliveredID
+			break
 		}
 	}
-	return "", nil
+	if lastDelivered == "" {
+		return "", nil
+	}
+	// Гонка с диспетчером: между XPENDING выше и XInfoGroups он мог прочитать
+	// новую пачку — last-delivered уехал вперёд записей, которые уже лежат в
+	// pending. Перепроверяем pending: появился — границей служит его
+	// минимальный ID (те же соображения, что и в первой ветке выше).
+	p2, err := r.rdb.XPending(ctx, StreamName, GroupName).Result()
+	if err != nil {
+		return "", fmt.Errorf("xpending recheck: %w", err)
+	}
+	if p2.Count > 0 && p2.Lower != "" {
+		return p2.Lower, nil
+	}
+	return lastDelivered, nil
 }

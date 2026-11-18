@@ -35,6 +35,10 @@ type fakeRedis struct {
 	pendingIDs    []string // PEL группы (в работе / не подтверждены)
 	lastDelivered string   // last-delivered-id группы
 	deleted       []string // записи, удалённые XDel
+
+	// onGroupInfo вызывается внутри XInfoGroups (под мьютексом) — имитирует
+	// диспетчера, успевшего прочитать пачку между XPENDING и XInfoGroups.
+	onGroupInfo func()
 }
 
 func (f *fakeRedis) XGroupCreateMkStream(ctx context.Context, stream, group, start string) *redis.StatusCmd {
@@ -121,6 +125,9 @@ func (f *fakeRedis) XInfoGroups(ctx context.Context, stream string) *redis.XInfo
 	defer f.mu.Unlock()
 	cmd := redis.NewXInfoGroupsCmd(ctx, stream)
 	cmd.SetVal([]redis.XInfoGroup{{Name: GroupName, LastDeliveredID: f.lastDelivered}})
+	if f.onGroupInfo != nil {
+		f.onGroupInfo()
+	}
 	return cmd
 }
 
