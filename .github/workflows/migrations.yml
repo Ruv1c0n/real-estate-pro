@@ -4,10 +4,8 @@
 # ошибки в SQL до деплоя.
 # Каталог миграций: notifier/migrations/*.sql (если Илья выберет другой путь —
 # поправить paths ниже и команду в шаге).
-# Джоба alembic ниже активируется автоматически, как только в репо появится
-# alembic.ini (пока его нет — job в UI вообще не создаётся, это чисто).
-# Alembic идёт из core-api/requirements.txt (запинен с PR #81) — отдельный
-# шаг установки не нужен.
+# Джоба alembic гоняет миграции схемы core (alembic.ini появился в main с PR #81).
+# Alembic идёт из core-api/requirements.txt — отдельный шаг установки не нужен.
 name: migrations
 on:
   pull_request:
@@ -58,12 +56,10 @@ jobs:
           done
           echo "Все миграции применены успешно"
 
-  # Авто-job для Alembic-миграций core (задел под Тимура/Илью, никого не блокирует):
-  # пока alembic.ini в репо нет, условие if не проходит и job в UI не видна вообще.
-  # Как только Тимур добавит alembic.ini (например, core-api/alembic.ini) — job
-  # появится сам, отдельные правки workflow не нужны.
+  # Alembic-миграции схемы core. DSN явно не задаётся: config.py собирает
+  # asyncpg-DSN из POSTGRES_* (app/app@127.0.0.1:5432/realestate) — ровно
+  # реквизиты сервиса postgres ниже.
   alembic:
-    if: ${{ hashFiles('**/alembic.ini') != '' }}
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -88,6 +84,4 @@ jobs:
         run: python -m pip install -r core-api/requirements.txt
       - name: alembic upgrade head (миграции схемы core)
         working-directory: core-api
-        env:
-          DATABASE_URL: postgresql+asyncpg://app:app@127.0.0.1:5432/realestate
         run: alembic upgrade head
