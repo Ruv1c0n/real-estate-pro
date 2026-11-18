@@ -221,6 +221,16 @@ async def main() -> None:
         " address, description, area_m2, published_at, content_hash"
     )
     records = [tuple(r[c] for c in cols.replace(" ", "").split(",")) for r in rows]
+    # Верхняя граница id до вставки: UPDATE ниже должен затрагивать только
+    # строки этого прогона — без --truncate в таблице могут быть реальные
+    # объявления и outbox-задания, помечать их как published нельзя
+    # (ревью Тимура, PR #92): воркер такие задания уже не отправит
+    listings_id_before = (
+        await conn.fetchval("SELECT COALESCE(max(id), 0) FROM core.listings") or 0
+    )
+    outbox_id_before = (
+        await conn.fetchval("SELECT COALESCE(max(id), 0) FROM core.outbox_events") or 0
+    )
     await conn.copy_records_to_table(
         "listings",
         schema_name="core",
@@ -228,10 +238,12 @@ async def main() -> None:
         records=records,
     )
 
-    # published_at: не storage-поле с DEFAULT — ставим частично (12% NULL)
+    # published_at: не storage-поле с DEFAULT — ставим частично (12% NULL),
+    # только строкам этого прогона
     await conn.execute(
         "UPDATE core.listings SET published_at = now() - (random() * interval '30 days')"
-        " WHERE published_at IS NULL AND random() > 0.12"
+        " WHERE id > $1 AND published_at IS NULL AND random() > 0.12",
+        listings_id_before,
     )
 
     id_by_ext = dict(await conn.fetch("SELECT external_id, id FROM core.listings"))
@@ -284,9 +296,13 @@ async def main() -> None:
         columns=["event_id", "kind", "payload", "listing_id", "published_at"],
         records=outbox,
     )
+    # published_at — только заданиям этого прогона (ревью Тимура): заданию
+    # без публикации, появившемуся вне генератора, нельзя присваивать
+    # published_at — воркер его больше не отправит
     await conn.execute(
         "UPDATE core.outbox_events SET published_at = now() - (random() * interval '2 hours')"
-        " WHERE published_at IS NULL AND random() > 0.30"
+        " WHERE id > $1 AND published_at IS NULL AND random() > 0.30",
+        outbox_id_before,
     )
 
     stats = await conn.fetchrow(
