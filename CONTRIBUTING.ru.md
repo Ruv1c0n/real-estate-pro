@@ -68,8 +68,9 @@ cd notifier && gofmt -l . && go vet ./... && go test ./...
 
 ### Тесты с PostgreSQL и Redis
 
-Часть тестов notifier работает против PostgreSQL и Redis. В CI сервисов
-postgres/redis нет, поэтому эти тесты там скипаются — это норма. Локальный запуск:
+Часть тестов notifier работает против PostgreSQL и Redis. В CI поднимаются
+сервисы postgres/redis и эти тесты выполняются (джоба `notifier-pg-tests`
+в `.github/workflows/ci.yml`). Тот же прогон локально:
 
 ```bash
 docker compose up -d postgres redis
