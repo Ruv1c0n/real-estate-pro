@@ -1,5 +1,9 @@
 # Graph Report - real-estate-pro  (2026-11-14)
 
+> **Сгенерированный артефакт** — не редактировать вручную. Свежая версия отчёта и графа
+> публикуется на [GitHub Pages](https://ruv1c0n.github.io/real-estate-pro/graph.html)
+> (workflow `graphify-pages`); этот закоммиченный снимок строился от коммита `30811adb`.
+
 ## Corpus Check
 - 46 files · ~19,073 words
 - Verdict: corpus is large enough that graph structure adds value.

@@ -72,9 +72,9 @@ cd notifier && gofmt -l . && go vet ./... && go test ./...
 
 ### PostgreSQL/Redis tests
 
-Some notifier tests run against PostgreSQL and Redis. CI has no postgres/redis
-services, so these tests are skipped there — that is expected. To run them
-locally:
+Some notifier tests run against PostgreSQL and Redis. CI spins up postgres/redis
+services and runs them (`notifier-pg-tests` job in `.github/workflows/ci.yml`).
+To run the same tests locally:
 
 ```bash
 docker compose up -d postgres redis
