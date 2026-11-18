@@ -24,4 +24,4 @@ CI/CD репозитория: GitHub Actions, гварды ссылок, шаб�
 ## Заметки
 
 - Правила веток/коммитов и процесс PR — [CONTRIBUTING.md](../CONTRIBUTING.md).
-- Имена бейджей в README соответствуют именам workflow-файлов: `ci`, `python-ci`, `migrations`, `docs-links`.
+- Workflow-файлы: `ci.yml`, `python-ci.yml`, `migrations.yml`, `docs-links.yml`, `graphify-pages.yml`; имена бейджей в корневом README (когда добавляются) должны соответствовать этим именам.

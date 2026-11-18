@@ -67,4 +67,4 @@ NOTIFIER_TEST_REDIS_ADDR='127.0.0.1:6379' go test -race -count=1 -p 1 ./...
 
 ## Статус
 
-По коду ТЗ — 100%; надёжностные хвосты — в открытых PR (`#68` условный XACK, `#70` UserExists, `#72` available_at, `#73` очистка stream/env-параметры): см. раздел «Target configuration» корневого README.
+По коду ТЗ — 100%; надёжностные хвосты — в открытых PR (`#68` условный XACK, `#69` Pg-тесты в CI, `#70` UserExists, `#71` infra-гигиена, `#72` available_at, `#73` очистка stream/env-параметры): см. раздел «Target configuration» корневого README.
