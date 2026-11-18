@@ -3,8 +3,9 @@
 по мере мержей. Читает JSON со stdin (или --url), проверяет обязательный
 набор путей. Незнакомые пути — ок (запрет только на исчезновение).
 
-Обязательный сейчас: каркас health (ФТ-2.7). Когда в main появятся
-/api/v1/*, добавить их в REQUIRED (сделаю при приёмке соответствующих PR).
+Обязательный сейчас: каркас health (ФТ-2.7) и POST /api/v1/listings
+(ФТ-2.1, в main с PR #89). Когда в main появятся остальные /api/v1/*,
+добавить их в REQUIRED (сделаю при приёмке соответствующих PR).
 """
 import json
 import sys
@@ -18,12 +19,12 @@ REQUIRED = {
     "/health",
     "/health/live",
     "/health/ready",
+    "/api/v1/listings",
 }
 # /openapi.json и /docs — документы схемы, в paths не перечислены.
 
-# Пока не реализованы — предупреждаём, не валим (снимается при мерже ФТ-2.1–2.4).
+# Пока не реализованы — предупреждаём, не валим (снимается при мерже ФТ-2.2–2.4).
 EXPECTED_SOON = {
-    "/api/v1/listings": "ФТ-2.1/2.2",
     "/api/v1/countries": "ФТ-2.4",
     "/api/v1/cities": "ФТ-2.4",
     "/api/v1/sources": "ФТ-2.4",
@@ -32,7 +33,14 @@ EXPECTED_SOON = {
 
 
 def main() -> int:
-    data = json.load(sys.stdin)
+    try:
+        data = json.load(sys.stdin)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        print(f"FAIL: на вход пришёл не-JSON ({e})")
+        return 1
+    if not isinstance(data, dict):
+        print("FAIL: на вход пришёл не-объект JSON (нужна OpenAPI-схема)")
+        return 1
     paths = set(data.get("paths", {}))
     missing = REQUIRED - paths
     if missing:
