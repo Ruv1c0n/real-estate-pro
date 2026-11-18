@@ -1,5 +1,7 @@
 import json
+from datetime import UTC, datetime
 from decimal import Decimal
+from unittest.mock import Mock
 
 import pytest
 from app.main import app
@@ -129,3 +131,59 @@ def test_list_listings_rejects_city_without_country(client):
     body = response.json()
     assert body["error"]
     assert body["message"]
+
+
+@pytest.mark.parametrize(
+    ("params", "expected"),
+    [
+        ({}, ["newer", "older"]),
+        ({"sort": "date_desc"}, ["newer", "older"]),
+        ({"sort": "date_asc"}, ["older", "newer"]),
+    ],
+)
+def test_list_listings_sorts_by_created_at(
+    client, payload, monkeypatch, params, expected
+):
+    clock = Mock()
+    clock.now.side_effect = [
+        datetime(2026, 1, 2, tzinfo=UTC),
+        datetime(2026, 1, 1, tzinfo=UTC),
+    ]
+    monkeypatch.setattr("app.in_memory_listing_store.datetime", clock)
+
+    for external_id in ("newer", "older"):
+        created = client.post(URL, json={**payload, "external_id": external_id})
+        assert created.status_code == 201, created.text
+
+    response = client.get(URL, params=params)
+
+    assert response.status_code == 200, response.text
+    assert [item["external_id"] for item in response.json()["items"]] == expected
+
+
+@pytest.mark.parametrize(
+    ("params", "expected"),
+    [
+        ({}, {"small", "medium", "large", "unknown"}),
+        ({"area_min": "42.75"}, {"medium", "large"}),
+        ({"area_max": "42.75"}, {"small", "medium"}),
+        ({"area_min": "42.75", "area_max": "42.75"}, {"medium"}),
+    ],
+)
+def test_list_listings_filters_by_area(client, payload, params, expected):
+    for external_id, area in [
+        ("small", 30),
+        ("medium", 42.75),
+        ("large", 60),
+        ("unknown", None),
+    ]:
+        listing = {**payload, "external_id": external_id, "area_m2": area}
+        created = client.post(URL, json=listing)
+        assert created.status_code == 201, created.text
+
+    response = client.get(URL, params=params)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["total"] == len(expected)
+    assert {item["external_id"] for item in body["items"]} == expected

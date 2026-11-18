@@ -2,6 +2,7 @@ import asyncio
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from operator import attrgetter
 from typing import Literal
 from uuid import UUID, uuid4
@@ -47,29 +48,27 @@ def build_listing_event(listing: StoredListing) -> OutboxEvent:
     )
 
 
+def _in_range(
+    value: int | Decimal | None,
+    minimum: Decimal | None,
+    maximum: Decimal | None,
+) -> bool:
+    if value is None:
+        return minimum is None and maximum is None
+
+    return (minimum is None or value >= minimum) and (
+        maximum is None or value <= maximum
+    )
+
+
 def _matches_filters(listing: StoredListing, filters: ListingFilters) -> bool:
-    if filters.deal_type is not None and listing.deal_type != filters.deal_type:
-        return False
-    if filters.country is not None and listing.country != filters.country:
-        return False
-    if filters.city is not None and listing.city != filters.city:
-        return False
-    if filters.source is not None and listing.source != filters.source:
-        return False
-    if filters.rooms is not None and listing.rooms != filters.rooms:
-        return False
+    for field in ("deal_type", "country", "city", "source", "rooms"):
+        expected = getattr(filters, field)
+        if expected is not None and getattr(listing, field) != expected:
+            return False
 
-    if filters.price_min is not None and listing.price_usd < filters.price_min:
-        return False
-    if filters.price_max is not None and listing.price_usd > filters.price_max:
-        return False
-
-    area = listing.area_m2
-    if area is None:
-        return filters.area_min is None and filters.area_max is None
-
-    return (filters.area_min is None or area >= filters.area_min) and (
-        filters.area_max is None or area <= filters.area_max
+    return _in_range(listing.price_usd, filters.price_min, filters.price_max) and (
+        _in_range(listing.area_m2, filters.area_min, filters.area_max)
     )
 
 
