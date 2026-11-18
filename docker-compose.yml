@@ -94,10 +94,11 @@ services:
       # поэтому знак @ и другие в POSTGRES_PASSWORD не ломают URL.
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
-      # Per-service роль (PR #82): дефолт app сохраняет прежнее поведение,
-      # пока пары *_DB_USER/*_DB_PASSWORD не заданы в .env.
-      POSTGRES_USER: "${CORE_API_DB_USER:-app}"
-      POSTGRES_PASSWORD: "${CORE_API_DB_PASSWORD:-app}"
+      # Per-service роль (PR #82): дефолт — общая пара POSTGRES_USER/PASSWORD
+      # (а она по умолчанию app/app), чтобы кастомизация общего пароля в .env
+      # не терялась, пока сервисные пары *_DB_USER/*_DB_PASSWORD не заданы.
+      POSTGRES_USER: "${CORE_API_DB_USER:-${POSTGRES_USER:-app}}"
+      POSTGRES_PASSWORD: "${CORE_API_DB_PASSWORD:-${POSTGRES_PASSWORD:-app}}"
       POSTGRES_DB: "${POSTGRES_DB:-realestate}"
       REDIS_URL: redis://redis:6379/0
       CORE_API_LOG_LEVEL: "${CORE_API_LOG_LEVEL:-INFO}"
@@ -152,10 +153,10 @@ services:
       # переменными, чтобы спецсимволы пароля не ломали подключение.
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
-      # Per-service роль (PR #82): notifier не получает доступ к схеме core,
-      # дефолт app сохраняет прежнее поведение.
-      POSTGRES_USER: "${NOTIFIER_DB_USER:-app}"
-      POSTGRES_PASSWORD: "${NOTIFIER_DB_PASSWORD:-app}"
+      # Per-service роль (PR #82): notifier не получает доступ к схеме core;
+      # дефолт — общая пара POSTGRES_USER/PASSWORD (аналогично core-api выше).
+      POSTGRES_USER: "${NOTIFIER_DB_USER:-${POSTGRES_USER:-app}}"
+      POSTGRES_PASSWORD: "${NOTIFIER_DB_PASSWORD:-${POSTGRES_PASSWORD:-app}}"
       POSTGRES_DB: "${POSTGRES_DB:-realestate}"
       CORE_API_URL: http://core-api:8000
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}

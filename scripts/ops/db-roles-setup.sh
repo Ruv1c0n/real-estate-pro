@@ -7,9 +7,13 @@
 # задана целиком, либо не задана вовсе. Неполная пара валит стек на старте
 # с явной ошибкой, а не в рантайме через /health/ready.
 #
-# Пароль передаётся переменной psql (-v pwd=...), не литералом в команде:
-# иначе он попадает в argv процесса (виден в ps / docker inspect) и в историю
-# шелла. Значения секретов — только из .env; миграции пароли не содержат
+# Пароль передаётся переменной psql (-v pwd=...) через stdin (heredoc), не
+# литералом в команде и не через `psql -c`: в -c подстановка psql-переменных
+# (:'pwd') вообще не выполняется — сервер получает её буквально и отвечает
+# синтаксической ошибкой (ревью #91, Soulnier). Остаточная граница: -v кладёт
+# значение в argv процесса psql внутри контейнера (виден в ps контейнера);
+# полностью закрыть это может только \password/секрет-файл — осознанный
+# компромисс. Значения секретов — только из .env; миграции пароли не содержат
 # (правило 5 ТЗ 6.5), роли создаются LOGIN без пароля.
 
 set -euo pipefail
@@ -18,6 +22,9 @@ errors=()
 
 check_pair() {
   local label="$1" user="$2" pass="$3"
+  # Пробельные значения считаем пустыми (проверка на пустоту по нормализованному).
+  user="${user//[[:space:]]/}"
+  pass="${pass//[[:space:]]/}"
   if [ -n "$user" ] && [ -z "$pass" ]; then
     errors+=("${label}_DB_USER=${user} задан, но ${label}_DB_PASSWORD пуст — пара должна быть задана целиком (both-or-neither)")
   elif [ -z "$user" ] && [ -n "$pass" ]; then
@@ -40,10 +47,16 @@ PGADMIN_USER="${POSTGRES_USER:-app}"
 PGADMIN_DB="${POSTGRES_DB:-realestate}"
 export PGPASSWORD="${POSTGRES_PASSWORD:-app}"
 
-# Имя роли попадает в SQL — допускаем только идентификатор.
+# Имя роли попадает в SQL — допускаем только идентификатор, отличный от
+# общей роли: выдача пароля роли POSTGRES_USER-у — это ротация пароля
+# общей роли на лету, после чего остальные сервисы потеряют коннект.
 check_role_name() {
   if ! [[ "$1" =~ ^[a-z_][a-z0-9_]*$ ]]; then
     echo "ОШИБКА КОНФИГУРАЦИИ: имя роли '$1' не подходит под ^[a-z_][a-z0-9_]*\$" >&2
+    exit 1
+  fi
+  if [ "$1" = "$PGADMIN_USER" ] || [ "$1" = "postgres" ]; then
+    echo "ОШИБКА КОНФИГУРАЦИИ: '$1' — общая роль; сервисные роли не должны совпадать с POSTGRES_USER/postgres" >&2
     exit 1
   fi
 }
@@ -58,8 +71,12 @@ issue_password() {
     echo "ОШИБКА: роль ${role} не найдена — сначала примените миграцию 0002_roles_per_service (alembic upgrade head)" >&2
     exit 1
   fi
-  psql -h "$PGHOST" -U "$PGADMIN_USER" -d "$PGADMIN_DB" -v pwd="$pass" \
-    -c "ALTER ROLE ${role} PASSWORD :'pwd'" >/dev/null
+  # ALTER ROLE через stdin (heredoc с кавыченным делимитером): только тут
+  # psql выполняет подстановку :'pwd' и :"role"; в `psql -c` не выполняется.
+  psql -h "$PGHOST" -U "$PGADMIN_USER" -d "$PGADMIN_DB" \
+    -v ON_ERROR_STOP=1 -v role="$role" -v pwd="$pass" >/dev/null <<'SQL'
+ALTER ROLE :"role" PASSWORD :'pwd';
+SQL
   echo "Пароль выдан роли ${role}"
 }
 
