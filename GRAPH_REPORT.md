@@ -1,31 +1,31 @@
 # Graph Report - real-estate-pro  (2026-11-18)
 
 ## Corpus Check
-- 101 files · ~70,234 words
+- 101 files · ~71,039 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 13 file(s) not represented in the graph (top: (none) 10, .example 1, .ini 1)
 
 ## Summary
-- 1370 nodes · 3314 edges · 102 communities (71 shown, 31 thin omitted)
-- Extraction: 84% EXTRACTED · 16% INFERRED · 0% AMBIGUOUS · INFERRED: 531 edges (avg confidence: 0.85)
+- 1393 nodes · 3388 edges · 106 communities (78 shown, 28 thin omitted)
+- Extraction: 84% EXTRACTED · 16% INFERRED · 0% AMBIGUOUS · INFERRED: 542 edges (avg confidence: 0.85)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `152c74f0`
+- Built from commit: `a0a6c4c6`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
 ## Community Hubs (Navigation)
-- main.go
-- Core API Config & Filters
+- event.go
+- ListingFilters
 - testing.T
-- health.py
+- test_health.py
 - Core API Bootstrap & Errors
 - Notifier CI Workflow
 - Python CI Workflow
-- context.Context
-- Stream Consumer & Claim
 - Bot
+- Stream Consumer & Claim
+- Telegram API Client
 - Dependabot Config
 - Compose Environment Vars
 - Collector Requirements (TZ)
@@ -49,7 +49,7 @@
 - Python Dev Tooling
 - Redis Compose Service
 - notifier
-- fakeRedis
+- Redis
 - Security Policy
 - Russian Contributing Guide
 - Contract Conventions
@@ -63,42 +63,47 @@
 - External Call Timeouts
 - Notifier Compose Service
 - Russian README
-- .subscribe
-- ListingCreate
-- test_migrations.py
-- with
-- postgres_test.go
-- Subscription
-- test_health.py
-- 2. Сценарии
-- DeferredJob
-- consumer_test.go
-- asyncio
-- main.py
-- Dispatcher
-- sync.Mutex
+- fakeRedis
+- context.Context
 - Event
-- NewReaper
+- main.go
+- test_migrations.py
+- Subscription
+- postgres_test.go
+- listings.py
+- with
+- InMemoryListingStore
+- in_memory_listing_store.py
+- health.py
+- main_test.go
+- go_pkg_time
+- DeferredJob
+- bot_test.go
+- Settings
+- ListingCreate
+- 2. Сценарии
+- asyncio
+- dicts/client_test.go
+- main.py
+- consumer_test.go
+- test_listings_http.py
+- Reaper
 - test_listing_filters_http.py
-- .Allow
 - smoke-flow.sh
-- check_postgres
 - Таблицы
 - Быстрый старт по схеме core — для разработчиков
 - ci.yml
 - migrations.yml
-- .Record
 - db-backup-restore.md
 - .github/README.md
 - docs-links.yml
-- Postgres
+- telegram/client_test.go
 - postgres
-- Reaper
-- test_listings_http.py
+- reaper_test.go
 - Отчёт приёмочного замера НФТ-11 (p95 задержки доставки)
 - on
 - notifier-sql
-- Int64Ptr
+- go_pkg_strings
 - 0001_core_schema.py
 - collector
 - Проект схемы `core`
@@ -106,7 +111,6 @@
 - Демо-сценарий сдачи (черновик Даниила; порядок показа согласуется с командой)
 - .XRange
 - Бенчмарк доставки notifier (НФТ-11)
-- .DropChatJobs
 - Feature branch workflow
 - Резервное копирование и проверка восстановления
 - docs/README.md
@@ -118,14 +122,14 @@
 ## God Nodes (most connected - your core abstractions)
 1. `testEvent()` - 46 edges
 2. `NewDispatcher()` - 37 edges
-3. `NewMemory()` - 35 edges
-4. `Event` - 29 edges
-5. `ListingFilters` - 25 edges
+3. `ListingFilters` - 36 edges
+4. `NewMemory()` - 35 edges
+5. `Event` - 29 edges
 6. `mustAddUser()` - 25 edges
 7. `Subscription` - 24 edges
 8. `Client` - 23 edges
-9. `resetTestDB()` - 22 edges
-10. `Dispatcher` - 22 edges
+9. `InMemoryListingStore` - 22 edges
+10. `resetTestDB()` - 22 edges
 
 ## Surprising Connections (you probably didn't know these)
 - `Планируется (набросок, по ТЗ и плану Тимура)` --references--> `ListingFilters`  [INFERRED]
@@ -150,23 +154,23 @@
 - **Required CI checks for merge (require-ci ruleset)** — contributing_ci_checks, contributing_require_ci, contributing_gitleaks, contributing_python_ci [EXTRACTED 1.00]
 - **Многоуровневая дедупликация: Redis-хэш Collector → уникальность PostgreSQL → журнал уведомлений notifier** — docs_contracts_dedup_source_external_id, docs_real_estate_pro_tz_url_hash, docs_real_estate_pro_tz_dedup_urls, docs_real_estate_pro_tz_фт_3_5, docs_real_estate_pro_tz_exactly_once [INFERRED 0.85]
 
-## Communities (102 total, 31 thin omitted)
+## Communities (106 total, 28 thin omitted)
 
-### Community 0 - "main.go"
-Cohesion: 0.05
-Nodes (67): checkResult, FormatEvent(), newTestBot(), TestFormatEventGiantCurrencyUnconditionalTier(), TestFormatEventNewContract(), TestFormatEventNilAddressUnchanged(), TestFormatEventShortEventUnchanged(), TestFormatEventTruncatesGiantURL() (+59 more)
+### Community 0 - "event.go"
+Cohesion: 0.14
+Nodes (22): ParseSubscription(), TestParseSubscription(), TestParseSubscriptionCityWithSpace(), TestParseSubscriptionErrors(), TestParseSubscriptionStudio(), int64OrZero(), isAlphaUpper2(), isHexDigit() (+14 more)
 
-### Community 1 - "Core API Config & Filters"
-Cohesion: 0.11
-Nodes (28): Settings, ListingFilters, clean_settings_env(), test_database_url_accepts_asyncpg(), test_database_url_built_from_parts_escapes_special_characters(), test_database_url_rejects_wrong_driver(), test_database_url_takes_priority_over_parts(), test_database_url_validation_error_hides_password() (+20 more)
+### Community 1 - "ListingFilters"
+Cohesion: 0.22
+Nodes (18): ListingFilters, test_listing_filters_accept_nonempty_text(), test_listing_filters_accept_valid_bounds(), test_listing_filters_accept_valid_choices(), test_listing_filters_accept_valid_country(), test_listing_filters_accept_valid_location(), test_listing_filters_accept_valid_pagination(), test_listing_filters_accept_valid_ranges() (+10 more)
 
 ### Community 2 - "testing.T"
-Cohesion: 0.10
-Nodes (92): New(), TestStartEnsuresUser(), TestStopDeletesUserAndReportsCount(), TestStopDropsDeferredJobs(), TestStoreErrorShowsNeutralText(), TestSubscribeAddErrorShowsNeutralText(), TestPgDispatcherRedeliveredOnceAfterDBFailure(), NewPgJournal() (+84 more)
+Cohesion: 0.07
+Nodes (105): New(), newTestBot(), TestStartEnsuresUser(), TestStartSubscribeStopStartScenario(), TestStopDeletesUserAndReportsCount(), TestStopDropsDeferredJobs(), TestStopRemovesAllSubscriptions(), TestStopWithoutCleanerStillWorks() (+97 more)
 
-### Community 3 - "health.py"
-Cohesion: 0.27
-Nodes (11): check_dependencies(), health_summary(), live(), DependencyState, HealthChecks, HealthReport, LiveReport, ReadinessError (+3 more)
+### Community 3 - "test_health.py"
+Cohesion: 0.10
+Nodes (11): check_postgres(), check_redis(), health_client(), test_dependency_check_timeout(), scenario(), hanging_operation(), test_health_summary(), test_probe_external_cancellation_propagates() (+3 more)
 
 ### Community 4 - "Core API Bootstrap & Errors"
 Cohesion: 0.13
@@ -180,17 +184,17 @@ Nodes (40): run, runs-on, steps, GITHUB_TOKEN, NOTIFIER_TEST_DSN, NOTIFIER_TEST_
 Cohesion: 0.06
 Nodes (38): concurrency, cancel-in-progress, group, CORE_API_LOG_LEVEL, POSTGRES_DB, POSTGRES_HOST, POSTGRES_PASSWORD, POSTGRES_PORT (+30 more)
 
-### Community 7 - "context.Context"
-Cohesion: 0.12
-Nodes (5): errStore, recordingStore, Store, failingStore, userGateStore
+### Community 7 - "Bot"
+Cohesion: 0.15
+Nodes (6): Bot, ChatCleaner, stubValidator, Validator, Describe(), ChatCleaner
 
 ### Community 8 - "Stream Consumer & Claim"
-Cohesion: 0.19
-Nodes (5): isBusyGroup(), NewConsumer(), Consumer, Handler, Redis
+Cohesion: 0.23
+Nodes (6): isBusyGroup(), NewConsumer(), streamLenWarnState(), TestStreamLenWarnStateHysteresis(), Consumer, Handler
 
-### Community 9 - "Bot"
-Cohesion: 0.15
-Nodes (8): API, Bot, ChatCleaner, fakeAPI, Update, NewClient(), Client, Message
+### Community 9 - "Telegram API Client"
+Cohesion: 0.19
+Nodes (6): API, fakeAPI, Update, NewClient(), Client, Message
 
 ### Community 10 - "Dependabot Config"
 Cohesion: 0.14
@@ -221,8 +225,8 @@ Cohesion: 0.15
 Nodes (14): GET /api/v1/listings (фильтры, сортировка, пагинация), GET /api/v1/listings/{id} (карточка), 3.5 Кэш (ключ с хэшем фильтров, TTL 600 с), 6.5 Границы ответственности команды, cache:version и инвалидация кэша, core-api (FastAPI, порт 8000), НФТ-10: p95 GET списка <300 мс с кэшем, <500 мс без, НФТ-12: Ошибки JSON API {error, message} (+6 more)
 
 ### Community 17 - "Client"
-Cohesion: 0.07
-Nodes (31): City, Country, healthProber, fresh(), Client, matchCity(), New(), newServer() (+23 more)
+Cohesion: 0.09
+Nodes (22): City, Country, eventJSON, healthProber, fresh(), Client, matchCity(), newMux() (+14 more)
 
 ### Community 18 - "Compose Infrastructure"
 Cohesion: 0.17
@@ -284,177 +288,205 @@ Nodes (6): command, image, ports, restart, volumes, redis
 Cohesion: 0.17
 Nodes (10): HTTP, notifier, Запуск, Миграции, Переменные окружения, Статус, Тесты, docs/contracts.md (inter-service contracts) (+2 more)
 
-### Community 50 - "ListingCreate"
-Cohesion: 0.07
-Nodes (26): build_listing_event(), InMemoryListingStore, OutboxEvent, ListingCreate, CreateListingResult, ListingStore, StoredListing, create_listing() (+18 more)
+### Community 50 - "context.Context"
+Cohesion: 0.10
+Nodes (7): errStore, recordingStore, Limiter, Store, failingStore, mockLimiter, userGateStore
 
-### Community 51 - "test_migrations.py"
+### Community 51 - "Event"
+Cohesion: 0.13
+Nodes (8): Event, Recipients(), Journal, logRateLimited(), Dispatcher, journalKey, MemoryJournal, Sender
+
+### Community 52 - "main.go"
+Cohesion: 0.12
+Nodes (13): checkResult, ConsumerName(), DefaultLenWarnThreshold(), DefaultWorkers(), TestConsumerName(), DefaultCleanupInterval(), env(), envPositiveDuration() (+5 more)
+
+### Community 53 - "test_migrations.py"
 Cohesion: 0.12
 Nodes (11): clients(), _alembic(), _app_dsn(), _components(), _dsn(), _head_revision(), _lifecycle(), test_migrations_full_cycle() (+3 more)
 
-### Community 52 - "with"
+### Community 54 - "Subscription"
+Cohesion: 0.13
+Nodes (8): Subscription, sameText(), Memory, collectSubscriptions(), derefStr(), scanSubscription(), Компоненты (`internal/`), Postgres
+
+### Community 55 - "postgres_test.go"
+Cohesion: 0.22
+Nodes (25): applyMigration(), assertSameInt(), assertSameInt64(), assertSameSub(), assertTablesEmpty(), mustAdd(), mustAddUser(), mustByChat() (+17 more)
+
+### Community 56 - "listings.py"
+Cohesion: 0.15
+Nodes (10): ListingStore, StoredListing, create_listing(), get_listing(), get_listing_store(), list_listings(), _listing_data(), ListingCreateResponse (+2 more)
+
+### Community 57 - "with"
 Cohesion: 0.08
 Nodes (24): runs-on, steps, concurrency, cancel-in-progress, group, jobs, build-and-deploy, name (+16 more)
 
-### Community 53 - "postgres_test.go"
-Cohesion: 0.23
-Nodes (24): applyMigration(), assertSameInt(), assertSameInt64(), assertSameSub(), assertTablesEmpty(), mustAdd(), mustAddUser(), mustByChat() (+16 more)
+### Community 58 - "InMemoryListingStore"
+Cohesion: 0.27
+Nodes (11): InMemoryListingStore, anyio_backend(), listing(), test_concurrent_duplicates_create_one_listing_and_event(), test_create_saves_listing_and_event(), test_duplicate_preserves_original_listing_and_event(), test_event_build_failure_does_not_save_listing(), test_get_unknown_listing_returns_none() (+3 more)
 
-### Community 54 - "Subscription"
+### Community 59 - "in_memory_listing_store.py"
+Cohesion: 0.19
+Nodes (6): build_listing_event(), _in_range(), _matches_filters(), OutboxEvent, CreateListingResult, ListingSearchResult
+
+### Community 60 - "health.py"
+Cohesion: 0.27
+Nodes (11): check_dependencies(), health_summary(), live(), DependencyState, HealthChecks, HealthReport, LiveReport, ReadinessError (+3 more)
+
+### Community 62 - "go_pkg_time"
+Cohesion: 0.19
+Nodes (11): applied(), Apply(), migrationNames(), TestApplyOnEmptySchema(), TestApplyParallel(), TestMain(), TestVersionOfAndSort(), versionOf() (+3 more)
+
+### Community 63 - "DeferredJob"
+Cohesion: 0.20
+Nodes (5): DeferredQueue, jobKey(), DeferredJob, mockQueue, PgQueue
+
+### Community 64 - "bot_test.go"
 Cohesion: 0.18
-Nodes (7): Describe(), Subscription, Memory, collectSubscriptions(), derefStr(), scanSubscription(), Компоненты (`internal/`)
+Nodes (11): FormatEvent(), TestFormatEventGiantCurrencyUnconditionalTier(), TestFormatEventNewContract(), TestFormatEventNilAddressUnchanged(), TestFormatEventShortEventUnchanged(), TestFormatEventTruncatesGiantURL(), TestFormatEventTruncatesLongAddress(), truncateRunes() (+3 more)
 
-### Community 55 - "test_health.py"
-Cohesion: 0.13
-Nodes (4): health_client(), test_health_summary(), test_ready(), test_redis_unexpected_exception_is_reported()
+### Community 65 - "Settings"
+Cohesion: 0.18
+Nodes (10): Settings, clean_settings_env(), test_database_url_accepts_asyncpg(), test_database_url_built_from_parts_escapes_special_characters(), test_database_url_rejects_wrong_driver(), test_database_url_takes_priority_over_parts(), test_database_url_validation_error_hides_password(), test_environment_overrides_dotenv() (+2 more)
 
-### Community 56 - "2. Сценарии"
+### Community 66 - "ListingCreate"
+Cohesion: 0.20
+Nodes (8): ListingCreate, payload(), test_invalid_value_is_rejected(), test_minimal_listing_from_json(), test_optional_fields_accept_null(), test_photos_preserve_order_in_json(), test_published_at_is_converted_to_utc(), test_required_field_cannot_be_omitted()
+
+### Community 67 - "2. Сценарии"
 Cohesion: 0.12
 Nodes (16): 0. Когда прогон возможен, 1. Предусловия, 2. Сценарии, 3. Критерии закрытия issue #20, 4. Инструменты, S10. Безопасность и ошибки (НФТ-1, 2, 3, 12), S1. Стартовая конфигурация, S2. Прямая публикация (без collector, доступен раньше остальных) (+8 more)
 
-### Community 57 - "DeferredJob"
-Cohesion: 0.24
-Nodes (6): DeferredQueue, jobKey(), DeferredJob, MemoryQueue, mockQueue, PgQueue
-
-### Community 58 - "consumer_test.go"
-Cohesion: 0.25
-Nodes (13): streamLenWarnState(), runConsumer(), TestConsumerDeadLetterOnBadPayload(), TestConsumerDeadLetterOnMissingData(), TestConsumerDeliversAndAcks(), TestConsumerGroupCreateFailureIsFatal(), TestConsumerKeepsPendingWhenDeadLetterFails(), TestConsumerKeepsPendingWhenHandlerFails() (+5 more)
-
-### Community 59 - "asyncio"
-Cohesion: 0.17
+### Community 68 - "asyncio"
+Cohesion: 0.16
 Nodes (4): do_run_migrations(), run_async_migrations(), run_migrations_offline(), run_migrations_online()
 
-### Community 60 - "main.py"
+### Community 69 - "dicts/client_test.go"
+Cohesion: 0.21
+Nodes (11): New(), newServer(), TestCachedHealthy(), TestCacheServesRepeatedCalls(), TestHealthy(), TestStaleCacheWhenCoreAPIDown(), TestUnavailableWithoutCache(), TestValidateCanonicalizesCountryAndCity() (+3 more)
+
+### Community 70 - "main.py"
 Cohesion: 0.22
 Nodes (5): create_db_engine(), setup_logging(), lifespan(), root(), create_redis_client()
 
-### Community 61 - "Dispatcher"
-Cohesion: 0.22
-Nodes (5): logRateLimited(), Dispatcher, journalKey, Sender, RateLimitError
+### Community 71 - "consumer_test.go"
+Cohesion: 0.31
+Nodes (11): runConsumer(), TestConsumerDeadLetterOnBadPayload(), TestConsumerDeadLetterOnMissingData(), TestConsumerDeliversAndAcks(), TestConsumerGroupCreateFailureIsFatal(), TestConsumerKeepsPendingWhenDeadLetterFails(), TestConsumerKeepsPendingWhenHandlerFails(), TestConsumerStaysSilentBelowStreamLenThreshold() (+3 more)
 
-### Community 62 - "sync.Mutex"
-Cohesion: 0.17
-Nodes (4): blockingSender, hangingSender, serialLimiter, slowSender
+### Community 72 - "test_listings_http.py"
+Cohesion: 0.18
+Nodes (4): client(), payload(), test_list_listings_filters_by_area(), test_list_listings_sorts_by_created_at()
 
-### Community 63 - "Event"
-Cohesion: 0.30
-Nodes (3): Event, Recipients(), sameText()
-
-### Community 64 - "NewReaper"
-Cohesion: 0.21
-Nodes (6): NewReaper(), TestReaperDeletesOnlyConfirmedBeforeMinPending(), TestReaperEmptyPendingUsesLastDelivered(), TestReaperNothingToCleanWhenGroupFresh(), TestReaperRaceNewPendingBetweenReads(), TestReaperSkipsAllWhenPendingAtHead()
-
-### Community 65 - "test_listing_filters_http.py"
+### Community 74 - "test_listing_filters_http.py"
 Cohesion: 0.29
 Nodes (6): client(), test_http_filters_defaults(), test_http_filters_explain_invalid_combinations(), test_http_filters_openapi_query_parameters(), test_http_filters_parse_query_parameters(), test_http_filters_return_validation_error()
 
-### Community 66 - ".Allow"
-Cohesion: 0.18
-Nodes (5): eventJSON, Limiter, limiterKey, MemoryLimiter, mockLimiter
-
-### Community 67 - "smoke-flow.sh"
+### Community 75 - "smoke-flow.sh"
 Cohesion: 0.40
 Nodes (10): bad(), cleanup(), ok(), poll_count(), psql_q(), redis_cli(), redis_xlen(), smoke-flow.sh script (+2 more)
 
-### Community 68 - "check_postgres"
-Cohesion: 0.24
-Nodes (7): check_postgres(), check_redis(), test_dependency_check_timeout(), scenario(), hanging_operation(), test_probe_external_cancellation_propagates(), scenario()
-
-### Community 69 - "Таблицы"
+### Community 76 - "Таблицы"
 Cohesion: 0.20
 Nodes (10): cities (ТЗ 3.7: уникальность города внутри страны), city_name_aliases (ТЗ 4.2: «таблица либо поле по решению Ильи» — выбрана таблица), countries (ТЗ 3.7), currencies (ТЗ 3.2: исходные курсы задаются миграциями), listing_duplicates (ТЗ 3.3: связь «возможный дубль», обе записи сохраняются), listing_photos (решение: отдельная таблица, не массив/JSONB), listings (ТЗ 3.1 + 3.3), outbox_events (ТЗ 4.3: transactional outbox, объявление + задание в одной транзакции) (+2 more)
 
-### Community 70 - "Быстрый старт по схеме core — для разработчиков"
+### Community 77 - "Быстрый старт по схеме core — для разработчиков"
 Cohesion: 0.20
 Nodes (10): Outbox (ТЗ 4.3), Быстрый старт по схеме core — для разработчиков, Дедупликация (ТЗ 3.3) — контракт для реализации, Деньги (ТЗ 3.2), Идентичности и массовая вставка (важно для дампа), Карта таблиц, Подъём базы, Роли (миграция 0002) (+2 more)
 
-### Community 71 - "ci.yml"
+### Community 78 - "ci.yml"
 Cohesion: 0.20
 Nodes (9): concurrency, cancel-in-progress, group, name, on, pull_request, push, branches (+1 more)
 
-### Community 72 - "migrations.yml"
+### Community 79 - "migrations.yml"
 Cohesion: 0.20
 Nodes (9): jobs, name, on, pull_request, push, workflow_dispatch, paths, branches (+1 more)
 
-### Community 74 - "db-backup-restore.md"
+### Community 80 - "db-backup-restore.md"
 Cohesion: 0.28
 Nodes (4): backup.sh script, restore-verify.sh script, scripts, Планируется (набросок)
 
-### Community 75 - ".github/README.md"
+### Community 81 - ".github/README.md"
 Cohesion: 0.22
 Nodes (6): version, .github, Workflows ([workflows/](workflows/)), Заметки, Скрипты и конфиги, check-md-links.sh script
 
-### Community 76 - "docs-links.yml"
+### Community 82 - "docs-links.yml"
 Cohesion: 0.22
 Nodes (8): runs-on, steps, jobs, check, name, name, run, uses
 
-### Community 78 - "postgres"
+### Community 83 - "telegram/client_test.go"
+Cohesion: 0.33
+Nodes (5): newTestClient(), TestOtherAPIErrorsNotRateLimited(), TestRateLimitedCarriesRetryAfter(), TestRateLimitedWithoutParametersUsesDefault(), TestSendMessageOK()
+
+### Community 84 - "postgres"
 Cohesion: 0.25
 Nodes (8): POSTGRES_DB, POSTGRES_PASSWORD, POSTGRES_USER, env, image, options, ports, postgres
 
-### Community 81 - "Отчёт приёмочного замера НФТ-11 (p95 задержки доставки)"
+### Community 85 - "reaper_test.go"
+Cohesion: 0.50
+Nodes (6): NewReaper(), TestReaperDeletesOnlyConfirmedBeforeMinPending(), TestReaperEmptyPendingUsesLastDelivered(), TestReaperNothingToCleanWhenGroupFresh(), TestReaperRaceNewPendingBetweenReads(), TestReaperSkipsAllWhenPendingAtHead()
+
+### Community 86 - "Отчёт приёмочного замера НФТ-11 (p95 задержки доставки)"
 Cohesion: 0.29
 Nodes (6): Вердикт, Границы этого замера, Отклонения в ходе замера (зафиксировано для честности), Отчёт приёмочного замера НФТ-11 (p95 задержки доставки), Результат, Условия замера (НФТ-10: «фиксируются машина, состав данных и фильтры»)
 
-### Community 82 - "on"
+### Community 87 - "on"
 Cohesion: 0.29
 Nodes (7): on, pull_request, push, workflow_dispatch, paths, branches, paths
 
-### Community 83 - "notifier-sql"
+### Community 88 - "notifier-sql"
 Cohesion: 0.29
 Nodes (7): notifier-sql, runs-on, services, steps, name, run, uses
 
-### Community 84 - "Int64Ptr"
+### Community 89 - "go_pkg_strings"
 Cohesion: 0.43
-Nodes (7): baseEvent(), TestMatchAll(), TestRecipientsDedupsChats(), TestSubscriptionMatches(), Int64Ptr(), IntPtr(), MatchAll()
+Nodes (4): Connect(), dsnFromEnv(), quoteValue(), TestDsnFromEnv()
 
-### Community 86 - "collector"
+### Community 91 - "collector"
 Cohesion: 0.33
 Nodes (5): collector, Запуск, Планируется (набросок, по ТЗ), Статус, Что есть сейчас
 
-### Community 87 - "Проект схемы `core`"
+### Community 92 - "Проект схемы `core`"
 Cohesion: 0.33
 Nodes (4): Индексы (ТЗ 4.2 + ревью PR #66), План реализации (после согласования), Проект схемы `core`, Решения по ревью PR #66 (2026-11-15)
 
-### Community 88 - "core-api"
+### Community 93 - "core-api"
 Cohesion: 0.33
 Nodes (6): core-api, Запуск, Переменные окружения, Планируется (набросок, по ТЗ и плану Тимура), Тесты, Что есть сейчас
 
-### Community 89 - "Демо-сценарий сдачи (черновик Даниила; порядок показа согласуется с командой)"
+### Community 94 - "Демо-сценарий сдачи (черновик Даниила; порядок показа согласуется с командой)"
 Cohesion: 0.33
 Nodes (5): Демо-сценарий сдачи (черновик Даниила; порядок показа согласуется с командой), До демонстрации (подготовка, ~10 минут), Запасные ответы на вопросы комиссии, Кто что показывает, Порядок показа
 
-### Community 91 - "Бенчмарк доставки notifier (НФТ-11)"
+### Community 96 - "Бенчмарк доставки notifier (НФТ-11)"
 Cohesion: 0.33
 Nodes (5): Бенчмарк доставки notifier (НФТ-11), Ограничения, Переменные окружения, Предусловия, Что делает скрипт
 
-### Community 93 - "Feature branch workflow"
+### Community 97 - "Feature branch workflow"
 Cohesion: 0.40
 Nodes (3): CI required checks (notifier lint/test, gitleaks, docker compose), gitleaks (secret leak detection), require-ci ruleset
 
-### Community 94 - "Резервное копирование и проверка восстановления"
+### Community 98 - "Резервное копирование и проверка восстановления"
 Cohesion: 0.40
 Nodes (5): Дамп, Проверка восстановления (обязательно для каждого дампа), Расписание и хранение, Резервное копирование и проверка восстановления, Что покрывается
 
 ## Knowledge Gaps
 - **61 isolated node(s):** `notifier`, `4.6 Необязательный mock-сервер источника`, `НФТ-3: X-Admin-Key для /debug/*, /collect/run и статусов`, `ФТ-1.7: Веб-интерфейс Jinja2 + HTMX`, `Consumer group notifier (XREADGROUP, XAUTOCLAIM, XACK)` (+56 more)
-  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 389 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
-- **31 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 393 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
+- **28 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
 - **Why does `notifier` connect `notifier` to `Subscription`?**
-  _High betweenness centrality (0.154) - this node is a cross-community bridge._
+  _High betweenness centrality (0.155) - this node is a cross-community bridge._
 - **Are the 12 inferred relationships involving `testEvent()` (e.g. with `TestPgDispatcherRedeliveredOnceAfterDBFailure()` and `TestPgDispatcherDoubleDelivery()`) actually correct?**
   _`testEvent()` has 12 INFERRED edges - model-reasoned connections that need verification._
 - **What connects `notifier`, `4.6 Необязательный mock-сервер источника`, `НФТ-3: X-Admin-Key для /debug/*, /collect/run и статусов` to the rest of the system?**
   _61 weakly-connected nodes found - possible documentation gaps or missing edges._
-- **Should `main.go` be split into smaller, more focused modules?**
-  _Cohesion score 0.050688976377952756 - nodes in this community are weakly interconnected._
-- **Why does `Компоненты (`internal/`)` connect `Subscription` to `main.go`, `notifier`, `Postgres`?**
-  _High betweenness centrality (0.153) - this node is a cross-community bridge._
+- **Should `event.go` be split into smaller, more focused modules?**
+  _Cohesion score 0.14153846153846153 - nodes in this community are weakly interconnected._
+- **Why does `Компоненты (`internal/`)` connect `Subscription` to `event.go`, `notifier`?**
+  _High betweenness centrality (0.152) - this node is a cross-community bridge._
 - **Are the 29 inferred relationships involving `NewDispatcher()` (e.g. with `TestPgDispatcherRedeliveredOnceAfterDBFailure()` and `TestPgDispatcherDoubleDelivery()`) actually correct?**
   _`NewDispatcher()` has 29 INFERRED edges - model-reasoned connections that need verification._
-- **Should `Core API Config & Filters` be split into smaller, more focused modules?**
-  _Cohesion score 0.10685249709639953 - nodes in this community are weakly interconnected._
+- **Should `testing.T` be split into smaller, more focused modules?**
+  _Cohesion score 0.07460524409676952 - nodes in this community are weakly interconnected._
