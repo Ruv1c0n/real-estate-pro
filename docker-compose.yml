@@ -28,6 +28,35 @@ services:
       timeout: 3s
       retries: 10
 
+  # Одноразовая выдача паролей сервисным ролям (миграция 0002, PR #82).
+  # Без заданных пар — no-op: стек работает под общей ролью app, как раньше.
+  # Неполная пара (user без password) валит стек на старте с явной ошибкой
+  # (both-or-neither), а не в рантайме через /health/ready.
+  # Порядок: роли создаёт миграция 0002; пока alembic не входит в compose-
+  # стартап, задание пар требует ручного `alembic upgrade head` до `up`.
+  db-roles-setup:
+    image: postgres:16
+    restart: "no"
+    logging: *default-logging
+    environment:
+      PGHOST: postgres
+      # admin-роль, от которой выдаются пароли (ALTER ROLE), — это app,
+      # не сервисные роли.
+      POSTGRES_USER: "${POSTGRES_USER:-app}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-app}"
+      POSTGRES_DB: "${POSTGRES_DB:-realestate}"
+      CORE_API_DB_USER: "${CORE_API_DB_USER:-}"
+      CORE_API_DB_PASSWORD: "${CORE_API_DB_PASSWORD:-}"
+      NOTIFIER_DB_USER: "${NOTIFIER_DB_USER:-}"
+      NOTIFIER_DB_PASSWORD: "${NOTIFIER_DB_PASSWORD:-}"
+    volumes:
+      # Скрипт монтируется только на чтение: содержимое не зависит от окружения.
+      - ./scripts/ops/db-roles-setup.sh:/setup.sh:ro
+    entrypoint: ["bash", "/setup.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   redis:
     image: redis:7
     restart: unless-stopped
@@ -65,14 +94,19 @@ services:
       # поэтому знак @ и другие в POSTGRES_PASSWORD не ломают URL.
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
-      POSTGRES_USER: "${POSTGRES_USER:-app}"
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-app}"
+      # Per-service роль (PR #82): дефолт app сохраняет прежнее поведение,
+      # пока пары *_DB_USER/*_DB_PASSWORD не заданы в .env.
+      POSTGRES_USER: "${CORE_API_DB_USER:-app}"
+      POSTGRES_PASSWORD: "${CORE_API_DB_PASSWORD:-app}"
       POSTGRES_DB: "${POSTGRES_DB:-realestate}"
       REDIS_URL: redis://redis:6379/0
       CORE_API_LOG_LEVEL: "${CORE_API_LOG_LEVEL:-INFO}"
     depends_on:
       postgres:
         condition: service_healthy
+      # Пароль роли должен быть выдан до первого подключения core-api.
+      db-roles-setup:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
     # В образе python-slim нет wget/curl — проверяем /health/ready
@@ -118,8 +152,10 @@ services:
       # переменными, чтобы спецсимволы пароля не ломали подключение.
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
-      POSTGRES_USER: "${POSTGRES_USER:-app}"
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-app}"
+      # Per-service роль (PR #82): notifier не получает доступ к схеме core,
+      # дефолт app сохраняет прежнее поведение.
+      POSTGRES_USER: "${NOTIFIER_DB_USER:-app}"
+      POSTGRES_PASSWORD: "${NOTIFIER_DB_PASSWORD:-app}"
       POSTGRES_DB: "${POSTGRES_DB:-realestate}"
       CORE_API_URL: http://core-api:8000
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
@@ -127,6 +163,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      # Пароль роли должен быть выдан до первого подключения notifier.
+      db-roles-setup:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
       # notifier ходит в справочники Core API — ждём его готовности.
