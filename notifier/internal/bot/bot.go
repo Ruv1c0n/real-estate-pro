@@ -37,14 +37,29 @@ const MaxSubscriptionsPerUser = 10
 // не утекают — они уходят в лог (L6).
 const msgUnavailable = "Сервис временно недоступен, попробуйте позже."
 
+// ChatCleaner — очистка отложенных заданий чата (ТЗ 4.2: «/stop удаляет и
+// отложенные задания»). Структурная копия notify.ChatCleaner: bot не зависит
+// от notify, сопряжение происходит в main через батарейку WithChatCleaner.
+type ChatCleaner interface {
+	DropChatJobs(ctx context.Context, chatID int64) error
+}
+
 type Bot struct {
-	api   API
-	subs  store.Store
-	dicts Validator
+	api     API
+	subs    store.Store
+	dicts   Validator
+	cleaner ChatCleaner
 }
 
 func New(api API, subs store.Store, dicts Validator) *Bot {
 	return &Bot{api: api, subs: subs, dicts: dicts}
+}
+
+// WithChatCleaner подключает очистку отложенных заданий чата при /stop
+// (ТЗ 4.2). nil — оставить без очистки: существующие вызовы New не меняются.
+func (b *Bot) WithChatCleaner(c ChatCleaner) *Bot {
+	b.cleaner = c
+	return b
 }
 
 const helpText = `Я присылаю новые объявления о недвижимости под ваши фильтры.
@@ -206,6 +221,17 @@ func (b *Bot) stop(ctx context.Context, chatID int64) string {
 	if err != nil {
 		log.Printf("bot: delete user (chat %d): %v", chatID, err)
 		return msgUnavailable
+	}
+	// ТЗ 4.2: «/stop удаляет и отложенные задания». В db-режиме каскад FK
+	// чистит deferred-строки вместе с users, но очередь подчищает их и сама
+	// (идемпотентно); в memory-режиме без этого шага очередь «доставила» бы
+	// отложенные задания в лог уже после удаления пользователя. Ошибка
+	// очистки не отменяет /stop: пользователь уже удалён — логируем и
+	// отвечаем как обычно.
+	if b.cleaner != nil {
+		if err := b.cleaner.DropChatJobs(ctx, chatID); err != nil {
+			log.Printf("bot: drop deferred jobs (chat %d): %v", chatID, err)
+		}
 	}
 	return fmt.Sprintf("Готово: удалено подписок — %d. Вы больше не будете получать уведомления. /subscribe вернёт их в любой момент.", n)
 }

@@ -8,6 +8,8 @@ from app.config import settings
 from app.database import create_db_engine
 from app.error_handlers import register_error_handlers
 from app.health import router as health_router
+from app.in_memory_listing_store import InMemoryListingStore
+from app.listings import router as listings_router
 from app.logging_setup import setup_logging
 from app.redis_client import create_redis_client
 
@@ -27,6 +29,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
 
         application.state.db_engine = db_engine
         application.state.redis = redis_client
+        application.state.listing_store = InMemoryListingStore()
 
         logger.info("Core API started")
         try:
@@ -45,6 +48,7 @@ app = FastAPI(
 
 register_error_handlers(app)
 app.include_router(health_router)
+app.include_router(listings_router)
 
 
 @app.get("/")
