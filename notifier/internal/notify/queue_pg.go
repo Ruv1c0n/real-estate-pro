@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -27,6 +28,15 @@ type PgQueue struct {
 	mu sync.Mutex
 	tx pgx.Tx // транзакция последнего PopBatch, коммитится в Mark
 }
+
+// retryBackoff — фиксированная отсрочка повторного задания после Mark(retry):
+// available_at сдвигается на now() + retryBackoff (миграция 0002_available_at,
+// см. её комментарий о семантике backoff). Значение — компромисс: больше, чем
+// проход флешера (flushInterval = 30s в main.go), чтобы deferred-строка не
+// перекручивалась каждым проходом до освобождения окна лимитера, и меньше
+// минуты, чтобы повтор оставался быстрым. ТЗ 3.6: отложенные задания не
+// отбрасываются — retry остаётся deferred навсегда, пока не уйдёт sent.
+const retryBackoff = 60 * time.Second
 
 func NewPgQueue(pool *pgxpool.Pool) *PgQueue {
 	return &PgQueue{pool: pool}
@@ -54,13 +64,15 @@ func (q *PgQueue) Postpone(ctx context.Context, chatID int64, e model.Event, mod
 	return nil
 }
 
-// PopBatch возвращает до limit самых старых отложенных заданий
-// (индекс notifications_log_deferred_idx). Строки блокируются за этим
-// воркером до Mark. Строка с битым payload батч не откатывает: она
-// карантинится (status='failed', причина в логе) и пропускается — из-за
-// одной битой строки доставка для всех вставать не должна. Из-за
-// карантина батч может вернуться меньше limit (недобранные строки флешер
-// заберёт следующим проходом).
+// PopBatch возвращает до limit самых старых доступных отложенных заданий.
+// Порядок и фильтр — по available_at (индекс notifications_log_available_idx
+// из миграции 0002_available_at): забираются только строки с
+// available_at <= now(), задание после Mark(retry) недоступно retryBackoff.
+// Строки блокируются за этим воркером до Mark. Строка с битым payload батч
+// не откатывает: она карантинится (status='failed', причина в логе) и
+// пропускается — из-за одной битой строки доставка для всех вставать не
+// должна. Из-за карантина батч может вернуться меньше limit (недобранные
+// строки флешер заберёт следующим проходом).
 func (q *PgQueue) PopBatch(ctx context.Context, limit int) ([]DeferredJob, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -73,8 +85,8 @@ func (q *PgQueue) PopBatch(ctx context.Context, limit int) ([]DeferredJob, error
 	}
 	rows, err := q.tx.Query(ctx, `
 		SELECT id, chat_id, payload FROM notifier.notifications_log
-		WHERE status = 'deferred'
-		ORDER BY created_at
+		WHERE status = 'deferred' AND available_at <= now()
+		ORDER BY available_at, id
 		LIMIT $1
 		FOR UPDATE SKIP LOCKED`, limit)
 	if err != nil {
@@ -95,7 +107,7 @@ func (q *PgQueue) PopBatch(ctx context.Context, limit int) ([]DeferredJob, error
 		e, err := model.ParseEvent(payload)
 		if err != nil {
 			// Битую строку нельзя откатывать вместе с батчем: она осталась
-			// бы головой ORDER BY created_at, и флушер зациклился на ней.
+			// бы головой ORDER BY available_at, и флушер зациклился на ней.
 			// Запоминаем id и карантиним после закрытия rows (Exec в той же
 			// tx, пока rows открыты, не выполняется), разбор остальных строк
 			// продолжаем.
@@ -140,7 +152,12 @@ func (q *PgQueue) PopBatch(ctx context.Context, limit int) ([]DeferredJob, error
 }
 
 // Mark фиксирует исход задания: sent/unknown — строка получает статус и
-// sent_at, retry — остаётся deferred (вернётся следующим проходом флешера).
+// sent_at; retry — остаётся deferred, но его available_at сдвигается на
+// now() + retryBackoff (миграция 0002_available_at): задание не отбрасывается
+// (ТЗ 3.6), а вернётся в выборку PopBatch, когда backoff истечёт; drop —
+// deferred-строка удаляется без отправки (получатель удалён, ТЗ 4.2;
+// отдельного статуса журнала для этого нет — набор статусов задан CHECK 0001,
+// а каскад /stop удалил бы строку тем же путём).
 // Любой Mark завершает транзакцию PopBatch: блокировки сняты, следующий
 // проход откроет её заново. Внутри сервиса флешер один, поэтому досрочное
 // снятие блокировок с неотмеченных заданий батча безопасно.
@@ -157,7 +174,31 @@ func (q *PgQueue) Mark(ctx context.Context, job DeferredJob, _ string, status st
 	}
 	switch status {
 	case StatusRetry:
-		// UPDATE не нужен: строка уже deferred.
+		// Строка остаётся deferred, но её available_at уходит вперёд: без
+		// этого повтор перекручивался бы каждым проходом флешера (каждые
+		// 30 с) до освобождения окна лимитера — «тугая петля» из 0002.
+		// make_interval из секунд: скалярный параметр вместо конкатенации
+		// строкового интервала.
+		if _, err := q.tx.Exec(ctx, `
+			UPDATE notifier.notifications_log
+			SET available_at = now() + make_interval(secs => $3)
+			WHERE chat_id = $1 AND listing_id = $2 AND status = 'deferred'`,
+			job.ChatID, job.Event.ID, retryBackoff.Seconds()); err != nil {
+			q.rollbackTx(ctx)
+			return fmt.Errorf("queue mark retry: %w", err)
+		}
+	case StatusDropped:
+		// Снять с очереди без отправки: DELETE deferred-строки в той же
+		// транзакции, что держит на ней FOR UPDATE (отдельным соединением
+		// упёрлись бы в собственную блокировку — самодедлок, как и карантин
+		// в PopBatch). ТЗ 4.2: пользователь удалён — доставка ему не нужна.
+		if _, err := q.tx.Exec(ctx, `
+			DELETE FROM notifier.notifications_log
+			WHERE chat_id = $1 AND listing_id = $2 AND status = 'deferred'`,
+			job.ChatID, job.Event.ID); err != nil {
+			q.rollbackTx(ctx)
+			return fmt.Errorf("queue drop: %w", err)
+		}
 	case StatusSent, StatusUnknown:
 		if _, err := q.tx.Exec(ctx, `
 			UPDATE notifier.notifications_log
@@ -176,6 +217,23 @@ func (q *PgQueue) Mark(ctx context.Context, job DeferredJob, _ string, status st
 		return fmt.Errorf("queue commit: %w", err)
 	}
 	q.tx = nil
+	return nil
+}
+
+// DropChatJobs удаляет отложенные задания чата (ТЗ 4.2: «/stop удаляет и
+// отложенные задания») — паритет с memory-очередью и идемпотентность:
+// чат без deferred-строк — тоже успех. В db-режиме /stop удаляет запись
+// users каскадом (ON DELETE CASCADE), что чистит и её deferred-строки;
+// явный DELETE закрывает окно между удалением пользователя и строкой,
+// забранной PopBatch «в полёте», — если флешер держит FOR UPDATE на строке
+// чата, DELETE дождётся снятия блокировки (Mark завершает транзакцию),
+// и строка уйдёт до записи sent. Автономный Exec, как в Postpone.
+func (q *PgQueue) DropChatJobs(ctx context.Context, chatID int64) error {
+	if _, err := q.pool.Exec(ctx, `
+		DELETE FROM notifier.notifications_log
+		WHERE chat_id = $1 AND status = 'deferred'`, chatID); err != nil {
+		return fmt.Errorf("queue drop chat jobs: %w", err)
+	}
 	return nil
 }
 

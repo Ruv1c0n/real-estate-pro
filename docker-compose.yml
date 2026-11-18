@@ -111,8 +111,9 @@ services:
       - "8080:8080"
     environment:
       REDIS_URL: redis://redis:6379/0
-      # notifier работает с Postgres: SQL-миграция 0001 применяется
-      # встроенным раннером при старте. БД недоступна на старте —
+      # notifier работает с Postgres: SQL-миграции каталога
+      # notifier/migrations/ (сейчас 0001, 0002) применяются встроенным
+      # раннером при старте. БД недоступна на старте —
       # сервис завершается с ошибкой (fail-fast); POSTGRES_* не заданы —
       # memory-режим (в логе "DB disabled"). Данные передаются отдельными
       # переменными, чтобы спецсимволы пароля не ломали подключение.
@@ -121,6 +122,9 @@ services:
       POSTGRES_USER: "${POSTGRES_USER:-app}"
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-app}"
       POSTGRES_DB: "${POSTGRES_DB:-realestate}"
+      # Пустое значение допустимо: dsnFromEnv считает незаданный sslmode
+      # пустым и подставляет дефолт disable (notifier/internal/db/db.go).
+      POSTGRES_SSLMODE: "${POSTGRES_SSLMODE:-}"
       CORE_API_URL: http://core-api:8000
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       ADMIN_KEY: ${ADMIN_KEY:-}
