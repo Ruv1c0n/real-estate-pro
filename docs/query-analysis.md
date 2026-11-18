@@ -80,3 +80,66 @@ DATABASE_URL=... .venv/Scripts/python -I scripts/db/gen-analysis-data.py --trunc
 # планы — см. таблицу выше, например:
 # EXPLAIN (ANALYZE, TIMING OFF) SELECT ... WHERE deal_type='rent' AND city_id=1 ...
 ```
+
+## Схема notifier — анализ запросов (дополнение)
+
+Отдельный прогон по второй схеме (ТЗ 6.1): запросы взяты из кода notifier
+в main (`internal/store/postgres.go`, `internal/notify/journal_pg.go`,
+`limiter_pg.go`, `queue_pg.go`), данные — `scripts/db/gen-notifier-data.py`:
+5 000 пользователей, 24 850 подписок, 150 000 строк журнала за 30 дней
+(sent 75% / unknown 5% / failed 5% / deferred 15%), очередь — 22 439
+заданий. Масштаб ×5–×10 от демо-нагрузки ТЗ.
+
+| # | Запрос (источник) | Время | Индекс |
+|---|---|---|---|
+| N1 | Диспетчер: `SELECT ... FROM subscriptions ORDER BY id` (dispatch All) | 2.9 мс | `subscriptions_pkey`, полный обход |
+| N2 | Подписки чата: `WHERE chat_id = $1` (ByChat) | <0.1 мс | `subscriptions_chat_id_idx` |
+| N3 | Журнал «уже доставлено?»: `EXISTS ... WHERE chat_id AND listing_id` (journal Sent) | 0.03 мс | `notifications_log_user_listing_uq` |
+| N4 | Лимитер 30/час: `count ... WHERE chat_id AND mode AND sent_at > now()-1h` | 0.08 мс | `notifications_log_rate_idx` |
+| N5 | Pop очереди, **код до PR #72**: `WHERE status='deferred' ORDER BY created_at LIMIT 10 FOR UPDATE SKIP LOCKED` | **44.3 мс** | см. «PopBatch» ниже |
+| N6 | Pop очереди, **целевой вид из 0002, в main с PR #72**: `WHERE status='deferred' AND available_at <= now() ORDER BY available_at` | 0.045 мс | `notifications_log_available_idx` |
+| N7 | Mark: `UPDATE ... WHERE chat_id AND listing_id AND status='deferred'` | <0.1 мс | `notifications_log_user_listing_uq` |
+| N8 | `/stop`: `DELETE FROM users` с каскадом подписок и журнала | 0.27 мс | PK + каскадные FK |
+
+### ПопBatch: была находка — уже внедрена (PR #72)
+
+История: PopBatch в коде на момент анализа использовал
+`WHERE status = 'deferred' ORDER BY created_at`, а миграция 0002 к этому
+моменту уже заменила индекс deferred-очереди на `available_at`
+(`notifications_log_available_idx`). Разрыв форм запросов на бэклоге
+22 439 deferred давал: планировщик собирал **все** deferred-строки
+bitmap-сканом и сортировал **на диске** (external merge, 8.8 МБ) ради
+LIMIT 10 — **44.3 мс** на каждый проход флешера (раз в 30 с, 8 воркеров),
+под `FOR UPDATE`-блокировками. Целевой вид из комментария миграции —
+прямо по индексу: **0.045 мс** (**×1000**).
+
+Даниил реализовал целевой вид в PR #72 (`WHERE status = 'deferred'
+AND available_at <= now() ORDER BY available_at, id`) — в main PopBatch
+идёт по индексу, backoff-семантика `available_at` включена. Замер выше
+сохранён как обоснование этого перехода.
+
+### Наблюдение: диспетчер читает все подписки на каждое событие
+
+`MatchAll` выполняет `SELECT ... FROM subscriptions` целиком (2.9 мс на
+24 850 строк) и фильтрует в Go. На демо-нагрузке ок; если подписок станет
+на порядки больше — кандидат на SQL-матчинг или инкрементальную выборку
+по индексам подписок (страна+город). Решение за Даниилом, схема не мешает.
+
+### Наблюдение: available_at
+
+На момент анализа `available_at` (миграция 0002) в коде notifier не
+использовался — PopBatch работал через `created_at` (совместимо, как и
+заявлено в миграции). С мержем PR #72 колонка задействована: backoff
+повтора и выборка очереди идут по `available_at`.
+
+### Как воспроизвести
+
+```bash
+docker run -d --name pg-n -e POSTGRES_USER=app -e POSTGRES_PASSWORD=app \
+  -e POSTGRES_DB=realestate -p 127.0.0.1:5448:5432 postgres:16
+for f in notifier/migrations/*.sql; do docker exec -i pg-n psql -U app \
+  -d realestate -v ON_ERROR_STOP=1 -q < "$f"; done
+DATABASE_URL=postgresql://app:app@127.0.0.1:5448/realestate \
+  .venv/Scripts/python -I scripts/db/gen-notifier-data.py --truncate
+# планы — запросы N1–N8 из таблицы выше
+```
