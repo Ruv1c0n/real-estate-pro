@@ -40,6 +40,19 @@ const (
 // задание остаётся в очереди и будет повторено следующим проходом флешера.
 const StatusRetry = "retry"
 
+// StatusDropped — тоже не статус журнала, а инструкция Mark для очереди:
+// задание снимается с очереди БЕЗ отправки и без возврата (ТЗ 4.2 — получатель
+// удалён между откладыванием задания и его обработкой). Отдельного статуса
+// журнала для этого нет и быть не должно: набор статусов notifications_log
+// задан CHECK-констрейнтом 0001 ('deferred'/'sent'/'failed'/'unknown'), а
+// менять схему вне миграций нельзя. В PgQueue это DELETE deferred-строки —
+// тот же исход, что у каскада /stop, закрывающий окно гонки; в MemoryQueue —
+// удаление задания из очереди. Дедуп при этом «забывает» пару
+// (chat_id, listing_id): это безопасно — пользователю с удалённой записью
+// уведомления не доставляются, а при повторном /start событие вернётся в стрим
+// только при повторной публикации (ТЗ 4.3, at-least-once).
+const StatusDropped = "drop"
+
 // Journal — журнал отправленных уведомлений: одному пользователю одно
 // объявление доставляется не более одного раза (ФТ-3.5). Дедуп постоянный,
 // без TTL: в PostgreSQL это UNIQUE (chat_id, listing_id).
@@ -78,7 +91,8 @@ type DeferredQueue interface {
 	// PopBatch возвращает до limit самых старых заданий из очереди.
 	PopBatch(ctx context.Context, limit int) ([]DeferredJob, error)
 	// Mark фиксирует исход: sent/unknown — доставка завершена,
-	// retry — задание остаётся в очереди.
+	// retry — задание остаётся в очереди, drop — задание снимается
+	// с очереди без отправки (получатель удалён, ТЗ 4.2).
 	Mark(ctx context.Context, job DeferredJob, mode, status string) error
 }
 
@@ -349,6 +363,24 @@ func (d *Dispatcher) deliverRecipient(ctx context.Context, chatID int64, e model
 	if sent {
 		return nil // событие доставлено повторно — не дублируем (ФТ-3.5)
 	}
+	// ТЗ 4.2 «перед отправкой проверяется существование пользователя»:
+	// подписка могла быть снята /stop'ом уже после subs.All (пользователь
+	// удалён) — отправлять сообщение несуществующему чату нельзя. Проверка до
+	// лимитера: слот окна не занимаем — пользователь его всё равно не потратит.
+	exists, err := d.subs.UserExists(rctx, chatID)
+	if err != nil {
+		// Проверка существования недоступна: доставку не начинаем (ТЗ 4.2
+		// запрещает отправку без неё). Ошибка события → повтор через pending
+		// (issue #53, ТЗ 4.3), как и остальные временные сбои БД.
+		return fmt.Errorf("user check listing %d chat %d: %w", e.ID, chatID, err)
+	}
+	if !exists {
+		// Пользователь удалён (/stop) после выбора получателей: доставка ему
+		// не нужна. Задание в очередь отложенных НЕ возвращается — в db-режиме
+		// каскад /stop уже снял бы его, здесь закрывается то же окно гонки.
+		log.Printf("user %d gone: skip listing %d (ТЗ 4.2)", chatID, e.ID)
+		return nil
+	}
 	ok, err := d.limiter.Allow(rctx, chatID, d.mode)
 	if err != nil {
 		// Окно лимитера не подтверждено: трактовать как «слот занят» нельзя —
@@ -518,6 +550,31 @@ func (d *Dispatcher) flushJob(ctx context.Context, job DeferredJob) {
 		// (UPDATE не найдёт её), в memory Mark убирает из очереди.
 		if merr := d.queue.Mark(ctx, job, d.mode, StatusSent); merr != nil {
 			log.Printf("mark listing %d chat %d: %v", job.Event.ID, job.ChatID, merr)
+		}
+		return
+	}
+
+	// ТЗ 4.2: перед отправкой проверяем существование пользователя — задание
+	// могло отлежаться в очереди, пока пользователь сделал /stop. Проверка до
+	// лимитера: слот окна не занимаем и не отдаем Mark'ом с чужой семантикой.
+	exists, uerr := d.subs.UserExists(ctx, job.ChatID)
+	if uerr != nil {
+		// Проверка недоступна — задание остаётся в очереди (retry), повтор
+		// следующим проходом флешера (ТЗ 3.6: отложенные не отбрасываются).
+		log.Printf("user check deferred listing %d chat %d: %v", job.Event.ID, job.ChatID, uerr)
+		if merr := d.queue.Mark(ctx, job, d.mode, StatusRetry); merr != nil {
+			log.Printf("mark retry listing %d chat %d: %v", job.Event.ID, job.ChatID, merr)
+		}
+		return
+	}
+	if !exists {
+		// Пользователь удалён (/stop) между откладыванием задания и флешем:
+		// доставка ему не нужна, задание снимается с очереди без отправки
+		// (Mark drop — в Pg DELETE deferred-строки, тот же исход, что у
+		// каскада /stop; ТЗ 4.2).
+		log.Printf("user %d gone: drop deferred listing %d (ТЗ 4.2)", job.ChatID, job.Event.ID)
+		if merr := d.queue.Mark(ctx, job, d.mode, StatusDropped); merr != nil {
+			log.Printf("mark drop listing %d chat %d: %v", job.Event.ID, job.ChatID, merr)
 		}
 		return
 	}

@@ -9,6 +9,7 @@ on:
       - collector/**
       - .github/workflows/python-ci.yml
       - requirements-lint.txt
+      - scripts/qa/openapi-check.py
   push:
     branches:
       - "**"
@@ -17,6 +18,7 @@ on:
       - collector/**
       - .github/workflows/python-ci.yml
       - requirements-lint.txt
+      - scripts/qa/openapi-check.py
   workflow_dispatch:
 
 # Новый пуш в ту же ветку отменяет устаревший прогон — экономия минут
@@ -44,6 +46,31 @@ jobs:
 
   pytest:
     runs-on: ubuntu-latest
+    # services для будущих интеграционных тестов core-api; сейчас тесты без БД
+    # проходят и с ними (env ниже просто доступен, ничего не ломается).
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: realestate
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U app -d realestate"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     strategy:
       fail-fast: false
       matrix:
@@ -56,6 +83,11 @@ jobs:
       # Используем зависимости разработки, если файл существует.
       # Для сервисов без тестов пропускаем запуск pytest.
       - name: pytest (если есть тесты)
+        # env задан обоим сервисам матрицы (core-api и collector) — безвредно для
+        # collector; core-api config.py читает их без префикса (validation_alias).
+        env:
+          DATABASE_URL: postgresql+asyncpg://app:app@127.0.0.1:5432/realestate
+          REDIS_URL: redis://127.0.0.1:6379/0
         run: |
           svc="${{ matrix.service }}"
 
@@ -75,3 +107,35 @@ jobs:
           else
             echo "В $svc тестов пока нет — шаг пропущен"
           fi
+
+  # OpenAPI-гейт (зона интеграции): схема /docs не пустеет и не худеет по мере
+  # мержей — обязательные пути health (ФТ-2.7) всегда в схеме. POSTGRES_* —
+  # фиктивные, чтобы pydantic-settings собрал DSN; реальных соединений при
+  # старте нет (health-проверки ленивые), движок создаётся без подключения.
+  openapi-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r core-api/requirements.txt
+      - name: Поднять core-api и сверить схему
+        env:
+          POSTGRES_HOST: 127.0.0.1
+          POSTGRES_PORT: "5432"
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: realestate
+          CORE_API_LOG_LEVEL: WARNING
+        run: |
+          cd core-api
+          python -m uvicorn app.main:app --port 8000 &
+          # Ждём /health/live (без обращений к зависимостям, всегда 200):
+          # /health при недоступных postgres/redis честно даёт 503 (ФТ-2.7),
+          # а гейту схема нужна независимо от состояния БД.
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/health/live > /dev/null && break
+            sleep 1
+          done
+          curl -sf http://localhost:8000/openapi.json | python ../scripts/qa/openapi-check.py

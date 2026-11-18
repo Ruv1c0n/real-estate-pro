@@ -132,6 +132,40 @@ func TestReaperEmptyPendingUsesLastDelivered(t *testing.T) {
 	}
 }
 
+// TestReaperRaceNewPendingBetweenReads — регресс на гонку с диспетчером
+// (ревью #73): между XPENDING и XInfoGroups диспетчер успел прочитать новую
+// пачку — last-delivered уехал вперёд уже pending-записей. Границей должен
+// стать минимальный pending ID повторного XPENDING, удалений быть не должно.
+func TestReaperRaceNewPendingBetweenReads(t *testing.T) {
+	var rdb *fakeRedis
+	rdb = &fakeRedis{
+		streamIDs:     []string{"10-1", "11-1", "12-1"},
+		pendingIDs:    nil, // на момент первого XPENDING pending пуст
+		lastDelivered: "12-1",
+		onGroupInfo: func() {
+			// Диспетчер забрал 11-1 и 12-1 в работу между двумя чтениями.
+			rdb.pendingIDs = []string{"11-1", "12-1"}
+		},
+	}
+	r := NewReaper(rdb, cleanupInterval)
+
+	n, boundary, err := r.CleanOnce(context.Background())
+	if err != nil {
+		t.Fatalf("CleanOnce: %v", err)
+	}
+	if boundary != "11-1" {
+		t.Errorf("boundary = %q, want 11-1 (min pending после перепроверки)", boundary)
+	}
+	// Удалить можно только подтверждённую 10-1 (строго раньше 11-1);
+	// claimed-но-неподтверждённые 11-1/12-1 остаются в стриме.
+	if n != 1 {
+		t.Errorf("deleted = %d, want 1 (только подтверждённая 10-1)", n)
+	}
+	if got := strings.Join(rdb.remainingIDs(), ","); got != "11-1,12-1" {
+		t.Errorf("remaining = %q, want 11-1,12-1 (без claimed-записей)", got)
+	}
+}
+
 // TestReaperNothingToCleanWhenGroupFresh — нулевой last-delivered (группа
 // создана, но ничего не доставляла) и пустой стрим — проход без удаления.
 func TestReaperNothingToCleanWhenGroupFresh(t *testing.T) {
