@@ -4,6 +4,7 @@ from decimal import Decimal
 import app.in_memory_listing_store as store_module
 import pytest
 from app.in_memory_listing_store import InMemoryListingStore
+from app.listing_filters import ListingFilters
 from app.listing_models import ListingCreate
 
 
@@ -163,3 +164,27 @@ async def test_get_unknown_listing_returns_none():
     store = InMemoryListingStore()
 
     assert await store.get(999) is None
+
+
+@pytest.mark.anyio
+async def test_search_filters_then_sorts_and_paginates(listing):
+    store = InMemoryListingStore()
+
+    first = await store.create_or_get(listing)
+    second = await store.create_or_get(
+        listing.model_copy(update={"external_id": "second-studio"})
+    )
+    await store.create_or_get(
+        listing.model_copy(update={"external_id": "one-room", "rooms": 1})
+    )
+
+    filters = ListingFilters(rooms=0, price_max=380, sort="price_desc", size=1)
+
+    page_one = await store.search(filters)
+    page_two = await store.search(filters.model_copy(update={"page": 2}))
+    page_three = await store.search(filters.model_copy(update={"page": 3}))
+
+    assert page_one.total == page_two.total == page_three.total == 2
+    assert [item.id for item in page_one.items] == [second.listing.id]
+    assert [item.id for item in page_two.items] == [first.listing.id]
+    assert page_three.items == []
