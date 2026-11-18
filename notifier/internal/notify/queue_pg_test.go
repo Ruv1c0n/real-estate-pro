@@ -443,3 +443,42 @@ func TestPgThirtyPerHourScenario(t *testing.T) {
 		t.Errorf("после флеша status = %q, want sent", status)
 	}
 }
+
+// TestPgQueueDropChatJobs — ТЗ 4.2 «/stop удаляет и отложенные задания»:
+// DELETE deferred-строк чата, идемпотентно; deferred-строки других чатов
+// и уже отправленные записи журнала остаются.
+func TestPgQueueDropChatJobs(t *testing.T) {
+	resetTestDB(t)
+	mustAddUser(t, 100)
+	mustAddUser(t, 200)
+	q := NewPgQueue(testPool)
+	mustPostpone(t, q, 100, 1)
+	mustPostpone(t, q, 100, 2)
+	mustPostpone(t, q, 200, 3)
+	ctx := context.Background()
+
+	if err := q.DropChatJobs(ctx, 100); err != nil {
+		t.Fatalf("DropChatJobs: %v", err)
+	}
+
+	var n int
+	if err := testPool.QueryRow(ctx,
+		"SELECT count(*) FROM notifier.notifications_log WHERE chat_id = 100 AND status = 'deferred'").Scan(&n); err != nil {
+		t.Fatalf("count chat 100: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("после drop deferred-строк чата 100 = %d, want 0", n)
+	}
+	if err := testPool.QueryRow(ctx,
+		"SELECT count(*) FROM notifier.notifications_log WHERE chat_id = 200 AND status = 'deferred'").Scan(&n); err != nil {
+		t.Fatalf("count chat 200: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("deferred-строки чата 200 = %d, want 1", n)
+	}
+
+	// Идемпотентность: повторный drop без строк — тоже успех.
+	if err := q.DropChatJobs(ctx, 100); err != nil {
+		t.Fatalf("повторный DropChatJobs: %v", err)
+	}
+}

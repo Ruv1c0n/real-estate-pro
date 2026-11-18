@@ -23,6 +23,8 @@ const validPayload = `{"event_id":"550e8400-e29b-41d4-a716-446655440000","id":12
 
 // fakeRedis — сценарный двойник Redis: первую пачку сообщений выдаёт XREADGROUP,
 // дальше пусто. Подтверждения и dead-letter пишет в логи для проверок.
+// Состояние стрима (streamIDs/pendingIDs/lastDelivered) используется тестами
+// очистки (reaper_test.go).
 type fakeRedis struct {
 	mu        sync.Mutex
 	groupErr  error
@@ -31,7 +33,16 @@ type fakeRedis struct {
 	dead      []redis.XAddArgs
 	xaddErr   error
 	readCalls int
-	streamLen int64 // длина стрима для XLEN (мониторинг мягкого порога, ТЗ 3.6)
+
+	streamIDs     []string // содержимое стрима, отсортировано по ID
+	pendingIDs    []string // PEL группы (в работе / не подтверждены)
+	lastDelivered string   // last-delivered-id группы
+	deleted       []string // записи, удалённые XDel
+	streamLen     int64    // длина стрима для XLEN (мониторинг мягкого порога, ТЗ 3.6)
+
+	// onGroupInfo вызывается внутри XInfoGroups (под мьютексом) — имитирует
+	// диспетчера, успевшего прочитать пачку между XPENDING и XInfoGroups.
+	onGroupInfo func()
 }
 
 func (f *fakeRedis) XGroupCreateMkStream(ctx context.Context, stream, group, start string) *redis.StatusCmd {
@@ -106,6 +117,92 @@ func (f *fakeRedis) ackedIDs() []string {
 	return append([]string(nil), f.acked...)
 }
 
+// XPending — summary-форма: Count и границы PEL (Lower — минимальный ID).
+func (f *fakeRedis) XPending(ctx context.Context, stream, group string) *redis.XPendingCmd {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cmd := redis.NewXPendingCmd(ctx)
+	p := &redis.XPending{Consumers: map[string]int64{}}
+	if len(f.pendingIDs) > 0 {
+		p.Count = int64(len(f.pendingIDs))
+		p.Lower = f.pendingIDs[0]
+		p.Higher = f.pendingIDs[len(f.pendingIDs)-1]
+	}
+	cmd.SetVal(p)
+	return cmd
+}
+
+// XInfoGroups отдаёт группу notifier с её last-delivered-id.
+func (f *fakeRedis) XInfoGroups(ctx context.Context, stream string) *redis.XInfoGroupsCmd {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cmd := redis.NewXInfoGroupsCmd(ctx, stream)
+	cmd.SetVal([]redis.XInfoGroup{{Name: GroupName, LastDeliveredID: f.lastDelivered}})
+	if f.onGroupInfo != nil {
+		f.onGroupInfo()
+	}
+	return cmd
+}
+
+// XRange фильтрует стрим по диапазону: "-" — с начала, "(" — исключающая
+// граница (Redis 6.2+), как в реальном XRANGE.
+func (f *fakeRedis) XRange(ctx context.Context, stream, start, stop string) *redis.XMessageSliceCmd {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cmd := redis.NewXMessageSliceCmd(ctx)
+	var out []redis.XMessage
+	for _, id := range f.streamIDs {
+		if !inRange(id, start, stop) {
+			continue
+		}
+		out = append(out, redis.XMessage{ID: id, Values: map[string]any{"data": "{}"}})
+	}
+	cmd.SetVal(out)
+	return cmd
+}
+
+// XDel удаляет записи из стрима; PEL не трогает — как реальный Redis
+// (тест очистки проверяет, что pending после XDEL не меняется).
+func (f *fakeRedis) XDel(ctx context.Context, stream string, ids ...string) *redis.IntCmd {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cmd := redis.NewIntCmd(ctx)
+	removed := map[string]bool{}
+	for _, id := range ids {
+		removed[id] = true
+	}
+	var rest []string
+	for _, id := range f.streamIDs {
+		if removed[id] {
+			f.deleted = append(f.deleted, id)
+			continue
+		}
+		rest = append(rest, id)
+	}
+	f.streamIDs = rest
+	cmd.SetVal(int64(len(ids)))
+	return cmd
+}
+
+// inRange проверяет, что id попадает в диапазон XRANGE: "-" — с начала,
+// "+" — до конца; префикс "(" задаёт исключающую границу (Redis 6.2+).
+// Сравнение — как пар (мс, seq), лексикография строк потока не годится.
+func inRange(id, start, stop string) bool {
+	min := start
+	minExclusive := false
+	if s, ok := strings.CutPrefix(start, "("); ok {
+		min, minExclusive = s, true
+	}
+	max := stop
+	maxExclusive := false
+	if s, ok := strings.CutPrefix(stop, "("); ok {
+		max, maxExclusive = s, true
+	}
+	ge := min == "-" || compareStreamIDs(id, min) > 0 || (compareStreamIDs(id, min) == 0 && !minExclusive)
+	le := max == "+" || compareStreamIDs(id, max) < 0 || (compareStreamIDs(id, max) == 0 && !maxExclusive)
+	return ge && le
+}
+
 func (f *fakeRedis) deadCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -123,7 +220,7 @@ func runConsumer(t *testing.T, rdb *fakeRedis, handle Handler, ready func() bool
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- NewConsumer(rdb, "test-1", handle).Run(ctx) }()
+	go func() { done <- NewConsumer(rdb, "test-1", 2, lenWarnThreshold, handle).Run(ctx) }()
 
 	deadline := time.Now().Add(3 * time.Second)
 	for !ready() && time.Now().Before(deadline) {
@@ -315,23 +412,23 @@ func (s *syncBuf) String() string {
 // за порог, дальше молчание, пока длина не упадёт ниже reset-порога 9000.
 func TestStreamLenWarnStateHysteresis(t *testing.T) {
 	// Ниже порога — молчание, гистерезис не взводится.
-	if warn, w := streamLenWarnState(streamLenWarnThreshold-1, false); warn || w {
+	if warn, w := streamLenWarnState(lenWarnThreshold-1, false, lenWarnThreshold); warn || w {
 		t.Fatalf("len < порога: warn=%v, warned=%v; want false, false", warn, w)
 	}
 	// Ровно порог — уже превышение (>=).
-	if warn, w := streamLenWarnState(streamLenWarnThreshold, false); !warn || !w {
+	if warn, w := streamLenWarnState(lenWarnThreshold, false, lenWarnThreshold); !warn || !w {
 		t.Fatalf("len = порога: warn=%v, warned=%v; want true, true", warn, w)
 	}
 	// Пока warned и длина ещё выше reset — повторных WARN нет (не спамим).
-	if warn, w := streamLenWarnState(streamLenWarnThreshold+100, true); warn || !w {
+	if warn, w := streamLenWarnState(lenWarnThreshold+100, true, lenWarnThreshold); warn || !w {
 		t.Fatalf("длинный стрим после WARN: warn=%v, warned=%v; want false, true", warn, w)
 	}
 	// Длина упала ниже reset — гистерезис снят (без WARN в этот проход).
-	if warn, w := streamLenWarnState(streamLenWarnReset-1, true); warn || w {
+	if warn, w := streamLenWarnState(streamLenWarnReset-1, true, lenWarnThreshold); warn || w {
 		t.Fatalf("len < reset: warn=%v, warned=%v; want false, false", warn, w)
 	}
 	// После снятия гистерезиса новый выход за порог снова предупреждает.
-	if warn, w := streamLenWarnState(streamLenWarnThreshold, false); !warn || !w {
+	if warn, w := streamLenWarnState(lenWarnThreshold, false, lenWarnThreshold); !warn || !w {
 		t.Fatalf("повторный выход за порог: warn=%v, warned=%v; want true, true", warn, w)
 	}
 }
@@ -345,14 +442,14 @@ func TestConsumerWarnsOnStreamLenThreshold(t *testing.T) {
 	log.SetOutput(sbuf)
 	defer log.SetOutput(old)
 
-	rdb := &fakeRedis{streamLen: streamLenWarnThreshold + 1}
+	rdb := &fakeRedis{streamLen: lenWarnThreshold + 1}
 	err := runConsumer(t, rdb, func(context.Context, model.Event) error { return nil },
 		func() bool { return strings.Contains(sbuf.String(), "soft threshold") })
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	logged := sbuf.String()
-	if !strings.Contains(logged, fmt.Sprintf("length %d", streamLenWarnThreshold+1)) {
+	if !strings.Contains(logged, fmt.Sprintf("length %d", lenWarnThreshold+1)) {
 		t.Errorf("в логе нет текущей длины стрима: %q", logged)
 	}
 	if !strings.Contains(logged, "test-1") {
@@ -371,7 +468,7 @@ func TestConsumerStaysSilentBelowStreamLenThreshold(t *testing.T) {
 	log.SetOutput(sbuf)
 	defer log.SetOutput(old)
 
-	rdb := &fakeRedis{streamLen: streamLenWarnThreshold - 1}
+	rdb := &fakeRedis{streamLen: lenWarnThreshold - 1}
 	err := runConsumer(t, rdb, func(context.Context, model.Event) error { return nil },
 		func() bool { return true }) // ждём штатную остановку по cancel
 	if err != nil {

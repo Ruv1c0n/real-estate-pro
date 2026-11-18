@@ -220,6 +220,23 @@ func (q *PgQueue) Mark(ctx context.Context, job DeferredJob, _ string, status st
 	return nil
 }
 
+// DropChatJobs удаляет отложенные задания чата (ТЗ 4.2: «/stop удаляет и
+// отложенные задания») — паритет с memory-очередью и идемпотентность:
+// чат без deferred-строк — тоже успех. В db-режиме /stop удаляет запись
+// users каскадом (ON DELETE CASCADE), что чистит и её deferred-строки;
+// явный DELETE закрывает окно между удалением пользователя и строкой,
+// забранной PopBatch «в полёте», — если флешер держит FOR UPDATE на строке
+// чата, DELETE дождётся снятия блокировки (Mark завершает транзакцию),
+// и строка уйдёт до записи sent. Автономный Exec, как в Postpone.
+func (q *PgQueue) DropChatJobs(ctx context.Context, chatID int64) error {
+	if _, err := q.pool.Exec(ctx, `
+		DELETE FROM notifier.notifications_log
+		WHERE chat_id = $1 AND status = 'deferred'`, chatID); err != nil {
+		return fmt.Errorf("queue drop chat jobs: %w", err)
+	}
+	return nil
+}
+
 // rollbackTx откатывает незавершённую транзакцию PopBatch: строки остаются
 // deferred и будут забраны следующим проходом.
 func (q *PgQueue) rollbackTx(ctx context.Context) {

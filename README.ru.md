@@ -116,6 +116,10 @@ docker compose down
 | `DATABASE_URL` | Только для локального Core API (`postgresql+asyncpg`); notifier проверяет её первой — до `POSTGRES_*` — как legacy-DSN. Работают только форматы, которые разбирает pgx: значение `+asyncpg` из `.env.example` уронит локальный запуск notifier |
 | `REDIS_URL` | Адрес Redis; сейчас задан в Compose |
 | `CORE_API_URL` | Адрес Core API для collector и справочников notifier |
+| `NOTIFIER_NOTIFICATIONS_PER_HOUR` | Лимит уведомлений Telegram за скользящий час на пользователя (ТЗ 3.6; по умолчанию значение ТЗ — 30). Мусорное или неположительное значение — фатальная ошибка старта |
+| `NOTIFIER_WORKERS` | Размер пула воркеров consumer'а `listings.new` (ТЗ 3.6; по умолчанию значение ТЗ — 8) |
+| `NOTIFIER_STREAM_LEN_THRESHOLD` | Мягкий порог WARN длины стрима `listings.new` (симптом отставания consumer'а; по умолчанию 10000), WARN не влияет на доставку и не обрезает стрим |
+| `NOTIFIER_STREAM_CLEANUP_INTERVAL` | Период безопасной очистки стрима — удаляются только подтверждённые записи за границей min-pending (ТЗ 4.3; по умолчанию 5m) |
 | `MOCK_MODE` | `true` по умолчанию; требуется подключить к конфигурации collector |
 | `MOCK_PUBLISH_MODE` | `batch` по умолчанию или `stream`; предстоит реализовать |
 | Ключ администратора | Переменная `ADMIN_KEY`, заголовок `X-Admin-Key`; пустое значение выключает `/debug/event` |

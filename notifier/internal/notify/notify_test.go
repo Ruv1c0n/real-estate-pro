@@ -1056,6 +1056,49 @@ func TestMemoryQueuePostponeInflightVisible(t *testing.T) {
 	}
 }
 
+// TestMemoryQueueDropChatJobs — ТЗ 4.2 «/stop удаляет и отложенные задания»:
+// DropChatJobs убирает deferred-задания чата и снимает пометку «в полёте»
+// с его пар, задания других чатов остаются.
+func TestMemoryQueueDropChatJobs(t *testing.T) {
+	q := NewMemoryQueue()
+	ctx := context.Background()
+	if err := q.Postpone(ctx, 10, testEvent(1), ModeLog); err != nil {
+		t.Fatalf("postpone chat 10: %v", err)
+	}
+	if err := q.Postpone(ctx, 10, testEvent(2), ModeLog); err != nil {
+		t.Fatalf("postpone chat 10: %v", err)
+	}
+	if err := q.Postpone(ctx, 20, testEvent(3), ModeLog); err != nil {
+		t.Fatalf("postpone chat 20: %v", err)
+	}
+	// Одно задание чата 10 «в полёте»: тоже должно исчезнуть после /stop.
+	jobs, err := q.PopBatch(ctx, 1)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("popbatch: %v, %d заданий", err, len(jobs))
+	}
+	if jobs[0].ChatID != 10 {
+		t.Fatalf("в полёте задание чата %d, want 10", jobs[0].ChatID)
+	}
+
+	if err := q.DropChatJobs(ctx, 10); err != nil {
+		t.Fatalf("drop chat jobs: %v", err)
+	}
+
+	// После /stop в очереди остаётся только задание чата 20; повторная
+	// публикация пары чата 10 снова видна — пометка «в полёте» снята.
+	jobs, err = q.PopBatch(ctx, 10)
+	if err != nil {
+		t.Fatalf("popbatch после drop: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].ChatID != 20 {
+		t.Fatalf("после drop в очереди %v, want одно задание чата 20", jobs)
+	}
+	// DropChatJobs идемпотентен.
+	if err := q.DropChatJobs(ctx, 10); err != nil {
+		t.Fatalf("повторный drop: %v", err)
+	}
+}
+
 // TestFlushSkipsAlreadySent — ТЗ 4.3 «Уже записанное состояние sent не
 // отправляется повторно»: задание лежит в очереди, событие уже доставлено
 // другим путём — Flush не отправляет второй раз и закрывает задание как sent.

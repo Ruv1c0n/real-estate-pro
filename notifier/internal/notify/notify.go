@@ -96,6 +96,15 @@ type DeferredQueue interface {
 	Mark(ctx context.Context, job DeferredJob, mode, status string) error
 }
 
+// ChatCleaner — очистка отложенных заданий одного чата (ТЗ 4.2: «/stop
+// удаляет и отложенные задания»). Реализуют MemoryQueue и PgQueue; бот
+// вызывает её после store.DeleteUser, если очередь под рукой реализует
+// интерфейс (в db-режиме каскад FK чистит deferred-строки вместе с users,
+// очистка при этом идемпотентна — паритет и защита memory-режима).
+type ChatCleaner interface {
+	DropChatJobs(ctx context.Context, chatID int64) error
+}
+
 // journalKey — ключ in-memory журнала: пара (объявление, пользователь).
 type journalKey struct {
 	listingID int64
