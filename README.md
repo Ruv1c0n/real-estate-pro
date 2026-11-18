@@ -2,6 +2,12 @@
 
 [English](README.md) | [Русский](README.ru.md)
 
+![CI](https://github.com/Ruv1c0n/real-estate-pro/actions/workflows/ci.yml/badge.svg)
+![python-ci](https://github.com/Ruv1c0n/real-estate-pro/actions/workflows/python-ci.yml/badge.svg)
+![migrations](https://github.com/Ruv1c0n/real-estate-pro/actions/workflows/migrations.yml/badge.svg)
+![docs-links](https://github.com/Ruv1c0n/real-estate-pro/actions/workflows/docs-links.yml/badge.svg)
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+
 Educational team project (4 people): a microservices aggregator of rental and sale apartment listings with search and Telegram notifications.
 
 My part of the project: the Go notifier (Telegram Bot API, Redis Streams), the Telegram bot, and shared service orchestration.
@@ -10,7 +16,7 @@ My part of the project: the Go notifier (Telegram Bot API, Redis Streams), the T
 
 | Component | Stack / port | Purpose |
 |---|---|---|
-| `core-api` | Python, FastAPI, SQLAlchemy, Alembic / 8000 | Listings, search, reference data, cache, outbox, event publishing |
+| `core-api` | Python, FastAPI, SQLAlchemy (Alembic planned) / 8000 | Listings, search, reference data, cache, outbox, event publishing |
 | `collector` | Python, httpx, Jinja2, HTMX / 8001 | API adapter, mock data, normalization, delivery, web routes |
 | `notifier` | Go, go-redis, Telegram Bot API / 8080 | Users, subscriptions, Streams, delivery jobs and notifications |
 | `postgres` | PostgreSQL / 5432 | Schemas `core` and `notifier` |
@@ -19,6 +25,18 @@ My part of the project: the Go notifier (Telegram Bot API, Redis Streams), the T
 HTML scraping of listing sites is not used. An optional mock server may be added as a separate Compose profile; the three main services work without it.
 
 ## Data flow
+
+```mermaid
+flowchart LR
+    S[Source / mock] --> C[Collector]
+    C -- POST /api/v1/listings --> A[Core API]
+    A <--> DB[(PostgreSQL<br/>listings + outbox)]
+    A -- XADD listings.new --> R[(Redis Streams)]
+    A --> CACHE[Cache]
+    R --> NT[Notifier]
+    NT <--> NDB[(PostgreSQL<br/>journal + queue)]
+    NT --> TG[Telegram]
+```
 
 1. The adapter converts a source response into the internal `RawListing` format. The mock adapter reads the same internal format from a local dump.
 2. Collector normalizes the data and calls `POST /api/v1/listings`.
@@ -67,7 +85,8 @@ Without a token, notifier writes matches to stdout. In the current Compose, `MOC
 
 Once the skeleton is up:
 
-- `http://localhost:8000` and `http://localhost:8001` — temporary HTTP servers; the real applications are not implemented yet.
+- `http://localhost:8000` — core-api skeleton: `/health`, `/health/live` and `/health/ready` endpoints are served; the listings API and reference data are not implemented yet.
+- `http://localhost:8001` — collector placeholder: an HTTP server is running; the real application is not implemented yet.
 - `http://localhost:8080/health` — notifier health check: Redis and Core API reference data availability, delivery mode (telegram/log).
 - `http://localhost:8080/health/ready` — readiness check: 200 only when Redis, Core API reference data and, in db mode, PostgreSQL are available; otherwise 503 with the same JSON body.
 - `POST http://localhost:8080/debug/event` with the `X-Admin-Key` header — a demo event: the body is validated and published to the `listings.new` stream, going through the regular delivery path. If `ADMIN_KEY` is not set, the endpoint responds with 404.
@@ -83,7 +102,7 @@ docker compose down
 
 ## Target configuration (per the spec)
 
-`.env.example`, Redis volume/AOF/noeviction and notifier readiness checks have been added. Notifier stage 2 is in place: the embedded runner applies SQL migration `0001` of the `notifier` schema (prepared by Ilya) automatically at startup, and subscriptions, the notification journal, the 30-per-hour limit counters and deferred jobs are stored in PostgreSQL. If neither `DATABASE_URL` nor the `POSTGRES_*` variables are set, notifier runs in memory mode (fallback: subscriptions survive only until restart); if the variables are set but PostgreSQL is unreachable at startup, the service exits with a fatal error (fail-fast).
+`.env.example`, Redis volume/AOF/noeviction and notifier readiness checks have been added. Notifier stage 2 is in place: the embedded runner applies the SQL migrations of the `notifier` schema from `notifier/migrations/` (prepared by Ilya; currently `0001`, `0002`) automatically at startup, and subscriptions, the notification journal, the 30-per-hour limit counters and deferred jobs are stored in PostgreSQL. If neither `DATABASE_URL` nor the `POSTGRES_*` variables are set, notifier runs in memory mode (fallback: subscriptions survive only until restart); if the variables are set but PostgreSQL is unreachable at startup, the service exits with a fatal error (fail-fast).
 
 How to tell the modes apart: at startup in memory mode notifier logs `DB disabled: running in memory mode`, and the `db` field in the `GET /health` and `GET /health/ready` response bodies reflects the PostgreSQL pool. `db: false` with no pool (`nil`) is memory mode, not an outage, and does not degrade readiness.
 
@@ -93,6 +112,7 @@ With `.env` filled in, startup is a single `docker compose up --build`.
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Without a token — log mode; implemented in notifier |
 | `POSTGRES_*` | PostgreSQL address in parts (`HOST`, `PORT`, `USER`, `PASSWORD`, `DB`); this is how notifier and core-api receive it in Compose |
+| `POSTGRES_SSLMODE` | TLS mode for notifier's PostgreSQL connection (`sslmode` in the assembled DSN); an empty value means `disable`, the built-in default |
 | `DATABASE_URL` | For local Core API only (`postgresql+asyncpg`); notifier checks it first — before `POSTGRES_*` — as a legacy DSN. Only pgx-parseable formats work: the `+asyncpg` value from `.env.example` fails a local notifier startup |
 | `REDIS_URL` | Redis address; currently set in Compose |
 | `CORE_API_URL` | Core API address for collector and notifier reference data |
@@ -192,6 +212,12 @@ Delivery:
 - [Real_Estate_Pro_TZ.pdf](docs/Real_Estate_Pro_TZ.pdf) — the requirements spec (numbered: ФТ-x.x functional, НФТ-x non-functional).
 - [docs/contracts.md](docs/contracts.md) — the actual inter-service contracts (Redis Streams, reference data, outbox). In case of any conflict with this README, contracts.md wins.
 - [Contributing](CONTRIBUTING.md) — branch/commit conventions, CI and the spec's change-control rules.
+
+### Architecture and diagrams (GitHub Pages)
+
+- [Architecture diagram](https://ruv1c0n.github.io/real-estate-pro/architecture.html) — services, ports, data flows; dashed edges mark contracts declared but not yet implemented.
+- [Trail knowledge graph](https://ruv1c0n.github.io/real-estate-pro/trail-graph.html) — interactive graph of the repository's development: issues, PRs, commits, communities.
+- [Graphify graph](https://ruv1c0n.github.io/real-estate-pro/graph.html) — static pages/builds dependency graph, rebuilt in CI.
 
 ## License
 

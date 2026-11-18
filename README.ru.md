@@ -2,6 +2,12 @@
 
 [English](README.md) | [Русский](README.ru.md)
 
+![CI](https://github.com/Ruv1c0n/real-estate-pro/actions/workflows/ci.yml/badge.svg)
+![python-ci](https://github.com/Ruv1c0n/real-estate-pro/actions/workflows/python-ci.yml/badge.svg)
+![migrations](https://github.com/Ruv1c0n/real-estate-pro/actions/workflows/migrations.yml/badge.svg)
+![docs-links](https://github.com/Ruv1c0n/real-estate-pro/actions/workflows/docs-links.yml/badge.svg)
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+
 Учебный командный проект (4 человека): микросервисный агрегатор объявлений об аренде и продаже квартир с поиском и Telegram-уведомлениями.
 
 Моя часть: нотификатор на Go (Telegram Bot API, Redis Streams), Telegram-бот, совместный запуск сервисов.
@@ -10,7 +16,7 @@
 
 | Компонент | Стек / порт | Назначение |
 |---|---|---|
-| `core-api` | Python, FastAPI, SQLAlchemy, Alembic / 8000 | Объявления, поиск, справочники, кэш, outbox, публикация событий |
+| `core-api` | Python, FastAPI, SQLAlchemy (Alembic запланирован) / 8000 | Объявления, поиск, справочники, кэш, outbox, публикация событий |
 | `collector` | Python, httpx, Jinja2, HTMX / 8001 | API-адаптер, mock-данные, нормализация, доставка, веб-маршруты |
 | `notifier` | Go, go-redis, Telegram Bot API / 8080 | Пользователи, подписки, Streams, задания и отправка уведомлений |
 | `postgres` | PostgreSQL / 5432 | Схемы `core` и `notifier` |
@@ -19,6 +25,18 @@
 Парсинг HTML площадок не используется. Необязательный mock-сервер может быть добавлен отдельным Compose-профилем; три основных сервиса работают без него.
 
 ## Поток данных
+
+```mermaid
+flowchart LR
+    S[Источник / mock] --> C[Collector]
+    C -- POST /api/v1/listings --> A[Core API]
+    A <--> DB[(PostgreSQL<br/>listings + outbox)]
+    A -- XADD listings.new --> R[(Redis Streams)]
+    A --> CACHE[Кэш]
+    R --> NT[Notifier]
+    NT <--> NDB[(PostgreSQL<br/>журнал + очередь)]
+    NT --> TG[Telegram]
+```
 
 1. Адаптер преобразует ответ источника во внутренний `RawListing`. Mock-адаптер читает тот же внутренний формат из локального дампа.
 2. Collector нормализует данные и вызывает `POST /api/v1/listings`.
@@ -35,7 +53,7 @@ Collector и notifier не обращаются к схеме `core` напря�
 
 Реальный адаптер реализуется по конкретному документированному методу API Авито с необходимыми правами и авторизацией. Доступ к глобальному поиску, тариф или способ передачи учётных данных не предполагаются без проверки документации метода. Без реквизитов адаптер проверяется на фикстурах; это не заменяет проверку на реальном API. Демонстрация не требует покупки аккаунта.
 
-Дамп содержит минимум 500 синтетических объявлений для 5 стран и 10 городов. Он хранит внутренний `RawListing`; образцы внешнего ответа API используются отдельно для тестов адаптера. Многострановые mock-данные не выдаются за ответ Авито.
+Дамп содержит минимум 500 синтетических объявлений для 5 стран и 10 городов. Он хранит внутренний `RawListing`; образцы внешнего ответа API используются отдельно для тестов адаптера. Mock-данные для нескольких стран не выдаются за ответ Авито.
 
 Два режима mock:
 
@@ -67,7 +85,8 @@ ADMIN_KEY=ключ_для_debug_event
 
 После запуска каркаса:
 
-- `http://localhost:8000` и `http://localhost:8001` — временные HTTP-серверы, полноценного приложения пока нет.
+- `http://localhost:8000` — каркас core-api: отданы `/health`, `/health/live` и `/health/ready`; полноценного API объявлений и справочников пока нет.
+- `http://localhost:8001` — заглушка collector: HTTP-сервер запущен, полноценного приложения пока нет.
 - `http://localhost:8080/health` — проверка notifier: доступность Redis и справочников Core API, режим доставки (telegram/log).
 - `http://localhost:8080/health/ready` — проверка готовности: 200, только когда доступны Redis, справочники Core API и — в db-режиме — PostgreSQL; иначе 503 с тем же JSON-телом.
 - `POST http://localhost:8080/debug/event` с заголовком `X-Admin-Key` — демо-событие: тело валидируется и публикуется в стрим `listings.new`, проходя обычный путь доставки. Без заданного `ADMIN_KEY` эндпоинт отвечает 404.
@@ -83,7 +102,7 @@ docker compose down
 
 ## Целевая конфигурация по ТЗ
 
-Добавлены `.env.example`, Redis volume/AOF/noeviction и проверки готовности notifier. Этап 2 notifier реализован: встроенный раннер автоматически применяет при старте SQL-миграцию `0001` схемы `notifier` (готовит Илья), а подписки, журнал уведомлений, счётчики лимита 30/час и отложенные задания хранятся в PostgreSQL. Если не заданы ни `DATABASE_URL`, ни переменные `POSTGRES_*`, notifier работает в memory-режиме (fallback: подписки живут до рестарта); если переменные заданы, но PostgreSQL недоступен на старте, сервис завершается фатальной ошибкой (fail-fast).
+Добавлены `.env.example`, Redis volume/AOF/noeviction и проверки готовности notifier. Этап 2 notifier реализован: встроенный раннер автоматически применяет при старте SQL-миграции схемы `notifier` из `notifier/migrations/` (готовит Илья; сейчас `0001`, `0002`), а подписки, журнал уведомлений, счётчики лимита 30/час и отложенные задания хранятся в PostgreSQL. Если не заданы ни `DATABASE_URL`, ни переменные `POSTGRES_*`, notifier работает в memory-режиме (fallback: подписки живут до рестарта); если переменные заданы, но PostgreSQL недоступен на старте, сервис завершается фатальной ошибкой (fail-fast).
 
 Как понять режим: при старте в memory-режиме notifier пишет в лог `DB disabled: running in memory mode`, а поле `db` в телах `GET /health` и `GET /health/ready` отражает наличие пула PostgreSQL. `db: false` при отсутствии пула (`nil`) — это memory-режим, а не авария, и readiness он не понижает.
 
@@ -93,6 +112,7 @@ docker compose down
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Без токена — log-режим; реализовано в notifier |
 | `POSTGRES_*` | Адрес PostgreSQL по частям (`HOST`, `PORT`, `USER`, `PASSWORD`, `DB`); так notifier и core-api получают его в Compose |
+| `POSTGRES_SSLMODE` | Режим TLS для подключения notifier к PostgreSQL (`sslmode` в собранном DSN); пустое значение означает `disable` — встроенный дефолт |
 | `DATABASE_URL` | Только для локального Core API (`postgresql+asyncpg`); notifier проверяет её первой — до `POSTGRES_*` — как legacy-DSN. Работают только форматы, которые разбирает pgx: значение `+asyncpg` из `.env.example` уронит локальный запуск notifier |
 | `REDIS_URL` | Адрес Redis; сейчас задан в Compose |
 | `CORE_API_URL` | Адрес Core API для collector и справочников notifier |
@@ -192,6 +212,12 @@ docker compose down
 - [Real_Estate_Pro_TZ.pdf](docs/Real_Estate_Pro_TZ.pdf) — ТЗ (требования пронумерованы: ФТ-x.x функциональные, НФТ-x нефункциональные).
 - [docs/contracts.md](docs/contracts.md) — актуальные контракты между сервисами (Redis Streams, справочники, outbox). При расхождении с этим README приоритет у contracts.md.
 - [Contributing](CONTRIBUTING.ru.md) — правила веток и коммитов, CI и требования ТЗ к изменению контрактов.
+
+### Архитектура и диаграммы (GitHub Pages)
+
+- [Диаграмма архитектуры](https://ruv1c0n.github.io/real-estate-pro/architecture.html) — сервисы, порты, потоки данных; пунктирные рёбра — контракты, заявленные, но ещё не реализованные.
+- [Trail-граф](https://ruv1c0n.github.io/real-estate-pro/trail-graph.html) — интерактивный граф разработки репозитория: issues, PR, коммиты, сообщества.
+- [Graphify-граф](https://ruv1c0n.github.io/real-estate-pro/graph.html) — граф зависимости страниц/сборок, пересобирается в CI.
 
 ## Лицензия
 
