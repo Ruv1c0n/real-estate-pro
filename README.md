@@ -216,6 +216,7 @@ Delivery:
 - [Real_Estate_Pro_TZ.pdf](docs/Real_Estate_Pro_TZ.pdf) — the requirements spec (numbered: ФТ-x.x functional, НФТ-x non-functional).
 - [docs/contracts.md](docs/contracts.md) — the actual inter-service contracts (Redis Streams, reference data, outbox). In case of any conflict with this README, contracts.md wins.
 - [Contributing](CONTRIBUTING.md) — branch/commit conventions, CI and the spec's change-control rules.
+- Per-service docs: [notifier](notifier/README.md), [core-api](core-api/README.md), [collector](collector/README.md).
 
 ### Architecture and diagrams (GitHub Pages)
 
