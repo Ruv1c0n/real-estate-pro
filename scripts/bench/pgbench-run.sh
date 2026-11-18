@@ -6,7 +6,8 @@
 # ПРЕДУСЛОВИЯ: таблица listings с данными (появится с core-миграциями +
 # дампом 500+). Скрипт честно выходит, если её нет — каркас, не приёмка.
 #
-# Вход: POSTGRES_CONTAINER/USER/DB как в backup.sh; T (секунд, default 30);
+# Вход: POSTGRES_CONTAINER/USER/DB как в scripts/db/backup.sh (PR #83);
+# T (секунд, default 30);
 # C (клиентов, default 1 — НФТ-10 меряет «одного последовательного клиента»).
 
 set -euo pipefail
