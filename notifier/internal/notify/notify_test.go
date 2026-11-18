@@ -372,6 +372,10 @@ func TestFlushDeliversAndMarksSent(t *testing.T) {
 	journal := newMockJournal()
 	sender := &recordingSender{}
 	subs := store.NewMemory()
+	// ТЗ 4.2: flushJob проверяет существование пользователя — чат 10 должен
+	// существовать (в живом режиме задание в очередь попадает только после
+	// прошедшей проверки в deliverRecipient).
+	subs.EnsureUser(context.Background(), 10)
 	d := NewDispatcher(subs, journal, &mockLimiter{allowed: true}, queue, ModeTelegram, sender.send)
 
 	d.Flush(context.Background())
@@ -392,6 +396,7 @@ func TestFlushRetriesWhenLimitReached(t *testing.T) {
 	queue := &mockQueue{popResult: []DeferredJob{{ChatID: 10, Event: e}}}
 	sender := &recordingSender{}
 	subs := store.NewMemory()
+	subs.EnsureUser(context.Background(), 10) // ТЗ 4.2: пользователь должен существовать
 	d := NewDispatcher(subs, newMockJournal(), &mockLimiter{allowed: false}, queue, ModeLog, sender.send)
 
 	d.Flush(context.Background())
@@ -499,6 +504,136 @@ type failingStore struct {
 
 func (f *failingStore) All(context.Context) ([]model.Subscription, error) {
 	return nil, f.err
+}
+
+// userGateStore — Store поверх Memory с управляемым UserExists: имитирует
+// результат проверки существования пользователя (ТЗ 4.2) независимо от
+// подписок. Так тесты закрывают гонку «/stop между subs.All и отправкой»:
+// подписка ещё видна в All, а записи пользователя уже нет.
+type userGateStore struct {
+	store.Store
+	exists bool
+	err    error
+}
+
+func (g *userGateStore) UserExists(context.Context, int64) (bool, error) {
+	return g.exists, g.err
+}
+
+// TestHandleSkipsDeliveryForDeletedUser — ТЗ 4.2: пользователь удалён
+// (/stop) уже после subs.All (окно гонки) — отправки нет, задание в очередь
+// отложенных не возвращается (в db-режиме каскад /stop уже снял бы его),
+// ошибки события нет — доставка получателю просто не нужна.
+func TestHandleSkipsDeliveryForDeletedUser(t *testing.T) {
+	mem := store.NewMemory()
+	mem.Add(context.Background(), model.Subscription{ChatID: 10})
+	sender := &recordingSender{}
+	queue := &mockQueue{}
+	d := NewDispatcher(&userGateStore{Store: mem, exists: false}, newMockJournal(),
+		&mockLimiter{allowed: true}, queue, ModeLog, sender.send)
+
+	if err := d.Handle(context.Background(), testEvent(1)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got := sender.sent(); len(got) != 0 {
+		t.Fatalf("sent = %v, want 0 (пользователь удалён — отправки нет)", got)
+	}
+	if len(queue.postponed) != 0 {
+		t.Fatalf("postponed = %+v, want пусто (задание удалённому пользователю не нужно)", queue.postponed)
+	}
+}
+
+// TestHandleUserCheckErrorReturnsEventError — ошибка проверки существования
+// пользователя (БД недоступна) — временный инфраструктурный сбой: доставка
+// без неё запрещена (ТЗ 4.2), ошибка уходит консьюмеру, событие остаётся
+// в pending и повторится (issue #53, ТЗ 4.3).
+func TestHandleUserCheckErrorReturnsEventError(t *testing.T) {
+	mem := store.NewMemory()
+	mem.Add(context.Background(), model.Subscription{ChatID: 10})
+	sender := &recordingSender{}
+	queue := &mockQueue{}
+	d := NewDispatcher(&userGateStore{Store: mem, err: errors.New("db down")}, newMockJournal(),
+		&mockLimiter{allowed: true}, queue, ModeLog, sender.send)
+
+	if err := d.Handle(context.Background(), testEvent(1)); err == nil {
+		t.Fatal("ошибка UserExists должна становиться ошибкой события (без XACK)")
+	}
+	if got := sender.sent(); len(got) != 0 {
+		t.Fatalf("sent = %v, want 0 (отправка без проверки не начинается)", got)
+	}
+	if len(queue.postponed) != 0 {
+		t.Fatalf("postponed = %+v, want пусто", queue.postponed)
+	}
+}
+
+// TestFlushDropsJobForDeletedUser — ТЗ 4.2: пользователь удалён, пока задание
+// лежало в очереди отложенных — флешер не отправляет и снимает задание
+// с очереди пометкой drop (в Pg это DELETE deferred-строки, паритет с каскадом
+// /stop), не возвращая его в очередь.
+func TestFlushDropsJobForDeletedUser(t *testing.T) {
+	e := testEvent(1)
+	queue := &mockQueue{popResult: []DeferredJob{{ChatID: 10, Event: e}}}
+	sender := &recordingSender{}
+	d := NewDispatcher(&userGateStore{Store: store.NewMemory(), exists: false}, newMockJournal(),
+		&mockLimiter{allowed: true}, queue, ModeLog, sender.send)
+
+	d.Flush(context.Background())
+
+	if got := sender.sent(); len(got) != 0 {
+		t.Fatalf("sent = %v, want 0 (пользователь удалён)", got)
+	}
+	if len(queue.marks) != 1 || queue.marks[0] != "10:1=drop" {
+		t.Fatalf("marks = %v, want [10:1=drop]", queue.marks)
+	}
+}
+
+// TestFlushUserCheckErrorRetriesJob — ошибка проверки существования при
+// флеше: задание остаётся в очереди (retry), повтор следующим проходом
+// флешера (ТЗ 3.6: отложенные не отбрасываются).
+func TestFlushUserCheckErrorRetriesJob(t *testing.T) {
+	e := testEvent(1)
+	queue := &mockQueue{popResult: []DeferredJob{{ChatID: 10, Event: e}}}
+	sender := &recordingSender{}
+	d := NewDispatcher(&userGateStore{Store: store.NewMemory(), err: errors.New("db down")},
+		newMockJournal(), &mockLimiter{allowed: true}, queue, ModeLog, sender.send)
+
+	d.Flush(context.Background())
+
+	if got := sender.sent(); len(got) != 0 {
+		t.Fatalf("sent = %v, want 0", got)
+	}
+	if len(queue.marks) != 1 || queue.marks[0] != "10:1=retry" {
+		t.Fatalf("marks = %v, want [10:1=retry]", queue.marks)
+	}
+}
+
+// TestMemoryQueueMarkDropRemovesJob — Mark(drop) убирает задание из memory-
+// очереди и снимает пометку «в полёте»: паритет с DELETE deferred-строки
+// в PgQueue (ТЗ 4.2).
+func TestMemoryQueueMarkDropRemovesJob(t *testing.T) {
+	q := NewMemoryQueue()
+	ctx := context.Background()
+	e := testEvent(1)
+	if err := q.Postpone(ctx, 10, e, ModeLog); err != nil {
+		t.Fatalf("Postpone: %v", err)
+	}
+	jobs, err := q.PopBatch(ctx, 5)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("PopBatch: %v, %d заданий", err, len(jobs))
+	}
+	if err := q.Mark(ctx, jobs[0], ModeLog, StatusDropped); err != nil {
+		t.Fatalf("Mark(drop): %v", err)
+	}
+	if n := queueLen(q); n != 0 {
+		t.Fatalf("заданий в очереди после drop = %d, want 0", n)
+	}
+	// Задание снято, а не «в полёте»: дедуп Postpone видит пару свободной.
+	if err := q.Postpone(ctx, 10, e, ModeLog); err != nil {
+		t.Fatalf("Postpone после drop: %v", err)
+	}
+	if n := queueLen(q); n != 1 {
+		t.Fatalf("заданий в очереди после повторного Postpone = %d, want 1", n)
+	}
 }
 
 func TestHandleStoreErrorNoDelivery(t *testing.T) {
@@ -736,6 +871,7 @@ func TestFlushRateLimitedRetries(t *testing.T) {
 	sender.err = &telegram.RateLimitError{RetryAfter: 10 * time.Millisecond}
 	sender.mu.Unlock()
 	subs := store.NewMemory()
+	subs.EnsureUser(context.Background(), 10) // ТЗ 4.2: пользователь должен существовать
 	d := NewDispatcher(subs, journal, &mockLimiter{allowed: true}, queue, ModeTelegram, sender.send)
 
 	d.Flush(context.Background())
