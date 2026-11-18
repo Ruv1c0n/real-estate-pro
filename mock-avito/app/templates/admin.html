@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>mock-avito console</title>
+  <script src="/static/htmx.min.js"></script>
+  <script src="/static/json-enc.js"></script>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 24px; background: #14161a; color: #d7dbe0;
+           font: 14px/1.5 "Segoe UI", system-ui, sans-serif; }
+    h1 { font-size: 18px; margin: 0 0 4px; color: #fff; }
+    .sub { color: #7d8590; margin: 0 0 20px; font-size: 12px; }
+    .grid { display: grid; grid-template-columns: 340px 1fr; gap: 16px; max-width: 1080px; }
+    .card { background: #1c1f24; border: 1px solid #2b3038; border-radius: 10px; padding: 16px; }
+    .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
+               color: #8b949e; margin: 0 0 12px; }
+    .row { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; }
+    .lbl { color: #8b949e; }
+    .val { font-family: ui-monospace, Consolas, monospace; text-align: right; }
+    .badge { padding: 1px 10px; border-radius: 999px; font-family: ui-monospace, monospace; }
+    .b-stream { background: #123a2c; color: #3fd68f; }
+    .b-batch  { background: #26324a; color: #79b8ff; }
+    .b-off    { background: #3a2626; color: #f85149; }
+    .ctl { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 0; }
+    .ctl .lbl { min-width: 110px; }
+    input, select { background: #14161a; border: 1px solid #2b3038; color: #d7dbe0;
+                    border-radius: 6px; padding: 5px 8px; font: inherit; width: 110px; }
+    button { background: #26324a; color: #cfe1ff; border: 1px solid #34405a; border-radius: 6px;
+             padding: 5px 14px; font: inherit; cursor: pointer; }
+    button:hover { background: #2f3d59; }
+    button.warn { background: #3a2626; border-color: #5a3434; color: #ffb3ad; }
+    .feed { max-width: 1080px; margin-top: 16px; }
+    .feedrow { display: flex; gap: 12px; padding: 5px 0; border-top: 1px solid #24282f; }
+    .feedrow:first-child { border-top: none; }
+    .fid { font-family: ui-monospace, monospace; color: #79b8ff; min-width: 110px; }
+    .ftitle { flex: 1; }
+    .fcity { color: #8b949e; font-family: ui-monospace, monospace; font-size: 12px; }
+    .empty { color: #7d8590; }
+    #toast { position: fixed; right: 24px; bottom: 24px; background: #1c1f24; border: 1px solid #2b3038;
+             border-radius: 8px; padding: 10px 16px; opacity: 0; transition: opacity .3s; }
+    #toast.show { opacity: 1; }
+  </style>
+</head>
+<!-- json-enc: hx-vals/hx-include уходят JSON-ом — FastAPI ждёт именно его -->
+<body hx-ext="json-enc">
+  <h1>mock-avito console</h1>
+  <p class="sub">Консоль управления mock-источником объявлений (contracts.md, раздел 4). Статус и лента обновляются каждые 2 с.</p>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Статус</h2>
+      <div id="status" hx-get="/admin/ui/state" hx-trigger="load, every 2s" hx-swap="outerHTML">
+        <div class="empty">Загрузка статуса…</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Управление</h2>
+      {% if admin_enabled %}
+      <div class="ctl"><span class="lbl">Ключ доступа</span>
+        <input id="adminkey" type="password" placeholder="X-Admin-Key" style="width: 180px">
+      </div>
+      <div class="ctl"><span class="lbl">Режим</span>
+        <button hx-post="/admin/mode" hx-vals='{"mode":"batch"}' hx-target="#status" hx-swap="outerHTML">batch</button>
+        <button hx-post="/admin/mode" hx-vals='{"mode":"stream"}' hx-target="#status" hx-swap="outerHTML">stream</button>
+      </div>
+      <div class="ctl"><span class="lbl">Хаос</span>
+        <select id="chaos-code" name="code"><option value="0">выкл</option><option value="429">429</option><option value="500">500</option></select>
+        <span class="lbl">каждый</span><input id="chaos-every" name="every" type="number" value="5" min="1" max="100" style="width: 70px">
+        <span class="lbl">-й запрос</span>
+        <button hx-post="/admin/chaos" hx-include="#chaos-code,#chaos-every" hx-target="#status" hx-swap="outerHTML">Задать</button>
+      </div>
+      <div class="ctl"><span class="lbl">Задержка</span>
+        <input id="delay-ms" name="ms" type="number" value="0" min="0" max="5000" style="width: 90px"><span class="lbl">мс</span>
+        <button hx-post="/admin/delay" hx-include="#delay-ms" hx-target="#status" hx-swap="outerHTML">Задать</button>
+      </div>
+      <div class="ctl"><span class="lbl">Rate limit</span>
+        <input id="rate-pm" name="per_minute" type="number" value="0" min="0" max="10000" style="width: 90px"><span class="lbl">/мин (0 = выкл)</span>
+        <button hx-post="/admin/rate-limit" hx-include="#rate-pm" hx-target="#status" hx-swap="outerHTML">Задать</button>
+      </div>
+      <div class="ctl"><span class="lbl">Плохие данные</span>
+        <select id="bad-enabled" name="enabled"><option value="false">выкл</option><option value="true">вкл</option></select>
+        <span class="lbl">доля</span><input id="bad-rate" name="rate" type="number" value="0.2" min="0" max="1" step="0.05" style="width: 80px">
+        <button hx-post="/admin/bad-data" hx-include="#bad-enabled,#bad-rate" hx-target="#status" hx-swap="outerHTML">Задать</button>
+      </div>
+      <div class="ctl"><span class="lbl">Reset из seed</span>
+        <input id="reset-seed" name="seed" type="number" value="42" min="0" style="width: 90px">
+        <button class="warn" hx-post="/admin/reset" hx-include="#reset-seed" hx-target="#status" hx-swap="outerHTML">Пересоздать</button>
+      </div>
+      {% else %}
+      <p class="empty">Управление выключено: переменная MOCK_ADMIN_KEY пуста.
+         Задайте её в .env или окружении контейнера и перезапустите сервис.</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="card feed">
+    <h2>Последние публикации</h2>
+    <div id="feed" hx-get="/admin/ui/feed" hx-trigger="load, every 2s" hx-swap="outerHTML">
+      <div class="empty">Загрузка ленты…</div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+
+  <script>
+    // Ключ из поля доступа подставляется во все админ-запросы.
+    document.body.addEventListener("htmx:configRequest", (e) => {
+      const key = document.getElementById("adminkey");
+      if (key && key.value) e.detail.headers["X-Admin-Key"] = key.value;
+    });
+    // Всплывашка с результатом действия.
+    document.body.addEventListener("htmx:afterRequest", (e) => {
+      if (!e.detail.elt.closest(".ctl") && !e.detail.elt.closest("button.warn")) return;
+      const t = document.getElementById("toast");
+      t.textContent = e.detail.successful ? "OK" : "Ошибка: проверьте ключ и параметры";
+      t.classList.add("show");
+      setTimeout(() => t.classList.remove("show"), 1800);
+    });
+  </script>
+</body>
+</html>

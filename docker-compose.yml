@@ -103,6 +103,34 @@ services:
     # TODO(#17): healthcheck добавим вместе с реализацией collector
     # (сейчас в образе только Dockerfile-заглушка — проверять нечего).
 
+  # Имитация внешнего источника объявлений (contracts.md, раздел 4).
+  # Запускается только с профилем mock: docker compose --profile mock up.
+  # Обычный up и все остальные сервисы его не трогают.
+  mock-avito:
+    build: ./mock-avito
+    restart: unless-stopped
+    logging: *default-logging
+    profiles:
+      - mock
+    # Мок нужен только с локальной машины, а дефолтный ключ лежит в репо —
+    # наружу (LAN) порт не публикуем.
+    ports:
+      - "127.0.0.1:8002:8002"
+    environment:
+      MOCK_PUBLISH_MODE: "${MOCK_PUBLISH_MODE:-batch}"
+      MOCK_SEED: "${MOCK_SEED:-42}"
+      MOCK_COUNT: "${MOCK_COUNT:-520}"
+      MOCK_STREAM_MIN_SEC: "${MOCK_STREAM_MIN_SEC:-5}"
+      MOCK_STREAM_MAX_SEC: "${MOCK_STREAM_MAX_SEC:-30}"
+      # Пустое значение выключает /admin (консоль и ручки управления).
+      MOCK_ADMIN_KEY: "${MOCK_ADMIN_KEY:-mock-admin}"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://127.0.0.1:8002/health', timeout=2)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
   notifier:
     build: ./notifier
     restart: unless-stopped

@@ -1,0 +1,25 @@
+<div id="status" hx-get="/admin/ui/state" hx-trigger="every 2s" hx-swap="outerHTML">
+  <div class="row"><span class="lbl">Режим</span>
+    <span class="badge {{ 'b-stream' if s.mode == 'stream' else 'b-batch' }}">{{ s.mode }}</span>
+    {% if not admin_enabled %}<span class="badge b-off">admin выкл (нет ключа)</span>{% endif %}
+  </div>
+  <div class="row"><span class="lbl">Объявлений</span><span class="val">{{ s.total }}</span></div>
+  <div class="row"><span class="lbl">Публикаций</span><span class="val">{{ s.publications }}</span></div>
+  <div class="row"><span class="lbl">Seed</span><span class="val">{{ s.seed }}</span></div>
+  <div class="row"><span class="lbl">Uptime</span><span class="val">{{ uptime }}</span></div>
+  <div class="row"><span class="lbl">Запросы</span>
+    <span class="val">search {{ s.requests.search }} · item {{ s.requests.item }} · admin {{ s.requests.admin }}</span>
+  </div>
+  <div class="row"><span class="lbl">Хаос</span>
+    <span class="val">{{ ('каждый ' ~ s.chaos.every ~ '-й → ' ~ s.chaos.code) if s.chaos.code else 'выкл' }}</span>
+  </div>
+  <div class="row"><span class="lbl">Задержка</span>
+    <span class="val">{{ (s.delay_ms ~ ' мс') if s.delay_ms else 'выкл' }}</span>
+  </div>
+  <div class="row"><span class="lbl">Rate limit</span>
+    <span class="val">{{ (s.rate_per_minute ~ '/мин') if s.rate_per_minute else 'выкл' }}{% if s.limited_responses %} · 429 отдано: {{ s.limited_responses }}{% endif %}</span>
+  </div>
+  <div class="row"><span class="lbl">Плохие данные</span>
+    <span class="val">{{ ('вкл, доля ' ~ s.bad_data.rate) if s.bad_data.enabled else 'выкл' }}</span>
+  </div>
+</div>

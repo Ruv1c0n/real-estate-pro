@@ -1,5 +1,5 @@
 # .github/workflows/python-ci.yml
-# Проверки Python-сервисов (core-api, collector).
+# Проверки Python-сервисов (core-api, collector, mock-avito).
 # Ручной запуск для проверки: вкладка Actions → python-ci → Run workflow.
 name: python-ci
 on:
@@ -7,6 +7,7 @@ on:
     paths:
       - core-api/**
       - collector/**
+      - mock-avito/**
       - .github/workflows/python-ci.yml
       - requirements-lint.txt
   push:
@@ -15,6 +16,7 @@ on:
     paths:
       - core-api/**
       - collector/**
+      - mock-avito/**
       - .github/workflows/python-ci.yml
       - requirements-lint.txt
   workflow_dispatch:
@@ -30,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [core-api, collector]
+        service: [core-api, collector, mock-avito]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -47,7 +49,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [core-api, collector]
+        service: [core-api, collector, mock-avito]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

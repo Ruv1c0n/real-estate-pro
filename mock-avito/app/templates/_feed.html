@@ -1,0 +1,13 @@
+<div id="feed" hx-get="/admin/ui/feed" hx-trigger="every 2s" hx-swap="outerHTML">
+  {% if feed %}
+    {% for it in feed %}
+      <div class="feedrow">
+        <span class="fid">{{ it.id }}</span>
+        <span class="ftitle">{{ it.title }}</span>
+        <span class="fcity">{{ it.city }} · {{ it.price }} {{ it.currency }} · {{ it.published_at }}</span>
+      </div>
+    {% endfor %}
+  {% else %}
+    <div class="feedrow empty">Пока нет публикаций — переключите режим на stream.</div>
+  {% endif %}
+</div>
