@@ -133,6 +133,19 @@ func (p *Postgres) ensureUser(ctx context.Context, chatID int64) error {
 	return nil
 }
 
+// UserExists проверяет наличие записи пользователя (ТЗ 4.2). Вызывается
+// перед Telegram-отправкой: закрывает гонку «/stop между выборкой получателей
+// (subs.All) и отправкой» — удалённому чату доставка не нужна.
+func (p *Postgres) UserExists(ctx context.Context, chatID int64) (bool, error) {
+	var ok bool
+	err := p.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM notifier.users WHERE chat_id = $1)`, chatID).Scan(&ok)
+	if err != nil {
+		return false, fmt.Errorf("store: user exists (chat %d): %w", chatID, err)
+	}
+	return ok, nil
+}
+
 // DeleteUser удаляет пользователя (/stop, ФТ-3.1): БД каскадом чистит его
 // подписки и журнал (ON DELETE CASCADE). Число подписок считаем ДО удаления —
 // каскад их сотрёт, а боту нужен ответ «удалено подписок — N».
