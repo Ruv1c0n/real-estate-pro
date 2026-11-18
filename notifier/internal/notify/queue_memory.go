@@ -74,7 +74,9 @@ func (q *MemoryQueue) PopBatch(_ context.Context, limit int) ([]DeferredJob, err
 // «в полёте» и убираем его из очереди, если оно там ещё лежит (так бывает,
 // когда Flush закрывает задание как «уже отправленное» без забора);
 // retry — снимаем пометку и возвращаем задание в начало очереди (дальше его
-// снова видит дедуп Postpone).
+// снова видит дедуп Postpone);
+// drop — снимаем пометку и убираем задание БЕЗ отправки (получатель удалён,
+// ТЗ 4.2): паритет с DELETE deferred-строки в PgQueue.
 func (q *MemoryQueue) Mark(_ context.Context, job DeferredJob, _, status string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -82,7 +84,7 @@ func (q *MemoryQueue) Mark(_ context.Context, job DeferredJob, _, status string)
 	switch status {
 	case StatusRetry:
 		q.jobs = append([]DeferredJob{job}, q.jobs...)
-	case StatusSent, StatusUnknown:
+	case StatusSent, StatusUnknown, StatusDropped:
 		// Паритет с db-режимом: строка перестаёт быть deferred — в memory
 		// аналогично убираем из очереди.
 		for i, j := range q.jobs {

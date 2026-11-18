@@ -1,8 +1,11 @@
 package stream
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"testing"
@@ -35,6 +38,7 @@ type fakeRedis struct {
 	pendingIDs    []string // PEL группы (в работе / не подтверждены)
 	lastDelivered string   // last-delivered-id группы
 	deleted       []string // записи, удалённые XDel
+	streamLen     int64    // длина стрима для XLEN (мониторинг мягкого порога, ТЗ 3.6)
 
 	// onGroupInfo вызывается внутри XInfoGroups (под мьютексом) — имитирует
 	// диспетчера, успевшего прочитать пачку между XPENDING и XInfoGroups.
@@ -95,6 +99,15 @@ func (f *fakeRedis) XAdd(ctx context.Context, a *redis.XAddArgs) *redis.StringCm
 	} else {
 		cmd.SetVal("dead-1")
 	}
+	return cmd
+}
+
+func (f *fakeRedis) XLen(ctx context.Context, stream string) *redis.IntCmd {
+	f.mu.Lock()
+	n := f.streamLen
+	f.mu.Unlock()
+	cmd := redis.NewIntCmd(ctx, stream)
+	cmd.SetVal(n)
 	return cmd
 }
 
@@ -168,15 +181,6 @@ func (f *fakeRedis) XDel(ctx context.Context, stream string, ids ...string) *red
 	}
 	f.streamIDs = rest
 	cmd.SetVal(int64(len(ids)))
-	return cmd
-}
-
-// XLen — длина стрима двойника (используется проверкой мягкого порога WARN).
-func (f *fakeRedis) XLen(ctx context.Context, stream string) *redis.IntCmd {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	cmd := redis.NewIntCmd(ctx)
-	cmd.SetVal(int64(len(f.streamIDs)))
 	return cmd
 }
 
@@ -381,5 +385,96 @@ func TestConsumerGroupCreateFailureIsFatal(t *testing.T) {
 func TestConsumerName(t *testing.T) {
 	if ConsumerName() == "" {
 		t.Fatal("consumer name must not be empty")
+	}
+}
+
+// syncBuf — потокобезопасный writer для перехвата стандартного лога:
+// readLoop пишет из своей горутины, тест читает из ready().
+type syncBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuf) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+// TestStreamLenWarnStateHysteresis — чистая функция гистерезиса WARN
+// (ТЗ 3.6: мягкий порог 10 000, без удаления): WARN один раз при выходе
+// за порог, дальше молчание, пока длина не упадёт ниже reset-порога 9000.
+func TestStreamLenWarnStateHysteresis(t *testing.T) {
+	// Ниже порога — молчание, гистерезис не взводится.
+	if warn, w := streamLenWarnState(lenWarnThreshold-1, false, lenWarnThreshold); warn || w {
+		t.Fatalf("len < порога: warn=%v, warned=%v; want false, false", warn, w)
+	}
+	// Ровно порог — уже превышение (>=).
+	if warn, w := streamLenWarnState(lenWarnThreshold, false, lenWarnThreshold); !warn || !w {
+		t.Fatalf("len = порога: warn=%v, warned=%v; want true, true", warn, w)
+	}
+	// Пока warned и длина ещё выше reset — повторных WARN нет (не спамим).
+	if warn, w := streamLenWarnState(lenWarnThreshold+100, true, lenWarnThreshold); warn || !w {
+		t.Fatalf("длинный стрим после WARN: warn=%v, warned=%v; want false, true", warn, w)
+	}
+	// Длина упала ниже reset — гистерезис снят (без WARN в этот проход).
+	if warn, w := streamLenWarnState(streamLenWarnReset-1, true, lenWarnThreshold); warn || w {
+		t.Fatalf("len < reset: warn=%v, warned=%v; want false, false", warn, w)
+	}
+	// После снятия гистерезиса новый выход за порог снова предупреждает.
+	if warn, w := streamLenWarnState(lenWarnThreshold, false, lenWarnThreshold); !warn || !w {
+		t.Fatalf("повторный выход за порог: warn=%v, warned=%v; want true, true", warn, w)
+	}
+}
+
+// TestConsumerWarnsOnStreamLenThreshold — интеграционный: readLoop с фейковым
+// Redis, длина стрима за мягким порогом (ТЗ 3.6) — в логе появляется WARN
+// с текущим значением и именем consumer'а, обработка при этом не ломается.
+func TestConsumerWarnsOnStreamLenThreshold(t *testing.T) {
+	sbuf := &syncBuf{}
+	old := log.Writer()
+	log.SetOutput(sbuf)
+	defer log.SetOutput(old)
+
+	rdb := &fakeRedis{streamLen: lenWarnThreshold + 1}
+	err := runConsumer(t, rdb, func(context.Context, model.Event) error { return nil },
+		func() bool { return strings.Contains(sbuf.String(), "soft threshold") })
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	logged := sbuf.String()
+	if !strings.Contains(logged, fmt.Sprintf("length %d", lenWarnThreshold+1)) {
+		t.Errorf("в логе нет текущей длины стрима: %q", logged)
+	}
+	if !strings.Contains(logged, "test-1") {
+		t.Errorf("в логе нет ID воркера: %q", logged)
+	}
+	if strings.Contains(logged, "XLEN") || strings.Contains(logged, "xlen") {
+		t.Errorf("ошибка XLEN не должна попадать в лог при успехе: %q", logged)
+	}
+}
+
+// TestConsumerStaysSilentBelowStreamLenThreshold — длина стрима ниже мягкого
+// порога (ТЗ 3.6): WARN не логируется.
+func TestConsumerStaysSilentBelowStreamLenThreshold(t *testing.T) {
+	sbuf := &syncBuf{}
+	old := log.Writer()
+	log.SetOutput(sbuf)
+	defer log.SetOutput(old)
+
+	rdb := &fakeRedis{streamLen: lenWarnThreshold - 1}
+	err := runConsumer(t, rdb, func(context.Context, model.Event) error { return nil },
+		func() bool { return true }) // ждём штатную остановку по cancel
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if strings.Contains(sbuf.String(), "soft threshold") {
+		t.Errorf("WARN при длине ниже порога не должен логироваться: %q", sbuf.String())
 	}
 }
