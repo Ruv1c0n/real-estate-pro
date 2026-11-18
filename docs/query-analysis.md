@@ -96,25 +96,27 @@ DATABASE_URL=... .venv/Scripts/python -I scripts/db/gen-analysis-data.py --trunc
 | N2 | Подписки чата: `WHERE chat_id = $1` (ByChat) | <0.1 мс | `subscriptions_chat_id_idx` |
 | N3 | Журнал «уже доставлено?»: `EXISTS ... WHERE chat_id AND listing_id` (journal Sent) | 0.03 мс | `notifications_log_user_listing_uq` |
 | N4 | Лимитер 30/час: `count ... WHERE chat_id AND mode AND sent_at > now()-1h` | 0.08 мс | `notifications_log_rate_idx` |
-| N5 | Pop очереди, **текущий код**: `WHERE status='deferred' ORDER BY created_at LIMIT 10 FOR UPDATE SKIP LOCKED` | **44.3 мс** | см. находку ниже |
-| N6 | Pop очереди, **целевой вид из миграции 0002**: `WHERE status='deferred' AND available_at <= now() ORDER BY available_at` | 0.045 мс | `notifications_log_available_idx` |
+| N5 | Pop очереди, **код до PR #72**: `WHERE status='deferred' ORDER BY created_at LIMIT 10 FOR UPDATE SKIP LOCKED` | **44.3 мс** | см. «PopBatch» ниже |
+| N6 | Pop очереди, **целевой вид из 0002, в main с PR #72**: `WHERE status='deferred' AND available_at <= now() ORDER BY available_at` | 0.045 мс | `notifications_log_available_idx` |
 | N7 | Mark: `UPDATE ... WHERE chat_id AND listing_id AND status='deferred'` | <0.1 мс | `notifications_log_user_listing_uq` |
 | N8 | `/stop`: `DELETE FROM users` с каскадом подписок и журнала | 0.27 мс | PK + каскадные FK |
 
-### Находка: запрос очереди и миграция 0002
+### ПопBatch: была находка — уже внедрена (PR #72)
 
-Текущий PopBatch (`ORDER BY created_at`) и замена индекса в миграции 0002
-(`notifications_log_available_idx` по `available_at` вместо индекса по
-`created_at`) разошлись: при бэклоге 22 439 deferred планировщик собирает
-**все** deferred-строки bitmap-сканом и сортирует их **на диске** (external
-merge, 8.8 МБ), чтобы взять LIMIT 10 — 44.3 мс на каждый проход флешера
-(раз в 30 с, 8 воркеров), и всё это под `FOR UPDATE`-блокировками.
+История: PopBatch в коде на момент анализа использовал
+`WHERE status = 'deferred' ORDER BY created_at`, а миграция 0002 к этому
+моменту уже заменила индекс deferred-очереди на `available_at`
+(`notifications_log_available_idx`). Разрыв форм запросов на бэклоге
+22 439 deferred давал: планировщик собирал **все** deferred-строки
+bitmap-сканом и сортировал **на диске** (external merge, 8.8 МБ) ради
+LIMIT 10 — **44.3 мс** на каждый проход флешера (раз в 30 с, 8 воркеров),
+под `FOR UPDATE`-блокировками. Целевой вид из комментария миграции —
+прямо по индексу: **0.045 мс** (**×1000**).
 
-Целевой вид из комментария миграции 0002 (`WHERE status = 'deferred'
-AND available_at <= now() ORDER BY available_at`) идёт прямо по индексу:
-0.045 мс — **×1000**. Переезд PopBatch на целевой вид — изменение кода
-notifier (зона Даниила), схема уже готова; до переезда на демо-масштабе
-текущий запрос также приемлем (44 мс ≪ бюджета НФТ-11).
+Даниил реализовал целевой вид в PR #72 (`WHERE status = 'deferred'
+AND available_at <= now() ORDER BY available_at, id`) — в main PopBatch
+идёт по индексу, backoff-семантика `available_at` включена. Замер выше
+сохранён как обоснование этого перехода.
 
 ### Наблюдение: диспетчер читает все подписки на каждое событие
 
@@ -123,12 +125,12 @@ notifier (зона Даниила), схема уже готова; до пер�
 на порядки больше — кандидат на SQL-матчинг или инкрементальную выборку
 по индексам подписок (страна+город). Решение за Даниилом, схема не мешает.
 
-### Наблюдение: available_at кодом пока не используется
+### Наблюдение: available_at
 
-`available_at` (миграция 0002) в коде notifier не встречается — PopBatch
-работает через `created_at`. Сама колонка NOT NULL DEFAULT now() совместима
-с текущим кодом без правок (это заявлено в миграции), но backoff-семантика
-включится только вместе с целевым видом запроса из находки выше.
+На момент анализа `available_at` (миграция 0002) в коде notifier не
+использовался — PopBatch работал через `created_at` (совместимо, как и
+заявлено в миграции). С мержем PR #72 колонка задействована: backoff
+повтора и выборка очереди идут по `available_at`.
 
 ### Как воспроизвести
 
