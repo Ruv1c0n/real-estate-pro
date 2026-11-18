@@ -31,6 +31,13 @@ const (
 	readBlock   = 5 * time.Second  // блокирующее чтение XREADGROUP
 	readCount   = int64(16)        // сообщений за одно чтение
 	retryDelay  = 3 * time.Second  // пауза при ошибке Redis
+
+	// ТЗ 3.6: «Порог контроля длины stream 10 000 событий; мягкий порог,
+	// без удаления необработанных». Мягкость — в том, что записи никогда
+	// не удаляются: превышение порога только логируется (WARN).
+	streamLenWarnThreshold = 10_000      // мягкий порог XLEN, событий
+	streamLenWarnReset     = 9_000       // гистерезис: WARN снова активен ниже этого
+	lenCheckEvery          = time.Minute // период проверки XLEN (не каждый проход)
 )
 
 // Handler обрабатывает одно событие. Обработка фиксирует доставку
@@ -49,6 +56,7 @@ type Redis interface {
 	XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimCmd
 	XAck(ctx context.Context, stream, group string, ids ...string) *redis.IntCmd
 	XAdd(ctx context.Context, a *redis.XAddArgs) *redis.StringCmd
+	XLen(ctx context.Context, stream string) *redis.IntCmd
 }
 
 // Consumer читает стрим группой notifier: цикл XREADGROUP раздаёт записи
@@ -111,7 +119,15 @@ func (c *Consumer) Run(ctx context.Context) error {
 
 // readLoop читает новые записи (">") и раздаёт их воркерам.
 func (c *Consumer) readLoop(ctx context.Context, jobs chan<- redis.XMessage) error {
+	var (
+		lastLenCheck time.Time // XLEN проверяется не каждый проход, а раз в lenCheckEvery
+		lenWarned    bool      // гистерезис WARN: не спамить, пока стрим длинный
+	)
 	for {
+		if time.Since(lastLenCheck) >= lenCheckEvery {
+			lastLenCheck = time.Now()
+			lenWarned = c.warnStreamLen(ctx, lenWarned)
+		}
 		res, err := c.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group:    GroupName,
 			Consumer: c.name,
@@ -145,6 +161,41 @@ func (c *Consumer) readLoop(ctx context.Context, jobs chan<- redis.XMessage) err
 			}
 		}
 	}
+}
+
+// streamLenWarnState решает, пора ли логировать WARN по длине стрима, и
+// возвращает новое состояние гистерезиса. WARN выдаётся, когда длина впервые
+// достигает streamLenWarnThreshold; пока длина не упадёт ниже
+// streamLenWarnReset, повторных WARN не будет — при стабильно длинном стриме
+// лог не заспамивается каждым проходом чтения (после сброса следующий
+// выход за порог снова предупредит).
+func streamLenWarnState(length int64, warned bool) (warn, newWarned bool) {
+	if warned {
+		return false, length >= streamLenWarnReset // ниже reset — гистерезис снят
+	}
+	if length >= streamLenWarnThreshold {
+		return true, true
+	}
+	return false, false
+}
+
+// warnStreamLen проверяет XLEN стрима и логирует WARN при превышении мягкого
+// порога (ТЗ 3.6: «Порог контроля длины stream 10 000 событий; мягкий порог,
+// без удаления необработанных»). Ничего не удаляет и не обрезает (MAXLEN
+// в XADD запрещён ТЗ 4.3) — только сигнал оператору. Ошибка Redis
+// игнорируется: это телеметрия рядом с горячим циклом чтения, сбой XLEN
+// не должен мешать обработке (состояние гистерезиса не меняется).
+func (c *Consumer) warnStreamLen(ctx context.Context, warned bool) bool {
+	n, err := c.rdb.XLen(ctx, StreamName).Result()
+	if err != nil {
+		return warned
+	}
+	warn, state := streamLenWarnState(n, warned)
+	if warn {
+		log.Printf("WARN: stream %s length %d >= soft threshold %d (consumer %s) — необработанные записи не удаляются (ТЗ 3.6)",
+			StreamName, n, streamLenWarnThreshold, c.name)
+	}
+	return state
 }
 
 // claimLoop забирает pending-записи, зависшие дольше 30 с (упавший воркер

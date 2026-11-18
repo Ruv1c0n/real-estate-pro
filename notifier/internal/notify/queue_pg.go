@@ -152,12 +152,15 @@ func (q *PgQueue) PopBatch(ctx context.Context, limit int) ([]DeferredJob, error
 }
 
 // Mark фиксирует исход задания: sent/unknown — строка получает статус и
-// sent_at, retry — остаётся deferred, но его available_at сдвигается на
+// sent_at; retry — остаётся deferred, но его available_at сдвигается на
 // now() + retryBackoff (миграция 0002_available_at): задание не отбрасывается
-// (ТЗ 3.6), а вернётся в выборку PopBatch, когда backoff истечёт. Любой Mark
-// завершает транзакцию PopBatch: блокировки сняты, следующий проход откроет
-// её заново. Внутри сервиса флешер один, поэтому досрочное снятие блокировок
-// с неотмеченных заданий батча безопасно.
+// (ТЗ 3.6), а вернётся в выборку PopBatch, когда backoff истечёт; drop —
+// deferred-строка удаляется без отправки (получатель удалён, ТЗ 4.2;
+// отдельного статуса журнала для этого нет — набор статусов задан CHECK 0001,
+// а каскад /stop удалил бы строку тем же путём).
+// Любой Mark завершает транзакцию PopBatch: блокировки сняты, следующий
+// проход откроет её заново. Внутри сервиса флешер один, поэтому досрочное
+// снятие блокировок с неотмеченных заданий батча безопасно.
 func (q *PgQueue) Mark(ctx context.Context, job DeferredJob, _ string, status string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -183,6 +186,18 @@ func (q *PgQueue) Mark(ctx context.Context, job DeferredJob, _ string, status st
 			job.ChatID, job.Event.ID, retryBackoff.Seconds()); err != nil {
 			q.rollbackTx(ctx)
 			return fmt.Errorf("queue mark retry: %w", err)
+		}
+	case StatusDropped:
+		// Снять с очереди без отправки: DELETE deferred-строки в той же
+		// транзакции, что держит на ней FOR UPDATE (отдельным соединением
+		// упёрлись бы в собственную блокировку — самодедлок, как и карантин
+		// в PopBatch). ТЗ 4.2: пользователь удалён — доставка ему не нужна.
+		if _, err := q.tx.Exec(ctx, `
+			DELETE FROM notifier.notifications_log
+			WHERE chat_id = $1 AND listing_id = $2 AND status = 'deferred'`,
+			job.ChatID, job.Event.ID); err != nil {
+			q.rollbackTx(ctx)
+			return fmt.Errorf("queue drop: %w", err)
 		}
 	case StatusSent, StatusUnknown:
 		if _, err := q.tx.Exec(ctx, `
