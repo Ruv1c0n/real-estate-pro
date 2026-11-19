@@ -25,6 +25,10 @@ class ListingSearchResult:
     total: int
 
 
+class UnknownListingReferenceError(ValueError):
+    """Значение из объявления отсутствует в справочниках Core API."""
+
+
 class ListingStore(Protocol):
     async def create_or_get(
         self,

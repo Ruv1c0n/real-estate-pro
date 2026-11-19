@@ -1,9 +1,10 @@
+import asyncio
 import json
 from decimal import Decimal
 from unittest.mock import AsyncMock
 
 import pytest
-from app.outbox import publish_listing_event
+from app.outbox import publish_listing_event, run_outbox_worker
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 
@@ -60,3 +61,26 @@ async def test_publish_listing_event_propagates_error_and_allows_retry(payload):
     stream, fields = first.args
     assert stream == "listings.new"
     assert json.loads(fields["data"])["event_id"] == payload["event_id"]
+
+
+@pytest.mark.anyio
+async def test_worker_retries_after_database_connection_refused():
+    stop = asyncio.Event()
+    store = AsyncMock()
+    redis = AsyncMock()
+
+    async def publish_next(publish):
+        if store.publish_next.await_count == 1:
+            raise ConnectionRefusedError("PostgreSQL временно недоступен")
+        stop.set()
+        return False
+
+    store.publish_next.side_effect = publish_next
+
+    await asyncio.wait_for(
+        run_outbox_worker(store, redis, stop, poll_interval=0.01),
+        timeout=2,
+    )
+
+    assert store.publish_next.await_count == 2
+    redis.xadd.assert_not_awaited()

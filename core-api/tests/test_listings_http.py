@@ -5,7 +5,9 @@ from threading import Event
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from app.in_memory_listing_store import InMemoryListingStore
 from app.main import app
+from app.postgres_listing_store import UnknownListingReferenceError
 from fastapi.testclient import TestClient
 
 URL = "/api/v1/listings"
@@ -19,7 +21,11 @@ def redis_client(monkeypatch):
 
 
 @pytest.fixture
-def client(redis_client):
+def client(redis_client, monkeypatch):
+    monkeypatch.setattr(
+        "app.main.PostgresListingStore",
+        lambda engine: InMemoryListingStore(),
+    )
     with TestClient(app) as test_client:
         yield test_client
 
@@ -217,3 +223,19 @@ def test_created_listing_is_published_by_worker(client, redis_client, payload):
     event = json.loads(fields["data"], parse_float=Decimal)
     assert event["id"] == response.json()["id"]
     assert event["price"] == Decimal("380.25")
+
+
+def test_create_returns_422_for_unknown_reference(client, payload, monkeypatch):
+    message = "Неизвестный источник, город для указанной страны или валюта"
+    monkeypatch.setattr(
+        app.state.listing_store,
+        "create_or_get",
+        AsyncMock(side_effect=UnknownListingReferenceError(message)),
+    )
+
+    response = client.post(URL, json=payload)
+
+    assert response.status_code == 422, response.text
+    body = response.json()
+    assert body["error"]
+    assert body["message"] == message
