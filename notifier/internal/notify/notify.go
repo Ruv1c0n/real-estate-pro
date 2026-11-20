@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"notifier/internal/metrics"
 	"notifier/internal/model"
 	"notifier/internal/store"
 	"notifier/internal/telegram"
@@ -418,6 +419,7 @@ func (d *Dispatcher) postpone(ctx context.Context, chatID int64, e model.Event) 
 // Telegram (RateLimitError.RetryAfter); обёртки может не быть — дозорная
 // ошибка ErrRateLimited распознаётся и без неё.
 func logRateLimited(err error, eventID string, listingID, chatID int64) {
+	metrics.TelegramRetryAfter.Inc()
 	var rle *telegram.RateLimitError
 	if errors.As(err, &rle) {
 		slog.Warn("dispatch: rate limited 429", "event_id", eventID, "retry_after", rle.RetryAfter.String(), "listing_id", listingID, "chat_id", chatID)
@@ -453,7 +455,12 @@ func (d *Dispatcher) pauseRateLimited(ctx context.Context, err error) {
 
 func (d *Dispatcher) deliver(ctx context.Context, chatID int64, e model.Event) error {
 	status := StatusSent
-	if err := d.send(ctx, chatID, e); err != nil {
+	start := time.Now()
+	err := d.send(ctx, chatID, e)
+	// Наблюдение в обе стороны: и успешная отправка, и unknown — реальное
+	// время до ответа Telegram (основа SLO НФТ-11, p95 < 5 с).
+	metrics.DeliveryDuration.Observe(time.Since(start).Seconds())
+	if err != nil {
 		// 429 — явный отказ Telegram с рекомендованной паузой (ТЗ 4.3
 		// «Для 429 учитывается Retry-After»), а не неопределённый исход:
 		// терминальный unknown (contracts.md §2) здесь потерял бы уведомление.
@@ -610,7 +617,11 @@ func (d *Dispatcher) flushJob(ctx context.Context, job DeferredJob) {
 		return
 	}
 	status := StatusSent
-	if err := d.send(ctx, job.ChatID, job.Event); err != nil {
+	start := time.Now()
+	// err уже объявлен выше (limiter.Allow): присваивание, не :=.
+	err = d.send(ctx, job.ChatID, job.Event)
+	metrics.DeliveryDuration.Observe(time.Since(start).Seconds())
+	if err != nil {
 		// 429 — явный отказ (ТЗ 4.3), а не неопределённый исход: задание
 		// возвращается в очередь (retry), повтор — следующим проходом
 		// флешера. Точную паузу Retry-After очередь пока не отслеживает.

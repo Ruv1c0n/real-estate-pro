@@ -23,9 +23,11 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/redis/go-redis/v9"
 
 	"notifier/internal/dicts"
+	"notifier/internal/metrics"
 	"notifier/internal/notify"
 	"notifier/internal/store"
 )
@@ -588,5 +590,63 @@ func TestRequestLoggerRejectsMalformedID(t *testing.T) {
 		if matched, err := regexp.MatchString(`^[0-9a-f]{16}$`, got); err != nil || !matched {
 			t.Fatalf("%s: X-Request-ID = %q, ожидается сгенерированный 16-hex (%v)", name, got, err)
 		}
+	}
+}
+
+// Тесты /metrics (карточка 01 плана prod-10of10): эндпоинт на mux отдаёт
+// пром-формат; поллер гейджей переживает недоступный Redis и обновляет
+// значения на живом.
+
+func TestMetricsEndpointOnMux(t *testing.T) {
+	t.Setenv("ADMIN_KEY", "")
+	dictsClient := newDictsFake(t)
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	t.Cleanup(func() { rdb.Close() })
+
+	mux := newMux(rdb, dictsClient, nil, notify.ModeLog, defaultDebugRateLimitPerMin)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/metrics: %d, ожидается 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "notifier_stream_length") {
+		t.Fatal("в /metrics нет наших метрик notifier_*")
+	}
+}
+
+func TestPollOnceToleratesDeadRedis(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	t.Cleanup(func() { rdb.Close() })
+
+	// Ошибки Redis не паникуют и не поднимают гейджи: значения остаются
+	// с прошлого прохода (в тесте — нулевые).
+	pollOnce(context.Background(), rdb, nil)
+	if got := testutil.ToFloat64(metrics.StreamLength); got != 0 {
+		t.Fatalf("StreamLength после сбоя Redis = %v, want 0", got)
+	}
+}
+
+func TestPollOnceSetsGauges(t *testing.T) {
+	rdb := testRedisAddr(t) // скип без живого Redis
+
+	// Наполняем стрим тремя записями и проверяем, что XLEN попал в гейдж.
+	ctx := context.Background()
+	ids := make([]string, 0, 3)
+	t.Cleanup(func() { rdb.XDel(ctx, stream.StreamName, ids...) })
+	for i := 0; i < 3; i++ {
+		id, err := rdb.XAdd(ctx, &redis.XAddArgs{
+			Stream: stream.StreamName,
+			Values: map[string]any{"data": `{"event_id":"550e8400-e29b-41d4-a716-446655440000","id":1,"source":"mock","deal_type":"rent","country":"BY","city":"Minsk","rooms":1,"price":1,"currency":"USD","price_usd":1,"url":"https://example.com/1","created_at":"2026-11-20T10:00:00Z"}`},
+		}).Result()
+		if err != nil {
+			t.Fatalf("XAdd: %v", err)
+		}
+		ids = append(ids, id)
+	}
+
+	pollOnce(ctx, rdb, nil)
+	if got := testutil.ToFloat64(metrics.StreamLength); got < 3 {
+		t.Fatalf("StreamLength = %v, ожидалось >= 3 (стрим общий, могли остаться чужие записи)", got)
 	}
 }

@@ -21,12 +21,14 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 
 	"notifier/internal/bot"
 	"notifier/internal/db"
 	"notifier/internal/dicts"
 	"notifier/internal/httpx"
+	"notifier/internal/metrics"
 	"notifier/internal/migrate"
 	"notifier/internal/model"
 	"notifier/internal/notify"
@@ -48,6 +50,10 @@ const (
 	// событие раз в несколько секунд, поэтому 30/мин с запасом покрывают
 	// честное использование и режут перебор.
 	defaultDebugRateLimitPerMin = 30
+	// Интервал поллера гейджей Prometheus: скрейп в Redis/PG не ходит
+	// (карточка 01 плана prod-10of10), поэтому частота определяется здесь,
+	// а не нагрузкой от Prometheus.
+	metricsPollEvery = 15 * time.Second
 )
 
 // Тайминги health-проверок: у каждой проверки свой дедлайн, сбор результатов
@@ -187,9 +193,17 @@ func main() {
 	// не фатальны — без очистки стрим просто не режется.
 	go stream.NewReaper(redisClient, cleanupEvery).Run(ctx)
 
+	// Гейджи Prometheus (карточка 01): pending/длина стрима/отложенные
+	// обновляются раз в metricsPollEvery — скрейп в Redis/PG не ходит.
+	go pollGauges(ctx, redisClient, pool, metricsPollEvery)
+
 	srv := &http.Server{
-		Addr:              ":8080",
-		Handler:           requestLogger(newMux(redisClient, dictsClient, pool, mode, debugRatePerMin)),
+		Addr: ":8080",
+		// Обвязка снаружи внутрь: slog-лог → HTTP-метрики Prometheus → mux.
+		Handler: requestLogger(promhttp.InstrumentHandlerInFlight(metrics.HTTPInFlight,
+			promhttp.InstrumentHandlerDuration(metrics.HTTPDuration,
+				promhttp.InstrumentHandlerCounter(metrics.HTTPRequests,
+					newMux(redisClient, dictsClient, pool, mode, debugRatePerMin))))),
 		ReadHeaderTimeout: 5 * time.Second, // медленные заголовки не держат коннект (slowloris)
 	}
 	srvErr := make(chan error, 1)
@@ -446,6 +460,11 @@ func newMux(rdb *redis.Client, dictsClient *dicts.Client, pool *pgxpool.Pool, mo
 		})
 	})
 
+	// /metrics — Prometheus (карточка 01 плана prod-10of10). Публичный на
+	// mux: значений секретов и PII не содержит. Гейджи обновляются фоновым
+	// поллером — скрейп в Redis/PG не ходит (см. internal/metrics).
+	mux.Handle("/metrics", metrics.Handler())
+
 	// POST /debug/event кладёт демо-событие в стрим — оно проходит весь
 	// обычный путь через consumer group. Без ADMIN_KEY эндпоинт выключен.
 	// Rate limit per-IP (аудит 20.11, P2-25) режет частоту ДО авторизации:
@@ -670,4 +689,46 @@ func newRequestID() string {
 		return fmt.Sprintf("t%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b[:])
+}
+
+// pollGauges обновляет гейджи internal/metrics раз в every: pending и
+// длина стрима — из Redis, отложенные — из notifications_log (только
+// db-режим; в memory-режиме нечего считать — см. metrics.DeferredJobs).
+// Ошибки поллера не фатальны: гейдж остаётся с прошлым значением, сбой
+// уходит WARN'ом — алерт по несвежим гейджам делается в карточке 03.
+func pollGauges(ctx context.Context, rdb *redis.Client, pool *pgxpool.Pool, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			pollOnce(ctx, rdb, pool)
+		}
+	}
+}
+
+// pollOnce — один проход поллера гейджей.
+func pollOnce(ctx context.Context, rdb *redis.Client, pool *pgxpool.Pool) {
+	if pending, err := rdb.XPending(ctx, stream.StreamName, stream.GroupName).Result(); err != nil {
+		slog.Warn("metrics: xpending failed", "error", err)
+	} else {
+		metrics.StreamPending.Set(float64(pending.Count))
+	}
+	if n, err := rdb.XLen(ctx, stream.StreamName).Result(); err != nil {
+		slog.Warn("metrics: xlen failed", "error", err)
+	} else {
+		metrics.StreamLength.Set(float64(n))
+	}
+	if pool == nil {
+		return
+	}
+	var n int
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM notifier.notifications_log WHERE status = 'deferred'").Scan(&n); err != nil {
+		slog.Warn("metrics: deferred count failed", "error", err)
+		return
+	}
+	metrics.DeferredJobs.Set(float64(n))
 }
