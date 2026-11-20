@@ -8,7 +8,7 @@
 package ratelimit
 
 import (
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
@@ -68,7 +68,7 @@ func (p *PerIP) Middleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ip := ClientIP(r)
 		if !p.allow(ip) {
-			log.Printf("WARN: rate limit exceeded for %s on %s", ip, r.URL.Path)
+			slog.Warn("rate limit exceeded", "client_ip", ip, "path", r.URL.Path)
 			w.Header().Set("Retry-After", "60")
 			http.Error(w, `{"error":"rate_limited"}`, http.StatusTooManyRequests)
 			return

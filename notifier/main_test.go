@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -435,5 +436,26 @@ func TestDebugEventPublishesToStream(t *testing.T) {
 	// оставленная демо-запись ломает ожидания соседних тестов по XLEN.
 	if err := rdb.XDel(context.Background(), stream.StreamName, resp["stream_id"]).Err(); err != nil {
 		t.Fatalf("XDel тестовой записи: %v", err)
+	}
+}
+
+// parseLevel — уровень NOTIFIER_LOG_LEVEL: распознаёт 4 уровня без учёта
+// регистра, мусор — fail-fast (ТЗ 3.6, как остальные параметры).
+func TestParseLevel(t *testing.T) {
+	for raw, want := range map[string]slog.Level{
+		"debug":   slog.LevelDebug,
+		"INFO":    slog.LevelInfo,
+		"warn":    slog.LevelWarn,
+		"warning": slog.LevelWarn,
+		"ERROR":   slog.LevelError,
+		"":        slog.LevelInfo,
+	} {
+		got, err := parseLevel(raw)
+		if err != nil || got != want {
+			t.Fatalf("parseLevel(%q) = %v, %v; want %v, nil", raw, got, err, want)
+		}
+	}
+	if _, err := parseLevel("verbose"); err == nil {
+		t.Fatal("мусорный уровень должен давать ошибку (fail-fast)")
 	}
 }
