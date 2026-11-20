@@ -217,6 +217,7 @@ docker compose down
 - [docs/contracts.md](docs/contracts.md) — актуальные контракты между сервисами (Redis Streams, справочники, outbox). При расхождении с этим README приоритет у contracts.md.
 - [Contributing](CONTRIBUTING.ru.md) — правила веток и коммитов, CI и требования ТЗ к изменению контрактов.
 - Доки сервисов: [notifier](notifier/README.md), [core-api](core-api/README.md), [collector](collector/README.md).
+- CI/CD репозитория: [.github/CICD.md](.github/CICD.md) — workflows, гвард ссылок, шаблон PR, Dependabot.
 
 ### Архитектура и диаграммы (GitHub Pages)
 
