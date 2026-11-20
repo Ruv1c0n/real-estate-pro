@@ -2,11 +2,14 @@ import asyncio
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
+from operator import attrgetter
 from typing import Literal
 from uuid import UUID, uuid4
 
+from app.listing_filters import ListingFilters
 from app.listing_models import ListingCreate
-from app.listing_store import CreateListingResult, StoredListing
+from app.listing_store import CreateListingResult, ListingSearchResult, StoredListing
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,30 @@ def build_listing_event(listing: StoredListing) -> OutboxEvent:
             "created_at": listing.created_at.isoformat(),
         },
         created_at=listing.created_at,
+    )
+
+
+def _in_range(
+    value: int | Decimal | None,
+    minimum: Decimal | None,
+    maximum: Decimal | None,
+) -> bool:
+    if value is None:
+        return minimum is None and maximum is None
+
+    return (minimum is None or value >= minimum) and (
+        maximum is None or value <= maximum
+    )
+
+
+def _matches_filters(listing: StoredListing, filters: ListingFilters) -> bool:
+    for field in ("deal_type", "country", "city", "source", "rooms"):
+        expected = getattr(filters, field)
+        if expected is not None and getattr(listing, field) != expected:
+            return False
+
+    return _in_range(listing.price_usd, filters.price_min, filters.price_max) and (
+        _in_range(listing.area_m2, filters.area_min, filters.area_max)
     )
 
 
@@ -97,3 +124,28 @@ class InMemoryListingStore:
         """Вернуть независимую копию outbox для проверок."""
         async with self._lock:
             return deepcopy(self._outbox)
+
+    async def search(self, filters: ListingFilters) -> ListingSearchResult:
+        async with self._lock:
+            matches = [
+                listing
+                for listing in self._listings.values()
+                if _matches_filters(listing, filters)
+            ]
+
+            sort_field = (
+                "price_usd" if filters.sort.startswith("price_") else "created_at"
+            )
+            matches.sort(
+                key=attrgetter(sort_field, "id"),
+                reverse=filters.sort.endswith("_desc"),
+            )
+
+            total = len(matches)
+            start = (filters.page - 1) * filters.size
+            page_items = matches[start : start + filters.size]
+
+            return ListingSearchResult(
+                items=[listing.model_copy(deep=True) for listing in page_items],
+                total=total,
+            )

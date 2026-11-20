@@ -4,6 +4,7 @@ package notify
 import (
 	"context"
 	"strconv"
+	"strings"
 	"sync"
 
 	"notifier/internal/model"
@@ -73,7 +74,9 @@ func (q *MemoryQueue) PopBatch(_ context.Context, limit int) ([]DeferredJob, err
 // «в полёте» и убираем его из очереди, если оно там ещё лежит (так бывает,
 // когда Flush закрывает задание как «уже отправленное» без забора);
 // retry — снимаем пометку и возвращаем задание в начало очереди (дальше его
-// снова видит дедуп Postpone).
+// снова видит дедуп Postpone);
+// drop — снимаем пометку и убираем задание БЕЗ отправки (получатель удалён,
+// ТЗ 4.2): паритет с DELETE deferred-строки в PgQueue.
 func (q *MemoryQueue) Mark(_ context.Context, job DeferredJob, _, status string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -81,7 +84,7 @@ func (q *MemoryQueue) Mark(_ context.Context, job DeferredJob, _, status string)
 	switch status {
 	case StatusRetry:
 		q.jobs = append([]DeferredJob{job}, q.jobs...)
-	case StatusSent, StatusUnknown:
+	case StatusSent, StatusUnknown, StatusDropped:
 		// Паритет с db-режимом: строка перестаёт быть deferred — в memory
 		// аналогично убираем из очереди.
 		for i, j := range q.jobs {
@@ -91,5 +94,28 @@ func (q *MemoryQueue) Mark(_ context.Context, job DeferredJob, _, status string)
 			}
 		}
 	}
+	return nil
+}
+
+// DropChatJobs удаляет отложенные задания чата (ТЗ 4.2: «/stop удаляет и
+// отложенные задания») и снимает пометку «в полёте» с его пар — иначе после
+// /stop очередь «доставила» бы их в лог уже удалённому пользователю.
+// Идемпотентно: чат без заданий — тоже успех.
+func (q *MemoryQueue) DropChatJobs(_ context.Context, chatID int64) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	prefix := strconv.FormatInt(chatID, 10) + ":"
+	for k := range q.inflight {
+		if strings.HasPrefix(k, prefix) {
+			delete(q.inflight, k)
+		}
+	}
+	jobs := q.jobs[:0]
+	for _, j := range q.jobs {
+		if j.ChatID != chatID {
+			jobs = append(jobs, j)
+		}
+	}
+	q.jobs = jobs
 	return nil
 }
