@@ -14,6 +14,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"notifier/internal/metrics"
 	"notifier/internal/model"
 )
 
@@ -304,6 +305,7 @@ func (c *Consumer) process(ctx context.Context, msg redis.XMessage) {
 	// подхвачена XAUTOCLAIM (minIdle 30 с; eventBudget 25 с меньше порога,
 	// поэтому живой воркер не перезабирается — см. notify.eventBudget).
 	if err := c.handle(ctx, event); err != nil {
+		metrics.ProcessErrors.Inc()
 		slog.Error("consumer: handle failed — не подтверждено, запись остаётся в pending",
 			"stream_msg_id", msg.ID, "event_id", event.EventID, "error", err)
 		return
@@ -335,6 +337,7 @@ func (c *Consumer) dead(ctx context.Context, msg redis.XMessage, payload, reason
 		return
 	}
 	slog.Warn("consumer: bad payload moved to dead stream", "stream_msg_id", msg.ID, "dead_stream", DeadStream, "reason", reason)
+	metrics.DeadLetter.Inc()
 	if err := c.rdb.XAck(context.WithoutCancel(ctx), StreamName, GroupName, msg.ID).Err(); err != nil {
 		slog.Warn("consumer: xack dead failed", "stream_msg_id", msg.ID, "error", err)
 	}
