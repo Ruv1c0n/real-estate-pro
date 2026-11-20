@@ -202,6 +202,29 @@ Delivery:
 | `/unsubscribe <id>` | Remove one of your subscriptions |
 | `/stop` | Delete the user, subscriptions, journal and deferred jobs |
 
+## Scaling boundaries (single-instance assumptions)
+
+The spec targets one instance per service; parts of the delivery correctness
+rely on that. Known single-instance assumptions (each documented in code):
+
+- **notifier — exactly one instance**: delivery claim is in-process
+  (`chatLocks`/`inFlight` in `notify.go`), the deferred-queue flusher assumes
+  a single runner, and the stream reaper has no leader election. Two
+  instances would double-deliver; the journal dedup would catch it, but
+  users would see duplicate messages.
+- **core-api** — the outbox worker uses `FOR UPDATE SKIP LOCKED` (it would
+  survive N workers) but is designed for one; the listing dedup itself is
+  DB-level and instance-agnostic.
+- **collector** — "no parallel cycles of one source" (FT-1.4) is enforced
+  in-process.
+- **Telegram** — long polling assumes a single consumer; webhook + queue is
+  the multi-instance path.
+
+If a second instance ever becomes a requirement: move the delivery claim to
+the DB level (`claimed_at` + `UPDATE ... RETURNING`), add advisory-lock
+leader election for the reaper/flusher, and a distributed lock for collector
+cycles.
+
 ## Team
 
 | Member | Responsibility |
