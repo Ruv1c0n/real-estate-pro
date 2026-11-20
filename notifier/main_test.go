@@ -8,21 +8,28 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/redis/go-redis/v9"
 
 	"notifier/internal/dicts"
+	"notifier/internal/metrics"
 	"notifier/internal/notify"
 	"notifier/internal/store"
+	"notifier/internal/stream"
 )
 
 // newDictsFake поднимает HTTP-заглушку Core API: GET /api/v1/countries
@@ -96,7 +103,7 @@ func TestHealthAlwaysOkWithDbField(t *testing.T) {
 		t.Fatal("заглушка Core API должна быть здорова при прогреве кэша")
 	}
 
-	mux := newMux(rdb, dictsClient, nil, notify.ModeLog) // memory-режим: pool == nil
+	mux := newMux(rdb, dictsClient, nil, notify.ModeLog, defaultDebugRateLimitPerMin) // memory-режим: pool == nil
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
 
@@ -131,7 +138,7 @@ func TestHealthLivenessNoNetwork(t *testing.T) {
 	t.Cleanup(srv.Close)
 	dictsClient := dicts.New(srv.URL) // кэш не прогрет: CachedHealthy() == false
 
-	mux := newMux(rdb, dictsClient, nil, notify.ModeLog)
+	mux := newMux(rdb, dictsClient, nil, notify.ModeLog, defaultDebugRateLimitPerMin)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
 
@@ -151,7 +158,7 @@ func TestHealthReadyMemoryModeOk(t *testing.T) {
 	rdb := testRedisAddr(t)
 	dictsClient := newDictsFake(t)
 
-	mux := newMux(rdb, dictsClient, nil, notify.ModeLog)
+	mux := newMux(rdb, dictsClient, nil, notify.ModeLog, defaultDebugRateLimitPerMin)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
 
@@ -171,7 +178,7 @@ func TestHealthReadyDbModeOk(t *testing.T) {
 	pool := testPool(t)
 	defer pool.Close()
 
-	mux := newMux(rdb, dictsClient, pool, notify.ModeLog)
+	mux := newMux(rdb, dictsClient, pool, notify.ModeLog, defaultDebugRateLimitPerMin)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
 
@@ -192,7 +199,7 @@ func TestHealthReadyDbDown(t *testing.T) {
 	pool := testPool(t)
 	pool.Close()
 
-	mux := newMux(rdb, dictsClient, pool, notify.ModeLog)
+	mux := newMux(rdb, dictsClient, pool, notify.ModeLog, defaultDebugRateLimitPerMin)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
 
@@ -213,7 +220,7 @@ func TestHealthReadyRedisDown(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
 	t.Cleanup(func() { rdb.Close() })
 
-	mux := newMux(rdb, dictsClient, nil, notify.ModeLog)
+	mux := newMux(rdb, dictsClient, nil, notify.ModeLog, defaultDebugRateLimitPerMin)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
 
@@ -319,5 +326,196 @@ func TestEnvPositiveDuration(t *testing.T) {
 	t.Setenv("NOTIFIER_JUNK", "five")
 	if _, err := envPositiveDuration("NOTIFIER_JUNK", 5*time.Minute); err == nil {
 		t.Fatal("мусорное значение должно давать ошибку (fail-fast)")
+	}
+}
+
+// Тесты /debug/event (НФТ-3): fail-closed без ключа, логирование отказов
+// авторизации и rate limit per-IP до авторизации (аудит 20.11, P2-25 —
+// брутфорс X-Admin-Key раньше был бесплатным и молчаливым).
+
+func TestDebugEventDisabledWithoutAdminKey(t *testing.T) {
+	t.Setenv("ADMIN_KEY", "")
+	dictsClient := newDictsFake(t)
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	t.Cleanup(func() { rdb.Close() })
+
+	mux := newMux(rdb, dictsClient, nil, notify.ModeLog, defaultDebugRateLimitPerMin)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/debug/event", nil))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("пустой ADMIN_KEY выключает эндпоинт: %d, ожидается 404", rec.Code)
+	}
+}
+
+func TestDebugEventUnauthorizedAttemptIsLogged(t *testing.T) {
+	t.Setenv("ADMIN_KEY", "correct-key")
+	dictsClient := newDictsFake(t)
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	t.Cleanup(func() { rdb.Close() })
+
+	mux := newMux(rdb, dictsClient, nil, notify.ModeLog, defaultDebugRateLimitPerMin)
+
+	// Захват стандартного логера: смысл правки в том, что отказ
+	// авторизации больше не молчаливый — проверяем содержимое лога.
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	req := httptest.NewRequest(http.MethodPost, "/debug/event", nil)
+	req.Header.Set("X-Admin-Key", "wrong-key")
+	req.RemoteAddr = "192.0.2.33:4444"
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("неверный ключ: %d, ожидается 401", rec.Code)
+	}
+	if !strings.Contains(buf.String(), "unauthorized attempt") || !strings.Contains(buf.String(), "192.0.2.33") {
+		t.Fatalf("отказ авторизации не в логе или без IP: %q", buf.String())
+	}
+}
+
+func TestDebugEventRateLimitedBeforeAuth(t *testing.T) {
+	t.Setenv("ADMIN_KEY", "correct-key")
+	dictsClient := newDictsFake(t)
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	t.Cleanup(func() { rdb.Close() })
+
+	// Лимит 2/мин на IP: первые два запроса доходят до авторизации (401 —
+	// ключ неверный), третий упирается в bucket ещё до constant-time
+	// compare. Заодно фиксируем, что неудачные авторизации не обходят
+	// лимит — они тратят те же токены.
+	mux := newMux(rdb, dictsClient, nil, notify.ModeLog, 2)
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/debug/event", nil)
+		req.Header.Set("X-Admin-Key", "wrong")
+		req.RemoteAddr = "192.0.2.44:1000"
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("запрос %d: %d, ожидается 401 (bucket ещё не пуст)", i+1, rec.Code)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/debug/event", nil)
+	req.Header.Set("X-Admin-Key", "wrong")
+	req.RemoteAddr = "192.0.2.44:1000"
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("третий запрос: %d, ожидается 429 (лимит 2/мин)", rec.Code)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra == "" {
+		t.Fatal("429 без Retry-After: клиент не узнаёт, когда повторять")
+	}
+}
+
+func TestDebugEventPublishesToStream(t *testing.T) {
+	t.Setenv("ADMIN_KEY", "correct-key")
+	dictsClient := newDictsFake(t)
+	rdb := testRedisAddr(t) // скип без живого Redis
+
+	mux := newMux(rdb, dictsClient, nil, notify.ModeLog, defaultDebugRateLimitPerMin)
+
+	body := `{"event_id":"550e8400-e29b-41d4-a716-446655440000","id":9001,"source":"mock","deal_type":"rent","country":"BY","city":"Minsk","rooms":2,"price":380,"currency":"USD","price_usd":380,"address":"ул. Тестовая, 1","url":"https://example.com/listing/9001","created_at":"2026-11-20T10:00:00Z"}`
+	req := httptest.NewRequest(http.MethodPost, "/debug/event", strings.NewReader(body))
+	req.Header.Set("X-Admin-Key", "correct-key")
+	req.RemoteAddr = "192.0.2.50:1111"
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("валидное событие с ключом: %d, ожидается 202; тело: %s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil || resp["published"] != "true" || resp["stream_id"] == "" {
+		t.Fatalf("неожиданное тело 202: %q (err=%v)", rec.Body.String(), err)
+	}
+
+	// Прибрать за собой: /debug/event кладёт запись в общий стрим, и
+	// оставленная демо-запись ломает ожидания соседних тестов по XLEN.
+	if err := rdb.XDel(context.Background(), stream.StreamName, resp["stream_id"]).Err(); err != nil {
+		t.Fatalf("XDel тестовой записи: %v", err)
+	}
+}
+
+// parseLevel — уровень NOTIFIER_LOG_LEVEL: распознаёт 4 уровня без учёта
+// регистра, мусор — fail-fast (ТЗ 3.6, как остальные параметры).
+func TestParseLevel(t *testing.T) {
+	for raw, want := range map[string]slog.Level{
+		"debug":   slog.LevelDebug,
+		"INFO":    slog.LevelInfo,
+		"warn":    slog.LevelWarn,
+		"warning": slog.LevelWarn,
+		"ERROR":   slog.LevelError,
+		"":        slog.LevelInfo,
+	} {
+		got, err := parseLevel(raw)
+		if err != nil || got != want {
+			t.Fatalf("parseLevel(%q) = %v, %v; want %v, nil", raw, got, err, want)
+		}
+	}
+	if _, err := parseLevel("verbose"); err == nil {
+		t.Fatal("мусорный уровень должен давать ошибку (fail-fast)")
+	}
+}
+
+// Тесты /metrics (карточка 01 плана prod-10of10): эндпоинт на mux отдаёт
+// пром-формат; поллер гейджей переживает недоступный Redis и обновляет
+// значения на живом.
+
+func TestMetricsEndpointOnMux(t *testing.T) {
+	t.Setenv("ADMIN_KEY", "")
+	dictsClient := newDictsFake(t)
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	t.Cleanup(func() { rdb.Close() })
+
+	mux := newMux(rdb, dictsClient, nil, notify.ModeLog, defaultDebugRateLimitPerMin)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/metrics: %d, ожидается 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "notifier_stream_length") {
+		t.Fatal("в /metrics нет наших метрик notifier_*")
+	}
+}
+
+func TestPollOnceToleratesDeadRedis(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	t.Cleanup(func() { rdb.Close() })
+
+	// Ошибки Redis не паникуют и не поднимают гейджи: значения остаются
+	// с прошлого прохода (в тесте — нулевые).
+	pollOnce(context.Background(), rdb, nil)
+	if got := testutil.ToFloat64(metrics.StreamLength); got != 0 {
+		t.Fatalf("StreamLength после сбоя Redis = %v, want 0", got)
+	}
+}
+
+func TestPollOnceSetsGauges(t *testing.T) {
+	rdb := testRedisAddr(t) // скип без живого Redis
+
+	// Наполняем стрим тремя записями и проверяем, что XLEN попал в гейдж.
+	ctx := context.Background()
+	ids := make([]string, 0, 3)
+	t.Cleanup(func() { rdb.XDel(ctx, stream.StreamName, ids...) })
+	for i := 0; i < 3; i++ {
+		id, err := rdb.XAdd(ctx, &redis.XAddArgs{
+			Stream: stream.StreamName,
+			Values: map[string]any{"data": `{"event_id":"550e8400-e29b-41d4-a716-446655440000","id":1,"source":"mock","deal_type":"rent","country":"BY","city":"Minsk","rooms":1,"price":1,"currency":"USD","price_usd":1,"url":"https://example.com/1","created_at":"2026-11-20T10:00:00Z"}`},
+		}).Result()
+		if err != nil {
+			t.Fatalf("XAdd: %v", err)
+		}
+		ids = append(ids, id)
+	}
+
+	pollOnce(ctx, rdb, nil)
+	if got := testutil.ToFloat64(metrics.StreamLength); got < 3 {
+		t.Fatalf("StreamLength = %v, ожидалось >= 3 (стрим общий, могли остаться чужие записи)", got)
 	}
 }

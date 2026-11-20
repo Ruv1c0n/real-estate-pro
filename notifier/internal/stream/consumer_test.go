@@ -449,7 +449,9 @@ func TestConsumerWarnsOnStreamLenThreshold(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	logged := sbuf.String()
-	if !strings.Contains(logged, fmt.Sprintf("length %d", lenWarnThreshold+1)) {
+	// slog-формат WARN (card 02 prod-10of10): поле length= со значением
+	// текущей длины стрима.
+	if !strings.Contains(logged, fmt.Sprintf("length=%d", lenWarnThreshold+1)) {
 		t.Errorf("в логе нет текущей длины стрима: %q", logged)
 	}
 	if !strings.Contains(logged, "test-1") {
