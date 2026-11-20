@@ -7,7 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -378,7 +378,7 @@ func (d *Dispatcher) deliverRecipient(ctx context.Context, chatID int64, e model
 		// Пользователь удалён (/stop) после выбора получателей: доставка ему
 		// не нужна. Задание в очередь отложенных НЕ возвращается — в db-режиме
 		// каскад /stop уже снял бы его, здесь закрывается то же окно гонки.
-		log.Printf("user %d gone: skip listing %d (ТЗ 4.2)", chatID, e.ID)
+		slog.Warn("dispatch: user gone, skip — задание не возвращается (ТЗ 4.2)", "chat_id", chatID, "listing_id", e.ID)
 		return nil
 	}
 	ok, err := d.limiter.Allow(rctx, chatID, d.mode)
@@ -394,7 +394,7 @@ func (d *Dispatcher) deliverRecipient(ctx context.Context, chatID int64, e model
 	if err := d.postpone(rctx, chatID, e); err != nil {
 		return fmt.Errorf("postpone listing %d chat %d: %w", e.ID, chatID, err)
 	}
-	log.Printf("hourly limit reached: listing %d to chat %d deferred", e.ID, chatID)
+	slog.Info("dispatch: hourly limit reached — deferred", "listing_id", e.ID, "chat_id", chatID)
 	return nil
 }
 
@@ -419,10 +419,10 @@ func (d *Dispatcher) postpone(ctx context.Context, chatID int64, e model.Event) 
 func logRateLimited(err error, listingID, chatID int64) {
 	var rle *telegram.RateLimitError
 	if errors.As(err, &rle) {
-		log.Printf("dispatch: rate limited (retry_after %s): listing %d chat %d", rle.RetryAfter, listingID, chatID)
+		slog.Warn("dispatch: rate limited 429", "retry_after", rle.RetryAfter.String(), "listing_id", listingID, "chat_id", chatID)
 		return
 	}
-	log.Printf("dispatch: rate limited: listing %d chat %d", listingID, chatID)
+	slog.Warn("dispatch: rate limited 429", "listing_id", listingID, "chat_id", chatID)
 }
 
 // flushRateLimitPause — потолок паузы между 429-повторами во Flush: больше
@@ -473,7 +473,7 @@ func (d *Dispatcher) deliver(ctx context.Context, chatID int64, e model.Event) e
 		// повтор не выполняется (contracts.md §2 — статус unknown без повтора).
 		// Ошибкой события НЕ возвращается: повтор всего события привёл бы к
 		// повторной отправке.
-		log.Printf("send listing %d to chat %d: %v", e.ID, chatID, err)
+		slog.Error("dispatch: send failed — статус unknown", "listing_id", e.ID, "chat_id", chatID, "error", err)
 		status = StatusUnknown
 	}
 	if err := d.journal.Record(ctx, chatID, e.ID, e.EventID, e, status, d.mode); err != nil {
@@ -485,7 +485,7 @@ func (d *Dispatcher) deliver(ctx context.Context, chatID int64, e model.Event) e
 		// у пользователя. Неопределённый исход отправки имеет статус unknown
 		// и автоповтору не подлежит (contracts.md §2); повтор возможен только
 		// при явной повторной публикации события.
-		log.Printf("journal record listing %d chat %d: %v", e.ID, chatID, err)
+		slog.Error("dispatch: journal record failed после отправки", "listing_id", e.ID, "chat_id", chatID, "error", err)
 	}
 	return nil
 }
@@ -510,7 +510,7 @@ func (d *Dispatcher) RunFlusher(ctx context.Context, every time.Duration) {
 func (d *Dispatcher) Flush(ctx context.Context) {
 	jobs, err := d.queue.PopBatch(ctx, deferredBatchSize)
 	if err != nil {
-		log.Printf("pop deferred batch: %v", err)
+		slog.Error("flush: pop batch failed", "error", err)
 		return
 	}
 	for _, job := range jobs {
@@ -528,7 +528,7 @@ func (d *Dispatcher) flushJob(ctx context.Context, job DeferredJob) {
 	if !d.claim(key) {
 		// Доставляется прямо сейчас другим путём — вернуть в очередь.
 		if err := d.queue.Mark(ctx, job, d.mode, StatusRetry); err != nil {
-			log.Printf("mark retry listing %d chat %d: %v", job.Event.ID, job.ChatID, err)
+			slog.Warn("flush: mark retry failed", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", err)
 		}
 		return
 	}
@@ -543,13 +543,13 @@ func (d *Dispatcher) flushJob(ctx context.Context, job DeferredJob) {
 	// его гасит дедуп журнала при Record.
 	sent, serr := d.journal.Sent(ctx, job.Event.ID, job.ChatID)
 	if serr != nil {
-		log.Printf("journal check deferred listing %d chat %d: %v", job.Event.ID, job.ChatID, serr)
+		slog.Warn("flush: journal check failed — отправляем без дедупа", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", serr)
 	}
 	if sent {
 		// Задание закрывается как sent: в Pg строка уже не deferred
 		// (UPDATE не найдёт её), в memory Mark убирает из очереди.
 		if merr := d.queue.Mark(ctx, job, d.mode, StatusSent); merr != nil {
-			log.Printf("mark listing %d chat %d: %v", job.Event.ID, job.ChatID, merr)
+			slog.Warn("flush: mark failed", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", merr)
 		}
 		return
 	}
@@ -561,9 +561,9 @@ func (d *Dispatcher) flushJob(ctx context.Context, job DeferredJob) {
 	if uerr != nil {
 		// Проверка недоступна — задание остаётся в очереди (retry), повтор
 		// следующим проходом флешера (ТЗ 3.6: отложенные не отбрасываются).
-		log.Printf("user check deferred listing %d chat %d: %v", job.Event.ID, job.ChatID, uerr)
+		slog.Warn("flush: user check failed — retry следующим проходом", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", uerr)
 		if merr := d.queue.Mark(ctx, job, d.mode, StatusRetry); merr != nil {
-			log.Printf("mark retry listing %d chat %d: %v", job.Event.ID, job.ChatID, merr)
+			slog.Warn("flush: mark retry failed", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", merr)
 		}
 		return
 	}
@@ -572,9 +572,9 @@ func (d *Dispatcher) flushJob(ctx context.Context, job DeferredJob) {
 		// доставка ему не нужна, задание снимается с очереди без отправки
 		// (Mark drop — в Pg DELETE deferred-строки, тот же исход, что у
 		// каскада /stop; ТЗ 4.2).
-		log.Printf("user %d gone: drop deferred listing %d (ТЗ 4.2)", job.ChatID, job.Event.ID)
+		slog.Info("flush: user gone, drop deferred (ТЗ 4.2)", "chat_id", job.ChatID, "listing_id", job.Event.ID)
 		if merr := d.queue.Mark(ctx, job, d.mode, StatusDropped); merr != nil {
-			log.Printf("mark drop listing %d chat %d: %v", job.Event.ID, job.ChatID, merr)
+			slog.Warn("flush: mark drop failed", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", merr)
 		}
 		return
 	}
@@ -582,12 +582,12 @@ func (d *Dispatcher) flushJob(ctx context.Context, job DeferredJob) {
 	ok, err := d.limiter.Allow(ctx, job.ChatID, d.mode)
 	if err != nil {
 		// Окно не подтверждено — задание остаётся в очереди.
-		log.Printf("limiter check listing %d chat %d: %v", job.Event.ID, job.ChatID, err)
+		slog.Warn("flush: limiter check failed — задание остаётся в очереди", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", err)
 		ok = false
 	}
 	if !ok {
 		if err := d.queue.Mark(ctx, job, d.mode, StatusRetry); err != nil {
-			log.Printf("mark retry listing %d chat %d: %v", job.Event.ID, job.ChatID, err)
+			slog.Warn("flush: mark retry failed", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", err)
 		}
 		return
 	}
@@ -599,7 +599,7 @@ func (d *Dispatcher) flushJob(ctx context.Context, job DeferredJob) {
 		if errors.Is(err, telegram.ErrRateLimited) {
 			logRateLimited(err, job.Event.ID, job.ChatID)
 			if merr := d.queue.Mark(ctx, job, d.mode, StatusRetry); merr != nil {
-				log.Printf("mark retry listing %d chat %d: %v", job.Event.ID, job.ChatID, merr)
+				slog.Warn("flush: mark retry failed", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", merr)
 			}
 			// Mark(retry) коммитит транзакцию — блокировок на неотмеченные
 			// задания батча больше нет, пауза безопасна. Без неё пачка
@@ -609,16 +609,16 @@ func (d *Dispatcher) flushJob(ctx context.Context, job DeferredJob) {
 			return
 		}
 		// contracts.md §2: ошибка отправки — статус unknown, без повтора.
-		log.Printf("send listing %d to chat %d: %v", job.Event.ID, job.ChatID, err)
+		slog.Error("flush: send failed — статус unknown", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", err)
 		status = StatusUnknown
 	}
 	if err := d.queue.Mark(ctx, job, d.mode, status); err != nil {
-		log.Printf("mark listing %d chat %d: %v", job.Event.ID, job.ChatID, err)
+		slog.Warn("flush: mark failed", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", err)
 	}
 	// Журнал: для Pg-очереди строка задания и есть запись журнала,
 	// Record подтверждает её (upsert по той же паре); для memory-очереди
 	// это единственная фиксация доставки.
 	if err := d.journal.Record(ctx, job.ChatID, job.Event.ID, job.Event.EventID, job.Event, status, d.mode); err != nil {
-		log.Printf("journal record listing %d chat %d: %v", job.Event.ID, job.ChatID, err)
+		slog.Error("flush: journal record failed после отправки", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", err)
 	}
 }

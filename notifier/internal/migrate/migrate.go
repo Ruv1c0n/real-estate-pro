@@ -10,7 +10,7 @@ package migrate
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -78,7 +78,7 @@ func Apply(ctx context.Context, pool *pgxpool.Pool) error {
 		defer cancel()
 		if _, err := conn.Exec(unlockCtx,
 			`SELECT pg_advisory_unlock($1)`, advisoryLockKey); err != nil {
-			log.Printf("migrations: release advisory lock: %v", err)
+			slog.Warn("migrations: release advisory lock failed", "error", err)
 		}
 	}()
 
@@ -125,7 +125,7 @@ func Apply(ctx context.Context, pool *pgxpool.Pool) error {
 	for _, name := range names {
 		version := versionOf(name)
 		if appliedVersions[version] {
-			log.Printf("migration %s already applied", version)
+			slog.Info("migrations: already applied", "migration", version)
 			continue
 		}
 		sql, err := migrations.FS().ReadFile(name)
@@ -140,7 +140,7 @@ func Apply(ctx context.Context, pool *pgxpool.Pool) error {
 			`INSERT INTO notifier.schema_migrations (version) VALUES ($1)`, version); err != nil {
 			return fmt.Errorf("migrations: record %s: %w", version, err)
 		}
-		log.Printf("migration %s applied", version)
+		slog.Info("migrations: applied", "migration", version)
 	}
 	return nil
 }
