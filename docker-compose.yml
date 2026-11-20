@@ -146,6 +146,40 @@ services:
       retries: 10
       start_period: 10s
 
+  # Резервное копирование по расписанию (карточка 06 плана prod-10of10,
+  # ТЗ 6.1): postgres:16-контейнер с pg_dump/initdb внутри — ходит в
+  # postgres по compose-сети, без docker-сокета. Ежедневный дамп в BACKUP_AT
+  # (TZ Europe/Minsk по ТЗ 3.2) + манифест; retention 7 daily + 4 weekly;
+  # по BACKUP_VERIFY_DAY — восстановление последнего дампа во временный
+  # кластер внутри контейнера со сверкой строк (контейнерная версия
+  # scripts/db/restore-verify.sh). Маркеры .last-success/.last-verify в
+  # volume — основа алерта «бэкап старше 26 часов» (docs/db-backup-restore.md).
+  db-backup:
+    image: postgres:16
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PG_USER: ${POSTGRES_USER:-app}
+      PG_PASSWORD: ${POSTGRES_PASSWORD:-app}
+      PG_DB: ${POSTGRES_DB:-realestate}
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      BACKUP_DIR: /backups
+      BACKUP_AT: ${BACKUP_AT:-03:00}
+      BACKUP_VERIFY_DAY: ${BACKUP_VERIFY_DAY:-7}
+      BACKUP_ON_START: ${BACKUP_ON_START:-1}
+      TZ: Europe/Minsk
+    volumes:
+      - backups:/backups
+      # Скрипт ro: расписание не должно редактироваться изнутри контейнера
+      # (тот же приём, что у сервисных ролей в db-roles-setup).
+      - ./scripts/db/backup-loop.sh:/usr/local/bin/backup-loop.sh:ro
+    entrypoint: ["bash", "/usr/local/bin/backup-loop.sh"]
+    logging: *default-logging
+
 volumes:
   pgdata:
   redisdata:
+  backups:
