@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -446,5 +447,26 @@ func TestDebugEventBruteForceTriggersBan(t *testing.T) {
 	ra, err := strconv.Atoi(rec.Header().Get("Retry-After"))
 	if err != nil || ra < 250 || ra > 301 {
 		t.Fatalf("Retry-After = %q (%d, %v), ожидается оставшееся время 5-минутного бана", rec.Header().Get("Retry-After"), ra, err)
+	}
+}
+
+// parseLevel — уровень NOTIFIER_LOG_LEVEL: распознаёт 4 уровня без учёта
+// регистра, мусор — fail-fast (ТЗ 3.6, как остальные параметры).
+func TestParseLevel(t *testing.T) {
+	for raw, want := range map[string]slog.Level{
+		"debug":   slog.LevelDebug,
+		"INFO":    slog.LevelInfo,
+		"warn":    slog.LevelWarn,
+		"warning": slog.LevelWarn,
+		"ERROR":   slog.LevelError,
+		"":        slog.LevelInfo,
+	} {
+		got, err := parseLevel(raw)
+		if err != nil || got != want {
+			t.Fatalf("parseLevel(%q) = %v, %v; want %v, nil", raw, got, err, want)
+		}
+	}
+	if _, err := parseLevel("verbose"); err == nil {
+		t.Fatal("мусорный уровень должен давать ошибку (fail-fast)")
 	}
 }

@@ -7,7 +7,7 @@ package stream
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 )
 
@@ -43,7 +43,7 @@ func DefaultCleanupInterval() time.Duration { return cleanupInterval }
 func (r *Reaper) Run(ctx context.Context) {
 	t := time.NewTicker(r.interval)
 	defer t.Stop()
-	log.Printf("stream reaper: cleanup every %s", r.interval)
+	slog.Info("stream reaper: cleanup interval", "interval", r.interval.String())
 	for {
 		select {
 		case <-ctx.Done():
@@ -51,11 +51,11 @@ func (r *Reaper) Run(ctx context.Context) {
 		case <-t.C:
 			n, boundary, err := r.CleanOnce(ctx)
 			if err != nil {
-				log.Printf("stream reaper: %v", err)
+				slog.Warn("stream reaper: cleanup pass failed", "error", err)
 				continue
 			}
 			if n > 0 {
-				log.Printf("stream reaper: deleted %d confirmed records (boundary %s)", n, boundary)
+				slog.Info("stream reaper: deleted confirmed records", "count", n, "boundary", boundary)
 			}
 		}
 	}

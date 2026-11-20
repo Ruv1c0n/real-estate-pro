@@ -2,16 +2,20 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -56,6 +60,18 @@ const (
 )
 
 func main() {
+	// Уровень лога и формат до всего остального: мусорный уровень —
+	// fail-fast через обычный log (slog ещё не установлен — начало
+	// chicken-and-egg; единственное место, где JSON-структуры ещё нет).
+	level, err := parseLevel(env("NOTIFIER_LOG_LEVEL", "info"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	// JSON-логи (карточка 02 плана prod-10of10): единая структура для
+	// сбора и алертов. Корреляция сквозного пути — по event_id, он и так
+	// в контракте listings.new (ТЗ 4.3): контракт не меняется.
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})))
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -63,32 +79,36 @@ func main() {
 	// значениями ТЗ, мусорные значения — fail-fast до поднятия компонентов.
 	perHour, err := envPositiveInt("NOTIFIER_NOTIFICATIONS_PER_HOUR", defaultNotificationsPerHour)
 	if err != nil {
-		log.Fatal(err)
+		fatal("config: notifications per hour", "error", err)
 	}
 	workers, err := envPositiveInt("NOTIFIER_WORKERS", stream.DefaultWorkers())
 	if err != nil {
-		log.Fatal(err)
+		fatal("config: workers", "error", err)
 	}
 	lenWarn, err := envPositiveInt64("NOTIFIER_STREAM_LEN_THRESHOLD", stream.DefaultLenWarnThreshold())
 	if err != nil {
-		log.Fatal(err)
+		fatal("config: stream len warn threshold", "error", err)
 	}
 	cleanupEvery, err := envPositiveDuration("NOTIFIER_STREAM_CLEANUP_INTERVAL", stream.DefaultCleanupInterval())
 	if err != nil {
-		log.Fatal(err)
+		fatal("config: stream cleanup interval", "error", err)
 	}
 	debugRatePerMin, err := envPositiveInt("NOTIFIER_DEBUG_RATE_LIMIT_PER_MIN", defaultDebugRateLimitPerMin)
 	if err != nil {
-		log.Fatal(err)
+		fatal("config: debug rate limit", "error", err)
 	}
-	log.Printf("config: notifications/hour=%d, workers=%d, stream len warn threshold=%d, stream cleanup interval=%s, debug rate limit=%d/min",
-		perHour, workers, lenWarn, cleanupEvery, debugRatePerMin)
+	slog.Info("config",
+		"notifications_per_hour", perHour,
+		"workers", workers,
+		"stream_len_warn_threshold", lenWarn,
+		"stream_cleanup_interval", cleanupEvery.String(),
+		"debug_rate_limit_per_min", debugRatePerMin)
 
 	// Пул БД создаётся первым и передаётся компонентам по мере перевода
 	// хранилищ на Postgres (issue #31, этап 2).
 	pool, err := db.Connect(ctx)
 	if err != nil {
-		log.Fatal(err)
+		fatal("db: connect failed", "error", err)
 	}
 
 	// Миграции накатываются до всего остального: consumer, бот и HTTP-сервер
@@ -97,13 +117,13 @@ func main() {
 	// Даниила, раннер схему не меняет).
 	if pool != nil {
 		if err := migrate.Apply(ctx, pool); err != nil {
-			log.Fatal(err)
+			fatal("migrate: apply failed", "error", err)
 		}
 	}
 
 	opt, err := redis.ParseURL(env("REDIS_URL", "redis://localhost:6379/0"))
 	if err != nil {
-		log.Fatal(err)
+		fatal("config: REDIS_URL invalid", "error", err)
 	}
 	redisClient := redis.NewClient(opt)
 	defer redisClient.Close()
@@ -130,10 +150,15 @@ func main() {
 		sender = tgBot.Send
 	} else {
 		// Режим «лог» (ФТ-3.6): совпадения пишутся в stdout, без Telegram.
-		log.Println("TELEGRAM_BOT_TOKEN is empty: log mode, bot disabled")
+		slog.Info("telegram token is empty: log mode, bot disabled")
 		mode = notify.ModeLog
 		sender = func(_ context.Context, chatID int64, e model.Event) error {
-			log.Printf("MATCH: chat %d <- listing %d (%s, $%d) %s", chatID, e.ID, e.City, e.PriceUSD, e.URL)
+			slog.Info("match: listing delivered in log mode",
+				"chat_id", chatID,
+				"listing_id", e.ID,
+				"city", e.City,
+				"price_usd", e.PriceUSD,
+				"url", e.URL)
 			return nil
 		}
 	}
@@ -164,7 +189,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              ":8080",
-		Handler:           newMux(redisClient, dictsClient, pool, mode, debugRatePerMin),
+		Handler:           requestLogger(newMux(redisClient, dictsClient, pool, mode, debugRatePerMin)),
 		ReadHeaderTimeout: 5 * time.Second, // медленные заголовки не держат коннект (slowloris)
 	}
 	srvErr := make(chan error, 1)
@@ -196,13 +221,14 @@ func main() {
 	if pool != nil {
 		pool.Close()
 	}
-	// redisClient.Close() дублируется с defer: log.Fatal ниже обходит defer,
+	// redisClient.Close() дублируется с defer: fatal ниже обходит defer,
 	// поэтому при фатальном выходе закрываем клиент явно.
 	redisClient.Close()
 	if fatalErr != nil {
-		log.Fatal(fatalErr)
+		slog.Error("fatal: shutting down", "error", fatalErr)
+		os.Exit(1)
 	}
-	log.Println("stopped")
+	slog.Info("stopped")
 }
 
 // buildStores — точка wiring хранилищ: db-режим (pool != nil) обязан
@@ -442,11 +468,11 @@ func newMux(rdb *redis.Client, dictsClient *dicts.Client, pool *pgxpool.Pool, mo
 		ip := httpx.ClientIP(r)
 		got := r.Header.Get("X-Admin-Key")
 		if subtle.ConstantTimeCompare([]byte(got), []byte(adminKey)) != 1 {
-			log.Printf("WARN: /debug/event: unauthorized attempt from %s", ip)
 			// Прогрессивный бан за перебор ключа: после 5 неудач подряд
 			// admit начнёт отвечать 429 раньше авторизации. Сюда возможно
 			// попасть только при непустом ADMIN_KEY — debugLimiter не nil.
 			debugLimiter.NoteAuthFailure(ip)
+			slog.Warn("debug event: unauthorized attempt", "client_ip", ip)
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
@@ -539,4 +565,80 @@ func envPositiveInt64(key string, fallback int64) (int64, error) {
 		return 0, fmt.Errorf("%s: %q должно быть положительным", key, raw)
 	}
 	return v, nil
+}
+
+// parseLevel разбирает NOTIFIER_LOG_LEVEL (debug/info/warn/error, регистр
+// не важен). Список намеренно без уровней вроде TRACE: это та гранулярность,
+// которую мы реально алертим и фильтруем.
+func parseLevel(raw string) (slog.Level, error) {
+	switch strings.ToLower(raw) {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info", "":
+		return slog.LevelInfo, nil
+	case "warn", "warning":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return 0, fmt.Errorf("NOTIFIER_LOG_LEVEL: %q — не уровень (debug|info|warn|error)", raw)
+	}
+}
+
+// fatal — slog.Error + os.Exit(1): замена log.Fatal для стартовых ошибок,
+// чтобы они шли в ту же JSON-структуру. Как и log.Fatal, обходит defer —
+// вызвать только до/после участков с defer-очисткой (main закрывает redis
+// явно перед fatal-выходом).
+func fatal(msg string, args ...any) {
+	slog.Error(msg, args...)
+	os.Exit(1)
+}
+
+// requestLogger — request-id middleware (карточка 02 плана prod-10of10):
+// входящий X-Request-ID сохраняется (чтобы сквозной trace можно было начать
+// с клиента), иначе генерируется 16-hex; id возвращается в ответе и попадает
+// в JSON-лог завершения запроса.
+func requestLogger(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rid := r.Header.Get("X-Request-ID")
+		if rid == "" {
+			rid = newRequestID()
+		}
+		w.Header().Set("X-Request-ID", rid)
+
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
+		next.ServeHTTP(rec, r)
+		slog.Info("http request",
+			"request_id", rid,
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", rec.status,
+			"duration_ms", time.Since(start).Milliseconds())
+	})
+}
+
+// statusRecorder ловит статус для лога: WriteHeader может не вызываться
+// для пустых ответов — дефолт 200 проставлен при создании.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+// newRequestID — 8 случайных байт в hex: 64 бита энтропии хватает для
+// корреляции запросов одного стенда, полный UUID тут избыточен.
+func newRequestID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand отказал — аномалия, но HTTP-запрос всё равно надо
+		// обработать: fallback на время достаточен для корреляции одной
+		// пачки логов.
+		return fmt.Sprintf("t%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
 }

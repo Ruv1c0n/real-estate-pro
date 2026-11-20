@@ -8,7 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -112,7 +112,7 @@ func (q *PgQueue) PopBatch(ctx context.Context, limit int) ([]DeferredJob, error
 			// tx, пока rows открыты, не выполняется), разбор остальных строк
 			// продолжаем.
 			badIDs = append(badIDs, id)
-			log.Printf("queue pop payload: bad row quarantined id=%d: %v", id, err)
+			slog.Warn("queue: bad payload quarantined", "queue_row_id", id, "error", err)
 			continue
 		}
 		jobs = append(jobs, DeferredJob{ChatID: chatID, Event: e})
