@@ -25,6 +25,7 @@ import (
 	"notifier/internal/migrate"
 	"notifier/internal/model"
 	"notifier/internal/notify"
+	"notifier/internal/ratelimit"
 	"notifier/internal/store"
 	"notifier/internal/stream"
 	"notifier/internal/telegram"
@@ -37,6 +38,11 @@ const (
 	defaultNotificationsPerHour = 30
 	flushInterval               = 30 * time.Second
 	debugBodyLimit              = 1 << 20 // 1 МБ на демо-событие
+	// Лимит /debug/event на клиентский IP (аудит 20.11, P2-25: без него
+	// X-Admin-Key брутфорсится с LAN бесплатно). Демо-сценарий отправляет
+	// событие раз в несколько секунд, поэтому 30/мин с запасом покрывают
+	// честное использование и режут перебор.
+	defaultDebugRateLimitPerMin = 30
 )
 
 // Тайминги health-проверок: у каждой проверки свой дедлайн, сбор результатов
@@ -70,8 +76,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("config: notifications/hour=%d, workers=%d, stream len warn threshold=%d, stream cleanup interval=%s",
-		perHour, workers, lenWarn, cleanupEvery)
+	debugRatePerMin, err := envPositiveInt("NOTIFIER_DEBUG_RATE_LIMIT_PER_MIN", defaultDebugRateLimitPerMin)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("config: notifications/hour=%d, workers=%d, stream len warn threshold=%d, stream cleanup interval=%s, debug rate limit=%d/min",
+		perHour, workers, lenWarn, cleanupEvery, debugRatePerMin)
 
 	// Пул БД создаётся первым и передаётся компонентам по мере перевода
 	// хранилищ на Postgres (issue #31, этап 2).
@@ -153,7 +163,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              ":8080",
-		Handler:           newMux(redisClient, dictsClient, pool, mode),
+		Handler:           newMux(redisClient, dictsClient, pool, mode, debugRatePerMin),
 		ReadHeaderTimeout: 5 * time.Second, // медленные заголовки не держат коннект (slowloris)
 	}
 	srvErr := make(chan error, 1)
@@ -361,8 +371,10 @@ func parallelProbe(ctx context.Context, checks []func(context.Context) bool) []b
 
 // newMux собирает HTTP-обработчики: /health и /health/ready (ФТ-3.7) и
 // /debug/event (НФТ-3). mode — режим доставки (notify.ModeLog / ModeTelegram),
-// вычисленный в main.
-func newMux(rdb *redis.Client, dictsClient *dicts.Client, pool *pgxpool.Pool, mode string) *http.ServeMux {
+// вычисленный в main. debugRatePerMin — лимит /debug/event на клиентский IP
+// в минуту (аудит 20.11, P2-25); 0 и отрицательные сюда не попадают —
+// main фейлит старт раньше.
+func newMux(rdb *redis.Client, dictsClient *dicts.Client, pool *pgxpool.Pool, mode string, debugRatePerMin int) *http.ServeMux {
 	adminKey := os.Getenv("ADMIN_KEY")
 
 	prober := &healthProber{rdb: rdb, dicts: dictsClient, pool: pool}
@@ -409,13 +421,17 @@ func newMux(rdb *redis.Client, dictsClient *dicts.Client, pool *pgxpool.Pool, mo
 
 	// POST /debug/event кладёт демо-событие в стрим — оно проходит весь
 	// обычный путь через consumer group. Без ADMIN_KEY эндпоинт выключен.
-	mux.HandleFunc("/debug/event", func(w http.ResponseWriter, r *http.Request) {
+	// Rate limit per-IP (аудит 20.11, P2-25) режет частоту ДО авторизации:
+	// брутфорс X-Admin-Key упирается в bucket, а каждая неудачная попытка
+	// остаётся в логах — раньше она молча терялась в 401.
+	debugEvent := func(w http.ResponseWriter, r *http.Request) {
 		if adminKey == "" {
 			http.NotFound(w, r)
 			return
 		}
 		got := r.Header.Get("X-Admin-Key")
 		if subtle.ConstantTimeCompare([]byte(got), []byte(adminKey)) != 1 {
+			log.Printf("WARN: /debug/event: unauthorized attempt from %s", ratelimit.ClientIP(r))
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
@@ -446,7 +462,14 @@ func newMux(rdb *redis.Client, dictsClient *dicts.Client, pool *pgxpool.Pool, mo
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
 		json.NewEncoder(w).Encode(map[string]string{"published": "true", "stream_id": id})
-	})
+	}
+	// Лимит вешается только на включённый эндпоинт: выключенный (пустой
+	// ключ) отвечает 404 как факт конфигурации, а не попытка авторизации,
+	// и bucket для него не нужен.
+	if adminKey != "" {
+		debugEvent = ratelimit.NewPerMinute(debugRatePerMin).Middleware(debugEvent)
+	}
+	mux.HandleFunc("/debug/event", debugEvent)
 
 	return mux
 }
