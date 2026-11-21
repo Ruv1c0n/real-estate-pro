@@ -9,6 +9,11 @@ from fastapi.testclient import TestClient
 @pytest.fixture
 def clients(monkeypatch):
     engine = SimpleNamespace(dispose=AsyncMock())
+    monkeypatch.setattr(
+        main.PostgresListingStore,
+        "publish_next",
+        AsyncMock(return_value=False),
+    )
     redis_client = SimpleNamespace(aclose=AsyncMock())
 
     db_factory = MagicMock(return_value=engine)
@@ -30,6 +35,7 @@ def test_clients_lifecycle(clients):
         redis_factory.assert_called_once_with(main.settings.redis_url)
 
         assert main.app.state.db_engine is engine
+        assert isinstance(main.app.state.listing_store, main.PostgresListingStore)
         assert main.app.state.redis is redis_client
 
         engine.dispose.assert_not_awaited()

@@ -8,6 +8,7 @@ from typing import Protocol
 import simplejson
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,10 @@ async def run_outbox_worker(
                 continue
         except RedisError as exc:
             logger.warning("Failed to publish outbox event to Redis: %s", exc)
+        except (OSError, PoolTimeoutError) as exc:
+            logger.warning("Outbox database connection unavailable: %s", exc)
+        except Exception:
+            logger.exception("Outbox iteration failed; will retry")
 
         with suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=poll_interval)

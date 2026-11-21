@@ -1,12 +1,16 @@
 import asyncio
+from datetime import UTC, datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock
+from uuid import UUID
 
 import app.in_memory_listing_store as store_module
 import pytest
 from app.in_memory_listing_store import InMemoryListingStore
+from app.listing_events import build_listing_event
 from app.listing_filters import ListingFilters
 from app.listing_models import ListingCreate
+from app.listing_store import StoredListing
 from app.outbox import run_outbox_worker
 from redis.exceptions import ConnectionError as RedisConnectionError
 
@@ -55,9 +59,28 @@ async def test_create_saves_listing_and_event(listing):
     assert event.kind == "listing_new"
     assert event.listing_id == saved.id
     assert event.published_at is None
+    assert event.payload["id"] == saved.id
+
+
+def test_build_listing_event_matches_stream_contract(listing):
+    created_at = datetime(2026, 1, 15, 12, 30, tzinfo=UTC)
+    data = listing.model_dump()
+    data.update(
+        id=17,
+        created_at=created_at,
+        address=None,
+        title="Студия в Минске",
+        description="Рядом с метро",
+        area_m2=Decimal("32.50"),
+    )
+    saved = StoredListing(**data)
+
+    event = build_listing_event(saved)
+
+    assert isinstance(event.event_id, UUID)
     assert event.payload == {
         "event_id": str(event.event_id),
-        "id": saved.id,
+        "id": 17,
         "source": "mock",
         "deal_type": "rent",
         "country": "BY",
@@ -68,7 +91,7 @@ async def test_create_saves_listing_and_event(listing):
         "price_usd": 380,
         "address": None,
         "url": "https://example.com/listing/123",
-        "created_at": saved.created_at.isoformat(),
+        "created_at": created_at.isoformat(),
     }
 
 
