@@ -47,6 +47,8 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
                 logger.info("Core API stopping")
                 stop.set()
 
+        logger.info("Core API stopped")
+
 
 app = FastAPI(
     title=settings.app_name,
