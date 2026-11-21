@@ -8,14 +8,12 @@ from fastapi.testclient import TestClient
 
 @pytest.fixture
 def clients(monkeypatch):
-    engine = MagicMock()
-    engine.dispose = AsyncMock()
-
-    empty_result = MagicMock()
-    empty_result.mappings.return_value.one_or_none.return_value = None
-
-    connection = engine.begin.return_value.__aenter__.return_value
-    connection.execute = AsyncMock(return_value=empty_result)
+    engine = SimpleNamespace(dispose=AsyncMock())
+    monkeypatch.setattr(
+        main.PostgresListingStore,
+        "publish_next",
+        AsyncMock(return_value=False),
+    )
     redis_client = SimpleNamespace(aclose=AsyncMock())
 
     db_factory = MagicMock(return_value=engine)

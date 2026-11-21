@@ -106,6 +106,23 @@ async def search_store(pg_engine):
     return store
 
 
+@pytest.fixture
+def listing_data():
+    external_id = uuid4().hex
+    return {
+        "source": "avito",
+        "external_id": external_id,
+        "url": f"https://example.com/{external_id}",
+        "deal_type": "rent",
+        "country": "BY",
+        "city": "Minsk",
+        "price": 380,
+        "currency": "USD",
+        "price_usd": 380,
+        "rooms": 1,
+    }
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     ("sort", "expected"),
@@ -130,7 +147,9 @@ async def test_search_order_across_pages(search_store, sort, expected):
 
 
 @pytest.mark.anyio
-async def test_concurrent_duplicate_creates_one_listing_and_one_event(pg_engine):
+async def test_concurrent_duplicate_creates_one_listing_and_one_event(
+    pg_engine, listing_data
+):
     store = PostgresListingStore(pg_engine)
     common = {
         "source": "avito",
@@ -143,15 +162,19 @@ async def test_concurrent_duplicate_creates_one_listing_and_one_event(pg_engine)
         "currency": "USD",
         "price_usd": 380,
     }
-    first = ListingCreate(
-        **common,
-        rooms=0,
-        photos=["https://example.com/z.jpg", "https://example.com/a.jpg"],
+    first = ListingCreate.model_validate(
+        {
+            **listing_data,
+            "rooms": 0,
+            "photos": ["https://example.com/z.jpg", "https://example.com/a.jpg"],
+        }
     )
-    second = ListingCreate(
-        **common,
-        rooms=2,
-        photos=["https://example.com/other.jpg"],
+    second = ListingCreate.model_validate(
+        {
+            **listing_data,
+            "rooms": 2,
+            "photos": ["https://example.com/other.jpg"],
+        }
     )
 
     first_result, second_result = await asyncio.gather(
@@ -199,28 +222,17 @@ async def test_concurrent_duplicate_creates_one_listing_and_one_event(pg_engine)
 
 @pytest.mark.anyio
 async def test_outbox_insert_failure_rolls_back_listing_and_photos(
-    pg_engine, monkeypatch
+    pg_engine, monkeypatch, listing_data
 ):
     store = PostgresListingStore(pg_engine)
-    run_id = uuid4().hex
+    run_id = listing_data["external_id"]
     fixed_event_id = uuid4()
     photo_url = f"https://example.com/{run_id}/photo.jpg"
 
-    first = ListingCreate(
-        source="avito",
-        external_id=f"{run_id}-first",
-        url=f"https://example.com/{run_id}/first",
-        deal_type="rent",
-        country="BY",
-        city="Minsk",
-        price=380,
-        currency="USD",
-        price_usd=380,
-        rooms=1,
-    )
+    first = ListingCreate.model_validate(listing_data)
     second = ListingCreate.model_validate(
         {
-            **first.model_dump(),
+            **listing_data,
             "external_id": f"{run_id}-second",
             "url": f"https://example.com/{run_id}/second",
             "photos": [photo_url],
@@ -276,21 +288,9 @@ async def test_outbox_insert_failure_rolls_back_listing_and_photos(
         {"currency": "ZZZ"},
     ],
 )
-async def test_create_rejects_unknown_reference(pg_engine, changes):
+async def test_create_rejects_unknown_reference(pg_engine, changes, listing_data):
     store = PostgresListingStore(pg_engine)
-    data = {
-        "source": "avito",
-        "external_id": uuid4().hex,
-        "url": "https://example.com/reference-test",
-        "deal_type": "rent",
-        "country": "BY",
-        "city": "Minsk",
-        "price": 380,
-        "currency": "USD",
-        "price_usd": 380,
-        "rooms": 1,
-    }
-    listing = ListingCreate.model_validate({**data, **changes})
+    listing = ListingCreate.model_validate({**listing_data, **changes})
 
     with pytest.raises(UnknownListingReferenceError):
         await store.create_or_get(listing)
