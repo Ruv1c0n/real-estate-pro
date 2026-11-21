@@ -1,9 +1,14 @@
 import asyncio
+import json
 import os
 import subprocess
 import sys
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from decimal import Decimal
+from functools import partial
 from pathlib import Path
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import asyncpg
@@ -11,10 +16,12 @@ import pytest
 from app.database import create_db_engine
 from app.listing_filters import ListingFilters
 from app.listing_models import ListingCreate
+from app.outbox import publish_listing_event
 from app.postgres_listing_store import (
     PostgresListingStore,
     UnknownListingReferenceError,
 )
+from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
@@ -25,8 +32,8 @@ def anyio_backend():
     return "asyncio"
 
 
-@pytest.fixture(scope="module")
-async def pg_engine(anyio_backend):
+@asynccontextmanager
+async def _temporary_pg_engine():
     admin_dsn = os.environ.get("MIGRATION_TEST_DSN")
     if not admin_dsn:
         pytest.skip("Для тестов PostgreSQL нужен MIGRATION_TEST_DSN")
@@ -60,22 +67,57 @@ async def pg_engine(anyio_backend):
 
 
 @pytest.fixture(scope="module")
+async def pg_engine(anyio_backend):
+    async with _temporary_pg_engine() as engine:
+        yield engine
+
+
+@pytest.fixture
+async def outbox_listing(anyio_backend):
+    async with _temporary_pg_engine() as engine:
+        store = PostgresListingStore(engine)
+        listing = ListingCreate(
+            source="avito",
+            external_id="outbox-test",
+            url="https://example.com/outbox-test",
+            deal_type="rent",
+            country="BY",
+            city="Minsk",
+            price=Decimal("9007199254740992.25"),
+            currency="USD",
+            price_usd=9007199254740992,
+            rooms=1,
+        )
+        result = await store.create_or_get(listing)
+        yield engine, store, result.listing.id
+
+
+@pytest.fixture(scope="module")
 async def search_store(pg_engine):
     store = PostgresListingStore(pg_engine)
     dates = []
 
-    for external_id, price, day in [("A", 300, 2), ("B", 100, 1), ("C", 300, 1)]:
+    # external_id, source, price, day, deal_type, country, city, rooms, area_m2
+    rows = [
+        ("A", "mock", 300, 2, "rent", "BY", "Minsk", 0, None),
+        ("B", "mock", 100, 1, "rent", "BY", "Brest", 1, Decimal("45.50")),
+        ("C", "mock", 300, 1, "sale", "RU", "Moscow", 2, Decimal("60.00")),
+        ("D", "avito", 300, 1, "sale", "RU", "Moscow", 2, Decimal("60.00")),
+    ]
+
+    for external_id, source, price, day, deal_type, country, city, rooms, area in rows:
         listing = ListingCreate(
-            source="mock",
+            source=source,
             external_id=external_id,
             url=f"https://example.com/{external_id}",
-            deal_type="rent",
-            country="BY",
-            city="Minsk",
+            deal_type=deal_type,
+            country=country,
+            city=city,
             price=price,
             currency="USD",
             price_usd=price,
-            rooms=0,
+            rooms=rooms,
+            area_m2=area,
         )
         result = await store.create_or_get(listing)
         dates.append(
@@ -282,3 +324,91 @@ async def test_create_rejects_unknown_reference(pg_engine, changes):
 
     with pytest.raises(UnknownListingReferenceError):
         await store.create_or_get(listing)
+
+
+async def _read_outbox_event(engine, listing_id):
+    async with engine.connect() as connection:
+        result = await connection.execute(
+            text("""
+                SELECT event_id, published_at
+                FROM core.outbox_events
+                WHERE listing_id = :listing_id AND kind = 'listing_new'
+            """),
+            {"listing_id": listing_id},
+        )
+        return result.mappings().one()
+
+
+@pytest.mark.anyio
+async def test_publish_next_retries_same_event_after_redis_failure(outbox_listing):
+    engine, store, listing_id = outbox_listing
+    original = await _read_outbox_event(engine, listing_id)
+    redis = AsyncMock()
+    redis.xadd.side_effect = [RedisConnectionError("Redis unavailable"), "1-0"]
+    publish = partial(publish_listing_event, redis)
+
+    with pytest.raises(RedisConnectionError):
+        await store.publish_next(publish)
+
+    pending = await _read_outbox_event(engine, listing_id)
+    assert pending["published_at"] is None
+    assert pending["event_id"] == original["event_id"]
+
+    assert await store.publish_next(publish) is True
+    first, retry = redis.xadd.await_args_list
+    assert retry == first
+    stream, fields = retry.args
+    assert stream == "listings.new"
+    assert json.loads(fields["data"])["event_id"] == str(original["event_id"])
+
+
+@pytest.mark.anyio
+async def test_publish_next_marks_event_published_once(outbox_listing):
+    engine, store, listing_id = outbox_listing
+    publish = AsyncMock()
+
+    assert await store.publish_next(publish) is True
+
+    event = await _read_outbox_event(engine, listing_id)
+    assert event["published_at"] is not None
+    assert await store.publish_next(publish) is False
+    publish.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_publish_next_preserves_decimal_price_in_stream(outbox_listing):
+    _, store, listing_id = outbox_listing
+    redis = AsyncMock()
+
+    assert await store.publish_next(partial(publish_listing_event, redis)) is True
+
+    redis.xadd.assert_awaited_once()
+    stream, fields = redis.xadd.await_args.args
+    assert stream == "listings.new"
+    payload = json.loads(fields["data"], parse_float=Decimal)
+    assert payload["id"] == listing_id
+    assert payload["price"] == Decimal("9007199254740992.25")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("criteria", "expected"),
+    [
+        ({"price_min": 300}, ["A", "C"]),
+        ({"price_max": 100}, ["B"]),
+        ({"area_min": "60.00"}, ["C"]),
+        ({"area_max": "45.50"}, ["B"]),
+        ({"rooms": 0}, ["A"]),
+        ({"rooms": 2_147_483_648}, []),
+        ({"deal_type": "sale"}, ["C"]),
+        ({"country": "BY"}, ["B", "A"]),
+        ({"country": "BY", "city": "Brest"}, ["B"]),
+    ],
+)
+async def test_search_applies_sql_filters(search_store, criteria, expected):
+    filters = ListingFilters(source="mock", sort="price_asc", **criteria)
+
+    result = await search_store.search(filters)
+
+    assert [item.external_id for item in result.items] == expected
+    assert result.total == len(expected)

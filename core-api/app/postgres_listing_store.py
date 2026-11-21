@@ -105,7 +105,7 @@ _SEARCH_FILTERS = {
     "country": "country = :country",
     "city": "city = :city",
     "source": "source = :source",
-    "rooms": "rooms = CAST(:rooms AS numeric)",
+    "rooms": "rooms = :rooms",
     "price_min": "price_usd >= CAST(:price_min AS numeric)",
     "price_max": "price_usd <= CAST(:price_max AS numeric)",
     "area_min": "area_m2 >= :area_min",
@@ -219,6 +219,9 @@ class PostgresListingStore:
             return True
 
     async def search(self, filters: ListingFilters) -> ListingSearchResult:
+        # В PostgreSQL rooms хранится как integer.
+        if filters.rooms is not None and filters.rooms > 2_147_483_647:
+            return ListingSearchResult(items=[], total=0)
         params = filters.model_dump(include=set(_SEARCH_FILTERS), exclude_none=True)
         conditions = [_SEARCH_FILTERS[name] for name in params]
 

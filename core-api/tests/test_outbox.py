@@ -5,7 +5,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 from app.outbox import publish_listing_event, run_outbox_worker
+from asyncpg.exceptions import UndefinedTableError
 from redis.exceptions import ConnectionError as RedisConnectionError
+from sqlalchemy.exc import ProgrammingError
 
 
 @pytest.fixture
@@ -83,4 +85,36 @@ async def test_worker_retries_after_database_connection_refused():
     )
 
     assert store.publish_next.await_count == 2
+    redis.xadd.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_worker_retries_after_missing_outbox_table(caplog):
+    stop = asyncio.Event()
+    store = AsyncMock()
+    redis = AsyncMock()
+    missing_table = ProgrammingError(
+        "SELECT id FROM core.outbox_events",
+        {},
+        UndefinedTableError('relation "core.outbox_events" does not exist'),
+    )
+
+    async def publish_next(publish):
+        if store.publish_next.await_count == 1:
+            raise missing_table
+        stop.set()
+        return False
+
+    store.publish_next.side_effect = publish_next
+
+    await asyncio.wait_for(
+        run_outbox_worker(store, redis, stop, poll_interval=0.01),
+        timeout=2,
+    )
+
+    assert store.publish_next.await_count == 2
+    assert any(
+        record.exc_info and record.exc_info[1] is missing_table
+        for record in caplog.records
+    )
     redis.xadd.assert_not_awaited()
