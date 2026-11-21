@@ -144,7 +144,11 @@ class PostgresListingStore:
         params = listing.model_dump(exclude={"photos"})
         params["url"] = str(listing.url)
 
+        # Историческое имя url_hash: SHA-256 от пары source|external_id.
         identity = f"{listing.source}|{listing.external_id}"
+
+        # Для поиска возможных дублей: SHA-256 от city|country|address|rooms|area|deal_type.
+        # Пустой адрес и отсутствующая площадь дают пустые поля, площадь имеет два знака.
         area = "" if listing.area_m2 is None else format(listing.area_m2, ".2f")
         content = "|".join(
             (

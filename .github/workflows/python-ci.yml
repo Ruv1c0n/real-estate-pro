@@ -46,8 +46,7 @@ jobs:
 
   pytest:
     runs-on: ubuntu-latest
-    # services для будущих интеграционных тестов core-api;
-    # проходят и с ними (env ниже просто доступен, ничего не ломается).
+    # Тесты миграций и хранилища core-api используют PostgreSQL из этого задания.
     services:
       postgres:
         image: postgres:16

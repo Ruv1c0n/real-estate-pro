@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from app.in_memory_listing_store import InMemoryListingStore
+from app.listing_store import UnknownListingReferenceError
 from app.main import app
-from app.postgres_listing_store import UnknownListingReferenceError
 from fastapi.testclient import TestClient
 
 URL = "/api/v1/listings"

@@ -16,11 +16,9 @@ import pytest
 from app.database import create_db_engine
 from app.listing_filters import ListingFilters
 from app.listing_models import ListingCreate
+from app.listing_store import UnknownListingReferenceError
 from app.outbox import publish_listing_event
-from app.postgres_listing_store import (
-    PostgresListingStore,
-    UnknownListingReferenceError,
-)
+from app.postgres_listing_store import PostgresListingStore
 from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
