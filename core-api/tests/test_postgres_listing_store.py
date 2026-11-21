@@ -151,17 +151,6 @@ async def test_concurrent_duplicate_creates_one_listing_and_one_event(
     pg_engine, listing_data
 ):
     store = PostgresListingStore(pg_engine)
-    common = {
-        "source": "avito",
-        "external_id": f"concurrent-{uuid4().hex}",
-        "url": "https://example.com/concurrent",
-        "deal_type": "rent",
-        "country": "BY",
-        "city": "Minsk",
-        "price": 380,
-        "currency": "USD",
-        "price_usd": 380,
-    }
     first = ListingCreate.model_validate(
         {
             **listing_data,
