@@ -38,7 +38,7 @@ async def run_outbox_worker(
             if await store.publish_next(publish):
                 continue
         except RedisError as exc:
-            logger.warning("Не удалось опубликовать событие в Redis: %s", exc)
+            logger.warning("Failed to publish outbox event to Redis: %s", exc)
 
         with suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=poll_interval)
