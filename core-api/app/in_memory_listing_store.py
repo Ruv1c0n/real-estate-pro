@@ -1,6 +1,7 @@
 import asyncio
+from collections.abc import Awaitable, Callable
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from operator import attrgetter
@@ -78,6 +79,8 @@ class InMemoryListingStore:
         self._listings: dict[int, StoredListing] = {}
         self._by_external_id: dict[tuple[str, str], int] = {}
         self._outbox: list[OutboxEvent] = []
+        self._publish_lock = asyncio.Lock()
+        self._next_unpublished = 0
         self._next_id = 1
 
     async def create_or_get(
@@ -149,3 +152,24 @@ class InMemoryListingStore:
                 items=[listing.model_copy(deep=True) for listing in page_items],
                 total=total,
             )
+
+    async def publish_next(
+        self,
+        publish: Callable[[dict[str, object]], Awaitable[None]],
+    ) -> bool:
+        async with self._publish_lock:
+            async with self._lock:
+                index = self._next_unpublished
+                if index >= len(self._outbox):
+                    return False
+
+                event = self._outbox[index]
+                payload = deepcopy(event.payload)
+
+            await publish(payload)
+
+            async with self._lock:
+                self._outbox[index] = replace(event, published_at=datetime.now(UTC))
+                self._next_unpublished += 1
+
+            return True

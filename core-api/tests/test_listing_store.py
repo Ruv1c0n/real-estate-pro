@@ -1,11 +1,14 @@
 import asyncio
 from decimal import Decimal
+from unittest.mock import AsyncMock
 
 import app.in_memory_listing_store as store_module
 import pytest
 from app.in_memory_listing_store import InMemoryListingStore
 from app.listing_filters import ListingFilters
 from app.listing_models import ListingCreate
+from app.outbox import run_outbox_worker
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 
 @pytest.fixture
@@ -188,3 +191,62 @@ async def test_search_filters_then_sorts_and_paginates(listing):
     assert [item.id for item in page_one.items] == [second.listing.id]
     assert [item.id for item in page_two.items] == [first.listing.id]
     assert page_three.items == []
+
+
+@pytest.mark.anyio
+async def test_failed_publication_stays_pending_until_successful_retry(listing):
+    store = InMemoryListingStore()
+    await store.create_or_get(listing)
+    [original] = await store.outbox_snapshot()
+
+    publish = AsyncMock(side_effect=[RedisConnectionError("Redis недоступен"), None])
+
+    with pytest.raises(RedisConnectionError):
+        await store.publish_next(publish)
+
+    [pending] = await store.outbox_snapshot()
+    assert pending == original
+    assert pending.published_at is None
+
+    assert await store.publish_next(publish) is True
+
+    [published] = await store.outbox_snapshot()
+    assert published.event_id == original.event_id
+    assert published.published_at is not None
+
+    assert await store.publish_next(publish) is False
+    assert publish.await_count == 2
+    first, retry = publish.await_args_list
+    assert first == retry
+    assert first.args == (original.payload,)
+
+
+@pytest.mark.anyio
+async def test_worker_retries_redis_failure_and_marks_event_published(listing):
+    store = InMemoryListingStore()
+    await store.create_or_get(listing)
+    [original] = await store.outbox_snapshot()
+
+    stop = asyncio.Event()
+    redis = AsyncMock()
+
+    async def xadd(stream, fields):
+        if redis.xadd.await_count == 1:
+            raise RedisConnectionError("Redis временно недоступен")
+
+        stop.set()
+        return "1-0"
+
+    redis.xadd.side_effect = xadd
+
+    await asyncio.wait_for(
+        run_outbox_worker(store, redis, stop, poll_interval=0.01),
+        timeout=2,
+    )
+
+    first, retry = redis.xadd.await_args_list
+    assert retry == first
+
+    [published] = await store.outbox_snapshot()
+    assert published.event_id == original.event_id
+    assert published.published_at is not None

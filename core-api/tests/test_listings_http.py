@@ -1,7 +1,8 @@
 import json
 from datetime import UTC, datetime
 from decimal import Decimal
-from unittest.mock import Mock
+from threading import Event
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from app.main import app
@@ -11,7 +12,14 @@ URL = "/api/v1/listings"
 
 
 @pytest.fixture
-def client():
+def redis_client(monkeypatch):
+    redis = AsyncMock()
+    monkeypatch.setattr("app.main.create_redis_client", lambda url: redis)
+    return redis
+
+
+@pytest.fixture
+def client(redis_client):
     with TestClient(app) as test_client:
         yield test_client
 
@@ -187,3 +195,25 @@ def test_list_listings_filters_by_area(client, payload, params, expected):
     body = response.json()
     assert body["total"] == len(expected)
     assert {item["external_id"] for item in body["items"]} == expected
+
+
+def test_created_listing_is_published_by_worker(client, redis_client, payload):
+    published = Event()
+
+    async def xadd(stream, fields):
+        published.set()
+        return "1-0"
+
+    redis_client.xadd.side_effect = xadd
+
+    response = client.post(URL, json=payload)
+    assert response.status_code == 201, response.text
+    assert published.wait(timeout=5), "Воркер не опубликовал событие"
+
+    redis_client.xadd.assert_awaited_once()
+    stream, fields = redis_client.xadd.await_args.args
+    assert stream == "listings.new"
+
+    event = json.loads(fields["data"], parse_float=Decimal)
+    assert event["id"] == response.json()["id"]
+    assert event["price"] == Decimal("380.25")
