@@ -1,17 +1,12 @@
 import asyncio
 import json
-import os
-import subprocess
-import sys
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
 from functools import partial
-from pathlib import Path
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
-import asyncpg
 import pytest
 from app.database import create_db_engine
 from app.listing_filters import ListingFilters
@@ -21,7 +16,6 @@ from app.outbox import publish_listing_event
 from app.postgres_listing_store import PostgresListingStore
 from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import text
-from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 
 
@@ -31,48 +25,26 @@ def anyio_backend():
 
 
 @asynccontextmanager
-async def _temporary_pg_engine():
-    admin_dsn = os.environ.get("MIGRATION_TEST_DSN")
-    if not admin_dsn:
-        pytest.skip("Для тестов PostgreSQL нужен MIGRATION_TEST_DSN")
-
-    database = f"core_store_test_{uuid4().hex}"
-    url = make_url(admin_dsn).set(drivername="postgresql+asyncpg", database=database)
-    database_url = url.render_as_string(hide_password=False)
-    core_api_dir = Path(__file__).resolve().parents[1]
-
-    admin = await asyncpg.connect(admin_dsn)
-    try:
-        await admin.execute(f'CREATE DATABASE "{database}"')
+async def _temporary_pg_engine(temporary_database, run_alembic):
+    async with temporary_database() as url:
+        await run_alembic(url, "upgrade", "head")
+        app_url = url.set(drivername="postgresql+asyncpg")
+        engine = create_db_engine(app_url.render_as_string(hide_password=False))
         try:
-            await asyncio.to_thread(
-                subprocess.run,
-                [sys.executable, "-m", "alembic", "upgrade", "head"],
-                cwd=core_api_dir,
-                env={**os.environ, "DATABASE_URL": database_url},
-                check=True,
-                timeout=60,
-            )
-            engine = create_db_engine(database_url)
-            try:
-                yield engine
-            finally:
-                await engine.dispose()
+            yield engine
         finally:
-            await admin.execute(f'DROP DATABASE "{database}"')
-    finally:
-        await admin.close()
+            await engine.dispose()
 
 
 @pytest.fixture(scope="module")
-async def pg_engine(anyio_backend):
-    async with _temporary_pg_engine() as engine:
+async def pg_engine(anyio_backend, temporary_database, run_alembic):
+    async with _temporary_pg_engine(temporary_database, run_alembic) as engine:
         yield engine
 
 
 @pytest.fixture
-async def outbox_listing(anyio_backend):
-    async with _temporary_pg_engine() as engine:
+async def outbox_listing(anyio_backend, temporary_database, run_alembic):
+    async with _temporary_pg_engine(temporary_database, run_alembic) as engine:
         store = PostgresListingStore(engine)
         listing = ListingCreate(
             source="avito",
