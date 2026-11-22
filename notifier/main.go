@@ -22,6 +22,7 @@ import (
 	"notifier/internal/bot"
 	"notifier/internal/db"
 	"notifier/internal/dicts"
+	"notifier/internal/httpx"
 	"notifier/internal/migrate"
 	"notifier/internal/model"
 	"notifier/internal/notify"
@@ -423,18 +424,34 @@ func newMux(rdb *redis.Client, dictsClient *dicts.Client, pool *pgxpool.Pool, mo
 	// обычный путь через consumer group. Без ADMIN_KEY эндпоинт выключен.
 	// Rate limit per-IP (аудит 20.11, P2-25) режет частоту ДО авторизации:
 	// брутфорс X-Admin-Key упирается в bucket, а каждая неудачная попытка
-	// остаётся в логах — раньше она молча терялась в 401.
+	// остаётся в логах — раньше она молча терялась в 401. Неудачи копятся
+	// в прогрессивный бан: после 5 подряд IP получает 429 с оставшимся
+	// сроком блокировки (см. ratelimit.NoteAuthFailure).
+	// Лимитер создаётся только для включённого эндпоинта: выключенный
+	// (пустой ключ) отвечает 404 как факт конфигурации, а не попытка
+	// авторизации, и bucket для него не нужен.
+	var debugLimiter *ratelimit.PerIP
+	if adminKey != "" {
+		debugLimiter = ratelimit.NewPerMinute(debugRatePerMin)
+	}
 	debugEvent := func(w http.ResponseWriter, r *http.Request) {
 		if adminKey == "" {
 			http.NotFound(w, r)
 			return
 		}
+		ip := httpx.ClientIP(r)
 		got := r.Header.Get("X-Admin-Key")
 		if subtle.ConstantTimeCompare([]byte(got), []byte(adminKey)) != 1 {
-			log.Printf("WARN: /debug/event: unauthorized attempt from %s", ratelimit.ClientIP(r))
+			log.Printf("WARN: /debug/event: unauthorized attempt from %s", ip)
+			// Прогрессивный бан за перебор ключа: после 5 неудач подряд
+			// admit начнёт отвечать 429 раньше авторизации. Сюда возможно
+			// попасть только при непустом ADMIN_KEY — debugLimiter не nil.
+			debugLimiter.NoteAuthFailure(ip)
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
+		// Верный ключ обнуляет счётчик неудач и активный бан.
+		debugLimiter.NoteAuthSuccess(ip)
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
 			http.Error(w, `{"error":"method_not_allowed"}`, http.StatusMethodNotAllowed)
@@ -463,11 +480,10 @@ func newMux(rdb *redis.Client, dictsClient *dicts.Client, pool *pgxpool.Pool, mo
 		w.WriteHeader(http.StatusAccepted)
 		json.NewEncoder(w).Encode(map[string]string{"published": "true", "stream_id": id})
 	}
-	// Лимит вешается только на включённый эндпоинт: выключенный (пустой
-	// ключ) отвечает 404 как факт конфигурации, а не попытка авторизации,
-	// и bucket для него не нужен.
+	// Лимит вешается только на включённый эндпоинт (см. создание
+	// debugLimiter выше).
 	if adminKey != "" {
-		debugEvent = ratelimit.NewPerMinute(debugRatePerMin).Middleware(debugEvent)
+		debugEvent = debugLimiter.Middleware(debugEvent)
 	}
 	mux.HandleFunc("/debug/event", debugEvent)
 

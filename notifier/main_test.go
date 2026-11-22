@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -26,7 +27,6 @@ import (
 	"notifier/internal/dicts"
 	"notifier/internal/notify"
 	"notifier/internal/store"
-	"notifier/internal/stream"
 )
 
 // newDictsFake поднимает HTTP-заглушку Core API: GET /api/v1/countries
@@ -327,8 +327,10 @@ func TestEnvPositiveDuration(t *testing.T) {
 }
 
 // Тесты /debug/event (НФТ-3): fail-closed без ключа, логирование отказов
-// авторизации и rate limit per-IP до авторизации (аудит 20.11, P2-25 —
-// брутфорс X-Admin-Key раньше был бесплатным и молчаливым).
+// авторизации, rate limit per-IP до авторизации (аудит 20.11, P2-25 —
+// брутфорс X-Admin-Key раньше был бесплатным и молчаливым) и прогрессивный
+// бан за перебор ключа. Publish-путь эндпоинта здесь не проверяется —
+// он не менялся этим PR и покрыт своими интеграционными тестами.
 
 func TestDebugEventDisabledWithoutAdminKey(t *testing.T) {
 	t.Setenv("ADMIN_KEY", "")
@@ -404,36 +406,45 @@ func TestDebugEventRateLimitedBeforeAuth(t *testing.T) {
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("третий запрос: %d, ожидается 429 (лимит 2/мин)", rec.Code)
 	}
-	if ra := rec.Header().Get("Retry-After"); ra == "" {
-		t.Fatal("429 без Retry-After: клиент не узнаёт, когда повторять")
+	if ra := rec.Header().Get("Retry-After"); ra != "30" {
+		t.Fatalf("Retry-After = %q, ожидается 30 (ceil(60/2): лимит 2/мин)", ra)
 	}
 }
 
-func TestDebugEventPublishesToStream(t *testing.T) {
+// Прогрессивный бан за брутфорс (п.1 ревью #123): 5 неудач авторизации
+// подряд от одного IP — и шестая попытка получает 429 раньше токен-бакета
+// и авторизации. Лимит 100/мин гарантирует, что bucket не пуст: отказ
+// может быть только баном, а Retry-After — оставшееся время свежего
+// 5-минутного бана.
+func TestDebugEventBruteForceTriggersBan(t *testing.T) {
 	t.Setenv("ADMIN_KEY", "correct-key")
 	dictsClient := newDictsFake(t)
-	rdb := testRedisAddr(t) // скип без живого Redis
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	t.Cleanup(func() { rdb.Close() })
 
-	mux := newMux(rdb, dictsClient, nil, notify.ModeLog, defaultDebugRateLimitPerMin)
+	mux := newMux(rdb, dictsClient, nil, notify.ModeLog, 100)
 
-	body := `{"event_id":"550e8400-e29b-41d4-a716-446655440000","id":9001,"source":"mock","deal_type":"rent","country":"BY","city":"Minsk","rooms":2,"price":380,"currency":"USD","price_usd":380,"address":"ул. Тестовая, 1","url":"https://example.com/listing/9001","created_at":"2026-11-20T10:00:00Z"}`
-	req := httptest.NewRequest(http.MethodPost, "/debug/event", strings.NewReader(body))
-	req.Header.Set("X-Admin-Key", "correct-key")
-	req.RemoteAddr = "192.0.2.50:1111"
+	for i := 0; i < 5; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/debug/event", nil)
+		req.Header.Set("X-Admin-Key", "wrong")
+		req.RemoteAddr = "192.0.2.90:1000"
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("попытка %d: %d, ожидается 401 (бан включается на 5-й)", i+1, rec.Code)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/debug/event", nil)
+	req.Header.Set("X-Admin-Key", "wrong")
+	req.RemoteAddr = "192.0.2.90:1000"
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("валидное событие с ключом: %d, ожидается 202; тело: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("шестая попытка после 5 неудач: %d, ожидается 429 (прогрессивный бан)", rec.Code)
 	}
-	var resp map[string]string
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil || resp["published"] != "true" || resp["stream_id"] == "" {
-		t.Fatalf("неожиданное тело 202: %q (err=%v)", rec.Body.String(), err)
-	}
-
-	// Прибрать за собой: /debug/event кладёт запись в общий стрим, и
-	// оставленная демо-запись ломает ожидания соседних тестов по XLEN.
-	if err := rdb.XDel(context.Background(), stream.StreamName, resp["stream_id"]).Err(); err != nil {
-		t.Fatalf("XDel тестовой записи: %v", err)
+	ra, err := strconv.Atoi(rec.Header().Get("Retry-After"))
+	if err != nil || ra < 250 || ra > 301 {
+		t.Fatalf("Retry-After = %q (%d, %v), ожидается оставшееся время 5-минутного бана", rec.Header().Get("Retry-After"), ra, err)
 	}
 }
