@@ -117,6 +117,9 @@ async def _verify_schema(db: str, *, expect_seeded: bool) -> None:
             assert not await conn.fetchval(
                 "SELECT has_schema_privilege('notifier', 'core', 'USAGE')"
             )
+            assert not await conn.fetchval(
+                "SELECT has_schema_privilege('core_api', 'notifier', 'USAGE')"
+            )
         if expect_seeded:
             assert await conn.fetchval("SELECT count(*) FROM core.countries") == 5
             assert (
@@ -147,6 +150,14 @@ async def _lifecycle() -> None:
                 " WHERE table_schema = 'core'"
             )
             assert leftover == 0, "после downgrade base остались таблицы core"
+            if HAS_0002:
+                roles_left = await conn.fetchval(
+                    "SELECT count(*) FROM pg_roles"
+                    " WHERE rolname IN ('core_api', 'notifier')"
+                )
+                assert roles_left == 0, (
+                    "роли per-service не удалены после downgrade base"
+                )
         finally:
             await conn.close()
 
