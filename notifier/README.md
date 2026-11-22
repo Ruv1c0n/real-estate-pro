@@ -24,8 +24,39 @@ Go-сервис уведомлений: Telegram-бот, consumer Redis Streams 
 |---|---|
 | `GET /health` | Liveness: `db`, `redis`, `dicts`, режим доставки |
 | `GET /health/ready` | Readiness: 200 только при доступных Redis, справочниках и (в db-режиме) PostgreSQL; иначе 503 |
+| `GET /metrics` | Метрики Prometheus (только серии `notifier_*`) — см. «Метрики» |
 | `POST /debug/event` | Демо-событие в `listings.new`; заголовок `X-Admin-Key` (без ключа — 404) |
 | заголовок `X-Request-ID` | На любой путь: эхо входящего или сгенерированный 16-hex id; возвращается в ответе и попадает в лог запроса (вход длиннее 64 символов или с непечатаемыми ASCII/кавычками заменяется сгенерированным) |
+
+## Метрики
+
+`GET /metrics` отдаёт Prometheus-формат из кастомного реестра — только серии `notifier_*` (runtime-коллекторы Go `go_*`/`process_*` не экспонируются).
+
+Бизнес-метрики:
+
+| Метрика | Что значит |
+|---|---|
+| `notifier_stream_pending_events` | Записи в pending consumer group (залипшие воркеры) |
+| `notifier_stream_length` | Длина стрима `listings.new` (XLEN); парный к мягкому порогу WARN (ТЗ 3.6) |
+| `notifier_deferred_jobs` | Отложенные задания: строки `deferred` в `notifications_log` (лимит 30/час) |
+| `notifier_quarantined_jobs` | Карантин: строки `failed` в `notifications_log` (нечитаемый payload — пара заблокирована навсегда) |
+| `notifier_delivery_duration_seconds` | Длительность отправки в Telegram; лейбл `outcome` = `sent`/`rate_limited`/`unknown` (p95 НФТ-11 считать по `sent`) |
+| `notifier_telegram_retry_after_total` | Ответы Telegram 429 Retry-After |
+| `notifier_dead_letter_total` | Записи, уложенные в `listings.dead` с причиной (битые payload) |
+| `notifier_event_process_errors_total` | Обработка события упала на временной ошибке — запись осталась в pending, вернётся по XAUTOCLAIM |
+| `notifier_gauge_poll_errors_total` | Неудачные проходы поллера гейджей (Redis/PG недоступны — гейджи замерли на прошлом значении) |
+
+HTTP-метрики (`{code, method}` у первых двух):
+
+| Метрика | Что значит |
+|---|---|
+| `notifier_http_requests_total` | HTTP-запросы по коду и методу |
+| `notifier_http_request_duration_seconds` | Длительность обработки HTTP-запроса |
+| `notifier_http_requests_in_flight` | Запросы в обработке прямо сейчас |
+
+Гейджи обновляет фоновый поллер раз в 15 с — мгновенный scrape показывает значения прошлого прохода. В memory-режиме `notifier_deferred_jobs` и `notifier_quarantined_jobs` не экспонируются (БД нет — «0» выглядел бы как «очередь пуста»).
+
+Экспозиция: `/metrics` отдаётся без ключа на том же порту 8080 — значений секретов и PII не содержит; при выносе сервиса из внутренней сети прикрыть ключом или выделить отдельный порт.
 
 ## Переменные окружения
 

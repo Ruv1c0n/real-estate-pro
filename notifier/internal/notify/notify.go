@@ -415,10 +415,12 @@ func (d *Dispatcher) postpone(ctx context.Context, chatID int64, e model.Event) 
 	return d.queue.Postpone(pctx, chatID, e, d.mode)
 }
 
-// logRateLimited логирует отказ 429 с рекомендованной паузой из ответа
-// Telegram (RateLimitError.RetryAfter); обёртки может не быть — дозорная
-// ошибка ErrRateLimited распознаётся и без неё.
-func logRateLimited(err error, eventID string, listingID, chatID int64) {
+// noteRateLimited фиксирует отказ 429 в телеметрии (счётчик
+// notifier_telegram_retry_after_total) и логирует его с рекомендованной
+// паузой из ответа Telegram (RateLimitError.RetryAfter); обёртки может не
+// быть — дозорная ошибка ErrRateLimited распознаётся и без неё. Имя «note»,
+// а не «log»: побочный эффект — инкремент метрики (п.8 ревью #125).
+func noteRateLimited(err error, eventID string, listingID, chatID int64) {
 	metrics.TelegramRetryAfter.Inc()
 	var rle *telegram.RateLimitError
 	if errors.As(err, &rle) {
@@ -453,13 +455,38 @@ func (d *Dispatcher) pauseRateLimited(ctx context.Context, err error) {
 	}
 }
 
-func (d *Dispatcher) deliver(ctx context.Context, chatID int64, e model.Event) error {
-	status := StatusSent
+// Исходы доставки для лейбла outcome гистограммы
+// notifier_delivery_duration_seconds: p95 НФТ-11 считают по успешным
+// отправкам, поэтому 429 и неизвестные исходы не смешиваются с sent
+// (п.2 ревью #125).
+const (
+	outcomeSent        = "sent"
+	outcomeRateLimited = "rate_limited"
+	outcomeUnknown     = "unknown"
+)
+
+// timedSend оборачивает одну отправку d.send: замеряет длительность и
+// наблюдает notifier_delivery_duration_seconds с outcome — классификацией
+// исхода. Замер живёт здесь, а не в call-site'ах, чтобы классификация не
+// расходилась с ветками обработки ошибок в deliver/flushJob и замер не
+// дублировался между путями (п.2 ревью #125).
+func (d *Dispatcher) timedSend(ctx context.Context, chatID int64, e model.Event) error {
 	start := time.Now()
 	err := d.send(ctx, chatID, e)
-	// Наблюдение в обе стороны: и успешная отправка, и unknown — реальное
-	// время до ответа Telegram (основа SLO НФТ-11, p95 < 5 с).
-	metrics.DeliveryDuration.Observe(time.Since(start).Seconds())
+	outcome := outcomeUnknown
+	switch {
+	case err == nil:
+		outcome = outcomeSent
+	case errors.Is(err, telegram.ErrRateLimited):
+		outcome = outcomeRateLimited
+	}
+	metrics.DeliveryDuration.WithLabelValues(outcome).Observe(time.Since(start).Seconds())
+	return err
+}
+
+func (d *Dispatcher) deliver(ctx context.Context, chatID int64, e model.Event) error {
+	status := StatusSent
+	err := d.timedSend(ctx, chatID, e)
 	if err != nil {
 		// 429 — явный отказ Telegram с рекомендованной паузой (ТЗ 4.3
 		// «Для 429 учитывается Retry-After»), а не неопределённый исход:
@@ -468,7 +495,7 @@ func (d *Dispatcher) deliver(ctx context.Context, chatID int64, e model.Event) e
 		// при повторном Postpone съедает UNIQUE (chat_id, listing_id)
 		// Pg-очереди (ON CONFLICT DO NOTHING).
 		if errors.Is(err, telegram.ErrRateLimited) {
-			logRateLimited(err, e.EventID, e.ID, chatID)
+			noteRateLimited(err, e.EventID, e.ID, chatID)
 			if perr := d.postpone(ctx, chatID, e); perr != nil {
 				// Postpone тоже упал: ни задания в очереди, ни записи журнала —
 				// уведомление потеряно после XACK. Ошибка события → повтор
@@ -617,16 +644,14 @@ func (d *Dispatcher) flushJob(ctx context.Context, job DeferredJob) {
 		return
 	}
 	status := StatusSent
-	start := time.Now()
 	// err уже объявлен выше (limiter.Allow): присваивание, не :=.
-	err = d.send(ctx, job.ChatID, job.Event)
-	metrics.DeliveryDuration.Observe(time.Since(start).Seconds())
+	err = d.timedSend(ctx, job.ChatID, job.Event)
 	if err != nil {
 		// 429 — явный отказ (ТЗ 4.3), а не неопределённый исход: задание
 		// возвращается в очередь (retry), повтор — следующим проходом
 		// флешера. Точную паузу Retry-After очередь пока не отслеживает.
 		if errors.Is(err, telegram.ErrRateLimited) {
-			logRateLimited(err, job.Event.EventID, job.Event.ID, job.ChatID)
+			noteRateLimited(err, job.Event.EventID, job.Event.ID, job.ChatID)
 			if merr := d.queue.Mark(ctx, job, d.mode, StatusRetry); merr != nil {
 				slog.Warn("flush: mark retry failed", "event_id", job.Event.EventID, "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", merr)
 			}

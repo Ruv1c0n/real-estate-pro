@@ -30,6 +30,7 @@ import (
 	"notifier/internal/metrics"
 	"notifier/internal/notify"
 	"notifier/internal/store"
+	"notifier/internal/stream"
 )
 
 // newDictsFake поднимает HTTP-заглушку Core API: GET /api/v1/countries
@@ -246,9 +247,10 @@ func TestHealthReadyRedisDown(t *testing.T) {
 }
 
 // buildStores в memory-режиме (pool == nil): все четыре реализации — memory-*.
-// Полностью офлайн, живая БД не нужна.
+// Полностью офлайн, живая БД не нужна. Счётчики для гейджей deferred/
+// quarantined недоступны (nil) — гейджи не экспонируются (п.4 ревью #125).
 func TestBuildStoresMemoryMode(t *testing.T) {
-	subs, journal, limiter, queue := buildStores(nil, 30)
+	subs, journal, limiter, queue, gauges := buildStores(nil, 30)
 
 	if _, ok := subs.(*store.Memory); !ok {
 		t.Fatalf("subs в memory-режиме: %T, ожидается *store.Memory", subs)
@@ -262,6 +264,9 @@ func TestBuildStoresMemoryMode(t *testing.T) {
 	if _, ok := queue.(*notify.MemoryQueue); !ok {
 		t.Fatalf("queue в memory-режиме: %T, ожидается *notify.MemoryQueue", queue)
 	}
+	if gauges != nil {
+		t.Fatalf("gauges в memory-режиме: %T, ожидается nil (гейджи deferred/quarantined не экспонируются)", gauges)
+	}
 }
 
 // buildStores в db-режиме обязан вернуть Pg-стек по всем четырём точкам:
@@ -273,7 +278,7 @@ func TestBuildStoresDbModePgStack(t *testing.T) {
 	pool := testPool(t)
 	defer pool.Close()
 
-	subs, journal, limiter, queue := buildStores(pool, 30)
+	subs, journal, limiter, queue, gauges := buildStores(pool, 30)
 
 	if _, ok := subs.(*store.Postgres); !ok {
 		t.Fatalf("subs в db-режиме: %T, ожидается *store.Postgres", subs)
@@ -286,6 +291,9 @@ func TestBuildStoresDbModePgStack(t *testing.T) {
 	}
 	if _, ok := queue.(*notify.PgQueue); !ok {
 		t.Fatalf("queue в db-режиме: %T, ожидается *notify.PgQueue", queue)
+	}
+	if _, ok := gauges.(*notify.PgJournal); !ok {
+		t.Fatalf("gauges в db-режиме: %T, ожидается *notify.PgJournal (гейджи deferred/quarantined)", gauges)
 	}
 }
 
@@ -594,8 +602,31 @@ func TestRequestLoggerRejectsMalformedID(t *testing.T) {
 }
 
 // Тесты /metrics (карточка 01 плана prod-10of10): эндпоинт на mux отдаёт
-// пром-формат; поллер гейджей переживает недоступный Redis и обновляет
-// значения на живом.
+// пром-формат; HTTP-обвязка instrument растит счётчики; поллер гейджей
+// переживает недоступный Redis и обновляет значения на живом.
+
+// TestInstrumentCountsRequests — HTTP-обвязка метрик (п.7d ревью #125):
+// запрос через instrument() растит notifier_http_requests_total по коду
+// и методу. Цепочка вынесена из main в функцию именно затем, чтобы тесты
+// гоняли ту же обвязку, что и прод (раньше она выполнялась только в живом
+// процессе).
+func TestInstrumentCountsRequests(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	rec := httptest.NewRecorder()
+	instrument(inner).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("instrument вернул %d, ожидается 200 (обвязка не должна ломать ответ)", rec.Code)
+	}
+	// promhttp нормализует метод в нижний регистр (sanitizeMethod): серия
+	// называется method="get", а не method="GET".
+	if got := testutil.ToFloat64(metrics.HTTPRequests.WithLabelValues("200", "get")); got < 1 {
+		t.Fatalf("notifier_http_requests_total{code=200,method=get} = %v, want > 0", got)
+	}
+}
 
 func TestMetricsEndpointOnMux(t *testing.T) {
 	t.Setenv("ADMIN_KEY", "")
@@ -619,11 +650,22 @@ func TestPollOnceToleratesDeadRedis(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
 	t.Cleanup(func() { rdb.Close() })
 
+	// Сброс до нуля перед проходом: тест не должен зависеть от порядка
+	// выполнения (п.7e ревью #125 — гейдж мог остаться с чужого теста).
+	metrics.StreamLength.Set(0)
+
 	// Ошибки Redis не паникуют и не поднимают гейджи: значения остаются
 	// с прошлого прохода (в тесте — нулевые).
+	pollErrBefore := testutil.ToFloat64(metrics.GaugePollErrors)
 	pollOnce(context.Background(), rdb, nil)
 	if got := testutil.ToFloat64(metrics.StreamLength); got != 0 {
 		t.Fatalf("StreamLength после сбоя Redis = %v, want 0", got)
+	}
+	// Неудачный проход зафиксирован счётчиком (п.3 ревью #125): ровно один
+	// инкремент за проход — XPending и XLen при мёртвом Redis падают вместе,
+	// и инкремент в каждой ветке удваивал бы частоту ошибки для алерта.
+	if got := testutil.ToFloat64(metrics.GaugePollErrors); got != pollErrBefore+1 {
+		t.Fatalf("GaugePollErrors = %v, want %v (ровно один неудачный проход)", got, pollErrBefore+1)
 	}
 }
 

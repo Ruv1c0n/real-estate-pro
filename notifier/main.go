@@ -54,6 +54,9 @@ const (
 	// (карточка 01 плана prod-10of10), поэтому частота определяется здесь,
 	// а не нагрузкой от Prometheus.
 	metricsPollEvery = 15 * time.Second
+	// Дедлайн одного прохода поллера гейджей (п.5 ревью #125): «чёрная дыра»
+	// Redis/PG иначе замораживала бы горутину поллера навсегда.
+	metricsPollTimeout = 5 * time.Second
 )
 
 // Тайминги health-проверок: у каждой проверки свой дедлайн, сбор результатов
@@ -136,7 +139,7 @@ func main() {
 
 	dictsClient := dicts.New(env("CORE_API_URL", "http://localhost:8000"))
 
-	subs, journal, limiter, queue := buildStores(pool, perHour)
+	subs, journal, limiter, queue, gauges := buildStores(pool, perHour)
 
 	// /stop чистит отложенные задания чата (ТЗ 4.2), если очередь реализует
 	// ChatCleaner (MemoryQueue и PgQueue реализуют); боту передаётся
@@ -193,17 +196,14 @@ func main() {
 	// не фатальны — без очистки стрим просто не режется.
 	go stream.NewReaper(redisClient, cleanupEvery).Run(ctx)
 
-	// Гейджи Prometheus (карточка 01): pending/длина стрима/отложенные
-	// обновляются раз в metricsPollEvery — скрейп в Redis/PG не ходит.
-	go pollGauges(ctx, redisClient, pool, metricsPollEvery)
+	// Гейджи Prometheus (карточка 01): pending/длина стрима/отложенные и
+	// карантин обновляются раз в metricsPollEvery — скрейп в Redis/PG не ходит.
+	go pollGauges(ctx, redisClient, gauges, metricsPollEvery)
 
 	srv := &http.Server{
 		Addr: ":8080",
 		// Обвязка снаружи внутрь: slog-лог → HTTP-метрики Prometheus → mux.
-		Handler: requestLogger(promhttp.InstrumentHandlerInFlight(metrics.HTTPInFlight,
-			promhttp.InstrumentHandlerDuration(metrics.HTTPDuration,
-				promhttp.InstrumentHandlerCounter(metrics.HTTPRequests,
-					newMux(redisClient, dictsClient, pool, mode, debugRatePerMin))))),
+		Handler:           requestLogger(instrument(newMux(redisClient, dictsClient, pool, mode, debugRatePerMin))),
 		ReadHeaderTimeout: 5 * time.Second, // медленные заголовки не держат коннект (slowloris)
 	}
 	srvErr := make(chan error, 1)
@@ -249,26 +249,32 @@ func main() {
 // использовать Pg-стек (подписки и users — ФТ-3.1, ФТ-3.2; журнал, лимит
 // 30/час и очередь отложенных — ФТ-3.5, ТЗ 3.6), memory-режим — in-memory
 // реализации. perHour — лимит уведомлений за скользящий час, читаемый
-// из NOTIFIER_NOTIFICATIONS_PER_HOUR. Класс бага #51: wiring в main
-// разъезжается с ветками db/memory, и db-режим молча работает in-memory —
-// уехало на e2e-прогоне. Вынесено из main, чтобы обе ветки wiring
-// проверялись тестами напрямую.
+// из NOTIFIER_NOTIFICATIONS_PER_HOUR. Пятый возврат — gauges: узкий
+// интерфейс счётчиков для поллера гейджей (gaugeCounters); в db-режиме это
+// PgJournal, в memory-режиме nil — deferred/quarantined не экспонируются
+// (п.4 ревью #125). Класс бага #51: wiring в main разъезжается с ветками
+// db/memory, и db-режим молча работает in-memory — уехало на e2e-прогоне.
+// Вынесено из main, чтобы обе ветки wiring проверялись тестами напрямую.
 func buildStores(pool *pgxpool.Pool, perHour int) (
 	subs store.Store,
 	journal notify.Journal,
 	limiter notify.Limiter,
 	queue notify.DeferredQueue,
+	gauges gaugeCounters,
 ) {
 	if pool != nil {
+		pgJournal := notify.NewPgJournal(pool)
 		return store.NewPostgres(pool),
-			notify.NewPgJournal(pool),
+			pgJournal,
 			notify.NewPgLimiter(pool, perHour),
-			notify.NewPgQueue(pool)
+			notify.NewPgQueue(pool),
+			pgJournal
 	}
 	return store.NewMemory(),
 		notify.NewMemoryJournal(),
 		notify.NewMemoryLimiter(perHour, time.Hour),
-		notify.NewMemoryQueue()
+		notify.NewMemoryQueue(),
+		nil
 }
 
 // probeResult — снимок состояния зависимостей для тела health-ответов.
@@ -691,12 +697,36 @@ func newRequestID() string {
 	return hex.EncodeToString(b[:])
 }
 
+// instrument — HTTP-обвязка метрик Prometheus (п.7d ревью #125): вынесена
+// из main, чтобы тесты гоняли тот же chain, что и прод (раньше обвязка
+// выполнялась только в живом процессе, и регрессию «счётчики не растут»
+// поймать было нечем).
+func instrument(next http.Handler) http.Handler {
+	return promhttp.InstrumentHandlerInFlight(metrics.HTTPInFlight,
+		promhttp.InstrumentHandlerDuration(metrics.HTTPDuration,
+			promhttp.InstrumentHandlerCounter(metrics.HTTPRequests, next)))
+}
+
+// gaugeCounters — узкий интерфейс счётчиков для поллера гейджей: только
+// подсчёты строк notifications_log для гейджей deferred/quarantined.
+// Реализует PgJournal; MemoryJournal не поддерживает — в memory-режиме
+// гейджи не экспонируются, чтобы Set(0) не выглядел как «очередь пуста»
+// (ложный негатив, п.4 ревью #125). Отдельно от notify.Journal: контракт
+// журнала не расширяется подсчётами, нужными только телеметрии (п.6
+// ревью #125).
+type gaugeCounters interface {
+	CountDeferred(ctx context.Context) (int, error)
+	CountQuarantined(ctx context.Context) (int, error)
+}
+
 // pollGauges обновляет гейджи internal/metrics раз в every: pending и
-// длина стрима — из Redis, отложенные — из notifications_log (только
-// db-режим; в memory-режиме нечего считать — см. metrics.DeferredJobs).
-// Ошибки поллера не фатальны: гейдж остаётся с прошлым значением, сбой
-// уходит WARN'ом — алерт по несвежим гейджам делается в карточке 03.
-func pollGauges(ctx context.Context, rdb *redis.Client, pool *pgxpool.Pool, every time.Duration) {
+// длина стрима — из Redis, отложенные и карантин — из notifications_log
+// (только db-режим; в memory-режиме counters == nil и гейджи не
+// экспонируются — п.4 ревью #125). Ошибки прохода не фатальны: гейдж
+// остаётся с прошлым значением, а неудачный проход фиксируется счётчиком
+// notifier_gauge_poll_errors_total (п.3 ревью #125) — WARN раз в 15 с
+// алерт не отличит, счётчик даст.
+func pollGauges(ctx context.Context, rdb *redis.Client, counters gaugeCounters, every time.Duration) {
 	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
@@ -704,31 +734,53 @@ func pollGauges(ctx context.Context, rdb *redis.Client, pool *pgxpool.Pool, ever
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			pollOnce(ctx, rdb, pool)
+			pollOnce(ctx, rdb, counters)
 		}
 	}
 }
 
-// pollOnce — один проход поллера гейджей.
-func pollOnce(ctx context.Context, rdb *redis.Client, pool *pgxpool.Pool) {
+// pollOnce — один проход поллера гейджей. Весь проход под дедлайном
+// metricsPollTimeout (п.5 ревью #125): XPending/XLen/SQL иначе могли бы
+// зависнуть навсегда на «чёрной дыре» Redis/PG.
+func pollOnce(ctx context.Context, rdb *redis.Client, counters gaugeCounters) {
+	ctx, cancel := context.WithTimeout(ctx, metricsPollTimeout)
+	defer cancel()
+
+	// failed — признак ошибочной ветки прохода. Счётчик notifier_gauge_poll_errors_total
+	// инкрементируется один раз на неудачный проход: при недоступном Redis
+	// падают и XPending, и XLen — инкремент в каждой ветке удваивал бы
+	// частоту ошибки для алерта (п.3 ревью #125, тест = +1 за проход).
+	failed := false
 	if pending, err := rdb.XPending(ctx, stream.StreamName, stream.GroupName).Result(); err != nil {
 		slog.Warn("metrics: xpending failed", "error", err)
+		failed = true
 	} else {
 		metrics.StreamPending.Set(float64(pending.Count))
 	}
 	if n, err := rdb.XLen(ctx, stream.StreamName).Result(); err != nil {
 		slog.Warn("metrics: xlen failed", "error", err)
+		failed = true
 	} else {
 		metrics.StreamLength.Set(float64(n))
 	}
-	if pool == nil {
-		return
+	// deferred/quarantined — только db-режим: в memory-режиме counters == nil
+	// и гейджи не экспонируются (Set(0) выглядел бы как «всё чисто» — ложный
+	// негатив, п.4 ревью #125).
+	if counters != nil {
+		if n, err := counters.CountDeferred(ctx); err != nil {
+			slog.Warn("metrics: deferred count failed", "error", err)
+			failed = true
+		} else {
+			metrics.DeferredJobs.Set(float64(n))
+		}
+		if n, err := counters.CountQuarantined(ctx); err != nil {
+			slog.Warn("metrics: quarantined count failed", "error", err)
+			failed = true
+		} else {
+			metrics.QuarantinedJobs.Set(float64(n))
+		}
 	}
-	var n int
-	if err := pool.QueryRow(ctx,
-		"SELECT count(*) FROM notifier.notifications_log WHERE status = 'deferred'").Scan(&n); err != nil {
-		slog.Warn("metrics: deferred count failed", "error", err)
-		return
+	if failed {
+		metrics.GaugePollErrors.Inc()
 	}
-	metrics.DeferredJobs.Set(float64(n))
 }

@@ -59,3 +59,29 @@ func (j *PgJournal) Record(ctx context.Context, chatID, listingID int64, eventID
 	}
 	return nil
 }
+
+// CountDeferred возвращает число строк со статусом 'deferred' — очередь
+// отложенных уведомлений (ТЗ 3.6). Служит гейджу notifier_deferred_jobs:
+// SQL с литералом статуса живёт в слое notify (как в queue_pg.go), а не в
+// main, где раньше была третья копия литерала (п.6 ревью #125).
+func (j *PgJournal) CountDeferred(ctx context.Context) (int, error) {
+	var n int
+	if err := j.pool.QueryRow(ctx, `
+		SELECT count(*) FROM notifier.notifications_log WHERE status = 'deferred'`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("journal deferred count: %w", err)
+	}
+	return n, nil
+}
+
+// CountQuarantined возвращает число строк со статусом 'failed' — карантин
+// PopBatch: нечитаемый payload, пара блокирована навсегда (ТЗ 3.6: задания
+// не отбрасываются). Служит гейджу notifier_quarantined_jobs (п.4 ревью
+// #125).
+func (j *PgJournal) CountQuarantined(ctx context.Context) (int, error) {
+	var n int
+	if err := j.pool.QueryRow(ctx, `
+		SELECT count(*) FROM notifier.notifications_log WHERE status = 'failed'`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("journal quarantined count: %w", err)
+	}
+	return n, nil
+}

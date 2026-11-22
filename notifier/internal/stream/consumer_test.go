@@ -12,8 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/redis/go-redis/v9"
 
+	"notifier/internal/metrics"
 	"notifier/internal/model"
 )
 
@@ -303,6 +305,10 @@ func TestConsumerDeadLetterOnBadPayload(t *testing.T) {
 	vals, _ := dead[0].Values.(map[string]any)
 	if vals["reason"] == "" || vals["data"] != `{oops` {
 		t.Errorf("dead values = %v", vals)
+	}
+	// Телеметрия dead-letter (п.7a ревью #125): счётчик растёт на битом payload.
+	if got := testutil.ToFloat64(metrics.DeadLetter); got < 1 {
+		t.Fatalf("DeadLetter = %v, want > 0 (битый payload уложен в listings.dead)", got)
 	}
 }
 
