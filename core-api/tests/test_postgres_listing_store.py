@@ -7,11 +7,14 @@ from functools import partial
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
+import httpx2
 import pytest
+import simplejson
 from app.database import create_db_engine
 from app.listing_filters import ListingFilters
 from app.listing_models import ListingCreate
 from app.listing_store import UnknownListingReferenceError
+from app.main import app
 from app.outbox import publish_listing_event
 from app.postgres_listing_store import PostgresListingStore
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -378,3 +381,54 @@ async def test_search_applies_sql_filters(search_store, criteria, expected):
 async def test_get_out_of_range_listing_id(pg_engine, listing_id):
     store = PostgresListingStore(pg_engine)
     assert await store.get(listing_id) is None
+
+
+@pytest.fixture
+async def price_client(pg_engine, monkeypatch):
+    monkeypatch.setattr(
+        app.state, "listing_store", PostgresListingStore(pg_engine), raising=False
+    )
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        yield client
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("currency", "price", "expected_usd"),
+    [("USD", 10.49, 10), ("USD", 10.50, 11), ("PLN", 42, 11)],
+)
+async def test_price_usd_validation(
+    price_client, listing_data, currency, price, expected_usd
+):
+    url = "/api/v1/listings"
+    payload = {**listing_data, "currency": currency, "price": price}
+
+    invalid = await price_client.post(
+        url, json={**payload, "price_usd": expected_usd - 1}
+    )
+    assert invalid.status_code == 422, invalid.text
+    assert invalid.json()["error"] == "validation_error"
+    assert "price_usd" in invalid.json()["message"]
+
+    valid = await price_client.post(url, json={**payload, "price_usd": expected_usd})
+    assert valid.status_code == 201, valid.text
+
+
+@pytest.mark.anyio
+async def test_price_survives_http_json(price_client, listing_data):
+    url = "/api/v1/listings"
+    price = Decimal("9007199254740992.25")
+    data = {**listing_data, "price": price, "price_usd": 9007199254740992}
+
+    created = await price_client.post(
+        url,
+        content=simplejson.dumps(data, use_decimal=True),
+        headers={"Content-Type": "application/json"},
+    )
+    assert created.status_code == 201, created.text
+
+    detail = await price_client.get(f"{url}/{created.json()['id']}")
+    assert detail.status_code == 200
+    assert json.loads(detail.content, parse_float=Decimal)["price"] == price

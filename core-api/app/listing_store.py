@@ -29,6 +29,10 @@ class UnknownListingReferenceError(ValueError):
     """Значение из объявления отсутствует в справочниках Core API."""
 
 
+class ListingPriceMismatchError(ValueError):
+    """Цена в USD расходится с курсом из справочника."""
+
+
 class ListingStore(Protocol):
     async def create_or_get(
         self,

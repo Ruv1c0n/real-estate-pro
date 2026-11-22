@@ -10,6 +10,7 @@ from app.listing_filters import ListingFilters
 from app.listing_models import ListingCreate
 from app.listing_store import (
     CreateListingResult,
+    ListingPriceMismatchError,
     ListingSearchResult,
     StoredListing,
     UnknownListingReferenceError,
@@ -46,6 +47,12 @@ _LISTING_SELECT = """
 """
 
 _GET_LISTING = text(_LISTING_SELECT + "\nWHERE l.id = :listing_id")
+
+_EXPECTED_PRICE_USD = text("""
+    SELECT round(CAST(:price AS numeric) * rate_to_usd)
+    FROM core.currencies
+    WHERE code = :currency
+""")
 
 _INSERT_LISTING = text("""
     INSERT INTO core.listings (
@@ -167,6 +174,14 @@ class PostgresListingStore:
         params["content_hash"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
         async with self._engine.begin() as connection:
+            expected_usd = await connection.scalar(
+                _EXPECTED_PRICE_USD,
+                {"price": listing.price, "currency": listing.currency},
+            )
+            if expected_usd is not None and listing.price_usd != expected_usd:
+                raise ListingPriceMismatchError(
+                    f"price_usd не соответствует курсу {listing.currency}: ожидается {expected_usd}"
+                )
             inserted = await connection.execute(_INSERT_LISTING, params)
             listing_id = inserted.scalar_one_or_none()
             created = listing_id is not None
