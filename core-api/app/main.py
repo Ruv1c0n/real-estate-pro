@@ -14,6 +14,7 @@ from app.logging_setup import setup_logging
 from app.outbox import run_outbox_worker
 from app.postgres_listing_store import PostgresListingStore
 from app.redis_client import create_redis_client
+from app.reference_data import router as reference_data_router
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ app = FastAPI(
 register_error_handlers(app)
 app.include_router(health_router)
 app.include_router(listings_router)
+app.include_router(reference_data_router)
 
 
 @app.get("/")
