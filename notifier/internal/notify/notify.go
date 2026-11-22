@@ -378,7 +378,8 @@ func (d *Dispatcher) deliverRecipient(ctx context.Context, chatID int64, e model
 		// Пользователь удалён (/stop) после выбора получателей: доставка ему
 		// не нужна. Задание в очередь отложенных НЕ возвращается — в db-режиме
 		// каскад /stop уже снял бы его, здесь закрывается то же окно гонки.
-		slog.Warn("dispatch: user gone, skip — задание не возвращается (ТЗ 4.2)", "chat_id", chatID, "listing_id", e.ID)
+		// Русский смысл стаба: «пользователь удалён — задание не возвращается».
+		slog.Warn("dispatch: user gone, skip", "event_id", e.EventID, "chat_id", chatID, "listing_id", e.ID)
 		return nil
 	}
 	ok, err := d.limiter.Allow(rctx, chatID, d.mode)
@@ -394,7 +395,7 @@ func (d *Dispatcher) deliverRecipient(ctx context.Context, chatID int64, e model
 	if err := d.postpone(rctx, chatID, e); err != nil {
 		return fmt.Errorf("postpone listing %d chat %d: %w", e.ID, chatID, err)
 	}
-	slog.Info("dispatch: hourly limit reached — deferred", "listing_id", e.ID, "chat_id", chatID)
+	slog.Info("dispatch: hourly limit reached, deferred", "event_id", e.EventID, "listing_id", e.ID, "chat_id", chatID)
 	return nil
 }
 
@@ -416,13 +417,13 @@ func (d *Dispatcher) postpone(ctx context.Context, chatID int64, e model.Event) 
 // logRateLimited логирует отказ 429 с рекомендованной паузой из ответа
 // Telegram (RateLimitError.RetryAfter); обёртки может не быть — дозорная
 // ошибка ErrRateLimited распознаётся и без неё.
-func logRateLimited(err error, listingID, chatID int64) {
+func logRateLimited(err error, eventID string, listingID, chatID int64) {
 	var rle *telegram.RateLimitError
 	if errors.As(err, &rle) {
-		slog.Warn("dispatch: rate limited 429", "retry_after", rle.RetryAfter.String(), "listing_id", listingID, "chat_id", chatID)
+		slog.Warn("dispatch: rate limited 429", "event_id", eventID, "retry_after", rle.RetryAfter.String(), "listing_id", listingID, "chat_id", chatID)
 		return
 	}
-	slog.Warn("dispatch: rate limited 429", "listing_id", listingID, "chat_id", chatID)
+	slog.Warn("dispatch: rate limited 429", "event_id", eventID, "listing_id", listingID, "chat_id", chatID)
 }
 
 // flushRateLimitPause — потолок паузы между 429-повторами во Flush: больше
@@ -460,7 +461,7 @@ func (d *Dispatcher) deliver(ctx context.Context, chatID int64, e model.Event) e
 		// при повторном Postpone съедает UNIQUE (chat_id, listing_id)
 		// Pg-очереди (ON CONFLICT DO NOTHING).
 		if errors.Is(err, telegram.ErrRateLimited) {
-			logRateLimited(err, e.ID, chatID)
+			logRateLimited(err, e.EventID, e.ID, chatID)
 			if perr := d.postpone(ctx, chatID, e); perr != nil {
 				// Postpone тоже упал: ни задания в очереди, ни записи журнала —
 				// уведомление потеряно после XACK. Ошибка события → повтор
@@ -473,8 +474,17 @@ func (d *Dispatcher) deliver(ctx context.Context, chatID int64, e model.Event) e
 		// повтор не выполняется (contracts.md §2 — статус unknown без повтора).
 		// Ошибкой события НЕ возвращается: повтор всего события привёл бы к
 		// повторной отправке.
-		slog.Error("dispatch: send failed — статус unknown", "listing_id", e.ID, "chat_id", chatID, "error", err)
+		// Русский смысл стаба: «ошибка отправки — статус unknown» (см.
+		// комментарий ниже: автоматический повтор не выполняется).
+		slog.Error("dispatch: send failed", "event_id", e.EventID, "listing_id", e.ID, "chat_id", chatID, "error", err)
 		status = StatusUnknown
+	}
+	if status == StatusSent {
+		// Успешная доставка: единственный INFO-лог шага отправки. По нему
+		// собирается сквозной путь события (consumer → dispatch → flush)
+		// по event_id — корреляция телеметрии (карточка 02); остальные
+		// записи шага — только ошибки.
+		slog.Info("dispatch: sent", "chat_id", chatID, "listing_id", e.ID, "event_id", e.EventID)
 	}
 	if err := d.journal.Record(ctx, chatID, e.ID, e.EventID, e, status, d.mode); err != nil {
 		// Решение по issue #53 (ФТ-3.5, ТЗ 4.3, contracts.md §2): ошибка
@@ -485,7 +495,8 @@ func (d *Dispatcher) deliver(ctx context.Context, chatID int64, e model.Event) e
 		// у пользователя. Неопределённый исход отправки имеет статус unknown
 		// и автоповтору не подлежит (contracts.md §2); повтор возможен только
 		// при явной повторной публикации события.
-		slog.Error("dispatch: journal record failed после отправки", "listing_id", e.ID, "chat_id", chatID, "error", err)
+		// Русский смысл стаба: «запись журнала не удалась после отправки».
+		slog.Error("dispatch: journal record failed after send", "event_id", e.EventID, "listing_id", e.ID, "chat_id", chatID, "error", err)
 	}
 	return nil
 }
@@ -528,7 +539,7 @@ func (d *Dispatcher) flushJob(ctx context.Context, job DeferredJob) {
 	if !d.claim(key) {
 		// Доставляется прямо сейчас другим путём — вернуть в очередь.
 		if err := d.queue.Mark(ctx, job, d.mode, StatusRetry); err != nil {
-			slog.Warn("flush: mark retry failed", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", err)
+			slog.Warn("flush: mark retry failed", "event_id", job.Event.EventID, "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", err)
 		}
 		return
 	}
@@ -543,13 +554,15 @@ func (d *Dispatcher) flushJob(ctx context.Context, job DeferredJob) {
 	// его гасит дедуп журнала при Record.
 	sent, serr := d.journal.Sent(ctx, job.Event.ID, job.ChatID)
 	if serr != nil {
-		slog.Warn("flush: journal check failed — отправляем без дедупа", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", serr)
+		// Русский смысл стаба: «отправляем без дедупа» (см. комментарий выше
+		// — повтор гасится дедупом журнала при Record).
+		slog.Warn("flush: journal check failed, sending without dedup", "event_id", job.Event.EventID, "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", serr)
 	}
 	if sent {
 		// Задание закрывается как sent: в Pg строка уже не deferred
 		// (UPDATE не найдёт её), в memory Mark убирает из очереди.
 		if merr := d.queue.Mark(ctx, job, d.mode, StatusSent); merr != nil {
-			slog.Warn("flush: mark failed", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", merr)
+			slog.Warn("flush: mark failed", "event_id", job.Event.EventID, "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", merr)
 		}
 		return
 	}
@@ -561,9 +574,11 @@ func (d *Dispatcher) flushJob(ctx context.Context, job DeferredJob) {
 	if uerr != nil {
 		// Проверка недоступна — задание остаётся в очереди (retry), повтор
 		// следующим проходом флешера (ТЗ 3.6: отложенные не отбрасываются).
-		slog.Warn("flush: user check failed — retry следующим проходом", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", uerr)
+		// Русский смысл стаба: «повтор следующим проходом флешера» (ТЗ 3.6:
+		// отложенные не отбрасываются — задание остаётся в очереди).
+		slog.Warn("flush: user check failed, retry next pass", "event_id", job.Event.EventID, "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", uerr)
 		if merr := d.queue.Mark(ctx, job, d.mode, StatusRetry); merr != nil {
-			slog.Warn("flush: mark retry failed", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", merr)
+			slog.Warn("flush: mark retry failed", "event_id", job.Event.EventID, "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", merr)
 		}
 		return
 	}
@@ -572,9 +587,11 @@ func (d *Dispatcher) flushJob(ctx context.Context, job DeferredJob) {
 		// доставка ему не нужна, задание снимается с очереди без отправки
 		// (Mark drop — в Pg DELETE deferred-строки, тот же исход, что у
 		// каскада /stop; ТЗ 4.2).
-		slog.Info("flush: user gone, drop deferred (ТЗ 4.2)", "chat_id", job.ChatID, "listing_id", job.Event.ID)
+		// Русский смысл стаба: «пользователь удалён, отложенное задание
+		// снимается без отправки» (ТЗ 4.2 — см. комментарий выше).
+		slog.Info("flush: user gone, drop deferred", "event_id", job.Event.EventID, "chat_id", job.ChatID, "listing_id", job.Event.ID)
 		if merr := d.queue.Mark(ctx, job, d.mode, StatusDropped); merr != nil {
-			slog.Warn("flush: mark drop failed", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", merr)
+			slog.Warn("flush: mark drop failed", "event_id", job.Event.EventID, "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", merr)
 		}
 		return
 	}
@@ -582,12 +599,13 @@ func (d *Dispatcher) flushJob(ctx context.Context, job DeferredJob) {
 	ok, err := d.limiter.Allow(ctx, job.ChatID, d.mode)
 	if err != nil {
 		// Окно не подтверждено — задание остаётся в очереди.
-		slog.Warn("flush: limiter check failed — задание остаётся в очереди", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", err)
+		// Русский смысл стаба: «задание остаётся в очереди» (ТЗ 3.6).
+		slog.Warn("flush: limiter check failed, job stays queued", "event_id", job.Event.EventID, "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", err)
 		ok = false
 	}
 	if !ok {
 		if err := d.queue.Mark(ctx, job, d.mode, StatusRetry); err != nil {
-			slog.Warn("flush: mark retry failed", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", err)
+			slog.Warn("flush: mark retry failed", "event_id", job.Event.EventID, "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", err)
 		}
 		return
 	}
@@ -597,9 +615,9 @@ func (d *Dispatcher) flushJob(ctx context.Context, job DeferredJob) {
 		// возвращается в очередь (retry), повтор — следующим проходом
 		// флешера. Точную паузу Retry-After очередь пока не отслеживает.
 		if errors.Is(err, telegram.ErrRateLimited) {
-			logRateLimited(err, job.Event.ID, job.ChatID)
+			logRateLimited(err, job.Event.EventID, job.Event.ID, job.ChatID)
 			if merr := d.queue.Mark(ctx, job, d.mode, StatusRetry); merr != nil {
-				slog.Warn("flush: mark retry failed", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", merr)
+				slog.Warn("flush: mark retry failed", "event_id", job.Event.EventID, "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", merr)
 			}
 			// Mark(retry) коммитит транзакцию — блокировок на неотмеченные
 			// задания батча больше нет, пауза безопасна. Без неё пачка
@@ -609,16 +627,24 @@ func (d *Dispatcher) flushJob(ctx context.Context, job DeferredJob) {
 			return
 		}
 		// contracts.md §2: ошибка отправки — статус unknown, без повтора.
-		slog.Error("flush: send failed — статус unknown", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", err)
+		// Русский смысл стаба: «ошибка отправки — статус unknown» (contracts.md §2,
+		// без повтора — см. комментарий выше).
+		slog.Error("flush: send failed", "event_id", job.Event.EventID, "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", err)
 		status = StatusUnknown
 	}
+	if status == StatusSent {
+		// Успешная доставка отложенного задания: единственный INFO-лог шага —
+		// корреляция по event_id со сквозным путём события (карточка 02).
+		slog.Info("flush: sent", "chat_id", job.ChatID, "listing_id", job.Event.ID, "event_id", job.Event.EventID)
+	}
 	if err := d.queue.Mark(ctx, job, d.mode, status); err != nil {
-		slog.Warn("flush: mark failed", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", err)
+		slog.Warn("flush: mark failed", "event_id", job.Event.EventID, "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", err)
 	}
 	// Журнал: для Pg-очереди строка задания и есть запись журнала,
 	// Record подтверждает её (upsert по той же паре); для memory-очереди
 	// это единственная фиксация доставки.
 	if err := d.journal.Record(ctx, job.ChatID, job.Event.ID, job.Event.EventID, job.Event, status, d.mode); err != nil {
-		slog.Error("flush: journal record failed после отправки", "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", err)
+		// Русский смысл стаба: «запись журнала не удалась после отправки».
+		slog.Error("flush: journal record failed after send", "event_id", job.Event.EventID, "listing_id", job.Event.ID, "chat_id", job.ChatID, "error", err)
 	}
 }

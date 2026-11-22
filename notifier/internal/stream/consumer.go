@@ -210,7 +210,9 @@ func (c *Consumer) warnStreamLen(ctx context.Context, warned bool) bool {
 	}
 	warn, state := streamLenWarnState(n, warned, c.lenWarn)
 	if warn {
-		slog.Warn("stream length above soft threshold — необработанные записи не удаляются (ТЗ 3.6)",
+		// Русский смысл стаба: «необработанные записи не удаляются» (ТЗ 3.6 —
+		// мягкий порог, без удаления).
+		slog.Warn("stream length above soft threshold, records kept",
 			"stream", StreamName, "length", n, "threshold", c.lenWarn, "consumer", c.name)
 	}
 	return state
@@ -234,7 +236,7 @@ func (c *Consumer) claimLoop(ctx context.Context, jobs chan<- redis.XMessage) {
 		if l, err := c.rdb.XLen(context.WithoutCancel(ctx), StreamName).Result(); err != nil {
 			slog.Warn("consumer: xlen probe failed", "error", err)
 		} else if l > c.lenWarn {
-			slog.Warn("stream length exceeds threshold — consumer may be lagging",
+			slog.Warn("stream length exceeds threshold, consumer may be lagging",
 				"stream", StreamName, "length", l, "threshold", c.lenWarn)
 		}
 		cursor := "0-0"
@@ -304,7 +306,8 @@ func (c *Consumer) process(ctx context.Context, msg redis.XMessage) {
 	// подхвачена XAUTOCLAIM (minIdle 30 с; eventBudget 25 с меньше порога,
 	// поэтому живой воркер не перезабирается — см. notify.eventBudget).
 	if err := c.handle(ctx, event); err != nil {
-		slog.Error("consumer: handle failed — не подтверждено, запись остаётся в pending",
+		// Русский смысл стаба: «не подтверждено, запись остаётся в pending».
+		slog.Error("consumer: handle failed, not acked, stays pending",
 			"stream_msg_id", msg.ID, "event_id", event.EventID, "error", err)
 		return
 	}
@@ -314,7 +317,8 @@ func (c *Consumer) process(ctx context.Context, msg redis.XMessage) {
 	// поэтому отдельный контекст.
 	if err := c.rdb.XAck(context.WithoutCancel(ctx), StreamName, GroupName, msg.ID).Err(); err != nil {
 		// Не подтверждено: запись останется в pending, XAUTOCLAIM вернёт её.
-		slog.Warn("consumer: xack failed — запись вернётся по XAUTOCLAIM", "stream_msg_id", msg.ID, "error", err)
+		// Русский смысл стаба: «запись вернётся по XAUTOCLAIM».
+		slog.Warn("consumer: xack failed, record will be reclaimed", "stream_msg_id", msg.ID, "error", err)
 	}
 }
 
@@ -331,7 +335,8 @@ func (c *Consumer) dead(ctx context.Context, msg redis.XMessage, payload, reason
 		},
 	}).Err()
 	if err != nil {
-		slog.Error("consumer: dead-letter write failed — запись не подтверждена", "stream_msg_id", msg.ID, "reason", reason, "error", err)
+		// Русский смысл стаба: «запись не подтверждена».
+		slog.Error("consumer: dead-letter write failed, record not acked", "stream_msg_id", msg.ID, "reason", reason, "error", err)
 		return
 	}
 	slog.Warn("consumer: bad payload moved to dead stream", "stream_msg_id", msg.ID, "dead_stream", DeadStream, "reason", reason)

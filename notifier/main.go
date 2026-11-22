@@ -595,13 +595,13 @@ func fatal(msg string, args ...any) {
 }
 
 // requestLogger — request-id middleware (карточка 02 плана prod-10of10):
-// входящий X-Request-ID сохраняется (чтобы сквозной trace можно было начать
-// с клиента), иначе генерируется 16-hex; id возвращается в ответе и попадает
-// в JSON-лог завершения запроса.
+// входящий X-Request-ID сохраняется, если «безопасен» (validRequestID —
+// чтобы сквозной trace можно было начать с клиента), иначе генерируется
+// 16-hex; id возвращается в ответе и попадает в JSON-лог завершения запроса.
 func requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rid := r.Header.Get("X-Request-ID")
-		if rid == "" {
+		if !validRequestID(rid) {
 			rid = newRequestID()
 		}
 		w.Header().Set("X-Request-ID", rid)
@@ -609,13 +609,42 @@ func requestLogger(next http.Handler) http.Handler {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		start := time.Now()
 		next.ServeHTTP(rec, r)
-		slog.Info("http request",
+		// Healthcheck compose (каждые 10 с) и скрейп /metrics (каждые 15 с,
+		// #125) бьют постоянно: на INFO такой регулярный шум топит полезные
+		// записи, для этих путей уровень — Debug.
+		logFn := slog.Info
+		if strings.HasPrefix(r.URL.Path, "/health") || strings.HasPrefix(r.URL.Path, "/metrics") {
+			logFn = slog.Debug
+		}
+		logFn("http request",
 			"request_id", rid,
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", rec.status,
+			"client_ip", httpx.ClientIP(r),
 			"duration_ms", time.Since(start).Milliseconds())
 	})
+}
+
+// maxRequestIDLen — потолок длины входящего X-Request-ID: длиннее — не id,
+// а попытка раздуть строку лога (её размер ограничен 1 МБ).
+const maxRequestIDLen = 64
+
+// validRequestID принимает входящий id только в «безопасном» виде: печатный
+// ASCII без кавычек и управляющих символов и не длиннее maxRequestIDLen.
+// Всё остальное (мусор, перебор, инъекция управляющих символов в лог)
+// заменяется сгенерированным id; пустой заголовок тоже даёт генерацию.
+func validRequestID(rid string) bool {
+	if rid == "" || len(rid) > maxRequestIDLen {
+		return false
+	}
+	for i := 0; i < len(rid); i++ {
+		c := rid[i]
+		if c < 0x20 || c > 0x7E || c == '"' || c == '\'' {
+			return false
+		}
+	}
+	return true
 }
 
 // statusRecorder ловит статус для лога: WriteHeader может не вызываться

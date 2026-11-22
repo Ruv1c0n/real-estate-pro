@@ -10,7 +10,7 @@
 package ratelimit
 
 import (
-	"log"
+	"log/slog"
 	"net/http"
 	"net/netip"
 	"strconv"
@@ -117,7 +117,9 @@ func (p *PerIP) Middleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		if a.warn {
-			log.Printf("WARN: rate limit exceeded for %s on %s", ip, r.URL.Path)
+			// Русский смысл стаба: WARN об отказе. Пишется только на первый
+			// отказ в окне (см. admit) — флуд брутфорса не заваливает журнал.
+			slog.Warn("rate limit exceeded", "client_ip", ip, "path", r.URL.Path)
 		}
 		w.Header().Set("Retry-After", strconv.Itoa(a.retryAfter))
 		http.Error(w, `{"error":"rate_limited"}`, http.StatusTooManyRequests)
@@ -177,7 +179,9 @@ func (p *PerIP) admit(ip string) admission {
 // выкинуть честных клиентов. Вызывается только под мьютексом.
 func (p *PerIP) admitFallbackLocked() admission {
 	if !p.overflowWarned {
-		log.Printf("WARN: rate limit: карта переполнена (cap %d записей) — новые IP обслуживает общий fallback-бакет", p.maxEntries)
+		// Русский смысл стаба: «карта переполнена (cap записей) — новые IP
+		// обслуживает общий fallback-бакет».
+		slog.Warn("rate limit: map overflow, new IPs served by shared fallback bucket", "max_entries", p.maxEntries)
 		p.overflowWarned = true
 	}
 	if p.fallback.Allow() {

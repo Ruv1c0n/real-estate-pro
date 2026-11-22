@@ -2,7 +2,9 @@ package ratelimit
 
 import (
 	"bytes"
+	"encoding/json"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +15,17 @@ import (
 
 	"golang.org/x/time/rate"
 )
+
+// captureSlog перехватывает slog-логер прод-JSON-хендлером (карточка 02):
+// тесты проверяют прод-формат, а не fallback-рендеринг дефолтного хендлера.
+func captureSlog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+	return &buf
+}
 
 func TestPerIPAllowsBurstThenDenies(t *testing.T) {
 	// 3 события в минуту на IP: burst=3 — три запроса подряд проходят,
@@ -66,11 +79,10 @@ func TestMiddlewareReturns429WithRetryAfter(t *testing.T) {
 		t.Fatalf("первый запрос вернул %d, ожидается 200", rec.Code)
 	}
 
-	// Захват стандартного логера: WARN об отказе обязан содержать IP, но
-	// один раз на окно — иначе брутфорс флудом заваливает журнал (п.3).
-	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	// Захват slog-логера через прод-JSON-хендлер (карточка 02): WARN об
+	// отказе обязан содержать client_ip, но один раз на окно — иначе
+	// брутфорс флудом заваливает журнал (п.3).
+	buf := captureSlog(t)
 
 	rec = httptest.NewRecorder()
 	handler(rec, req)
@@ -85,8 +97,16 @@ func TestMiddlewareReturns429WithRetryAfter(t *testing.T) {
 	if body := rec.Body.String(); !strings.Contains(body, `"rate_limited"`) {
 		t.Fatalf("тело 429 без json-ошибки: %q", body)
 	}
-	if n := strings.Count(buf.String(), "192.0.2.10"); n != 1 {
-		t.Fatalf("IP встречается в логе %d раз, ожидается 1 (WARN только на первый 429): %q", n, buf.String())
+	logged := buf.String()
+	if n := strings.Count(logged, "rate limit exceeded"); n != 1 {
+		t.Fatalf("WARN об отказе встречается %d раз, ожидается 1 (только на первый 429): %q", n, logged)
+	}
+	var rec429 map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(logged)), &rec429); err != nil {
+		t.Fatalf("строка лога не JSON: %v: %q", err, logged)
+	}
+	if rec429["client_ip"] != "192.0.2.10" || rec429["path"] != "/debug/event" {
+		t.Fatalf("в WARN нет client_ip/path: %v", rec429)
 	}
 }
 
@@ -336,7 +356,7 @@ func TestMapCapOverflowUsesFallback(t *testing.T) {
 	if n != 3 {
 		t.Fatalf("после fallback-отказов карта выросла до %d записей", n)
 	}
-	if cnt := strings.Count(buf.String(), "переполнена"); cnt != 1 {
+	if cnt := strings.Count(buf.String(), "map overflow"); cnt != 1 {
 		t.Fatalf("WARN о переполнении встречается %d раз, ожидается 1 (флаг): %q", cnt, buf.String())
 	}
 }
