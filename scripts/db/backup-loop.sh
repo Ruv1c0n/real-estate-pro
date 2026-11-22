@@ -130,6 +130,7 @@ verify_last_dump() (
     # 0700 и gosu postgres туда не доходит, а кластер пишет под postgres.
     tmpdir=$(mktemp -d)
     chmod 777 "$tmpdir" # postgres'у нужны запись/траверс; каталог одноразовый
+    # shellcheck disable=SC2329 — функция вызывается непрямым путём: trap cleanup EXIT ниже
     cleanup() {
         [ -n "$pgpid" ] && kill "$pgpid" 2>/dev/null
         rm -rf "$tmpdir"
@@ -146,12 +147,10 @@ verify_last_dump() (
     gosu postgres initdb -D "$tmpdir/data" -U "$PG_USER" -A trust >/dev/null
     gosu postgres postgres -D "$tmpdir/data" -p 55432 -k "$tmpdir" > "$tmpdir/pg.log" 2>&1 &
     pgpid=$!
-    local i
-    for i in $(seq 1 30); do
+    for _ in $(seq 1 30); do
         pg_isready -q -h 127.0.0.1 -p 55432 && break
         sleep 1
     done
-
     # initdb создаёт пустой кластер (только postgres/template0/1): целевой
     # БД нет — создаём под тем же PG_USER, иначе pg_restore в неё падает.
     createdb -h 127.0.0.1 -p 55432 -U "$PG_USER" "$PG_DB" \
@@ -238,7 +237,11 @@ if [ "$BACKUP_ON_START" = "1" ]; then
     # Стартовый дамп: свежий volume → мгновенно есть .last-success; также
     # это приёмка карточки 06 на живом стенде без ожидания ночи.
     if wait_for_pg; then
-        dump && prune || log "стартовый бэкап не удался — продолжаем по расписанию"
+        if dump && prune; then
+            : # стартовый дамп и prune прошли
+        else
+            log "стартовый бэкап не удался — продолжаем по расписанию"
+        fi
     fi
 fi
 
