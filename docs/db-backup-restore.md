@@ -72,8 +72,9 @@ scripts/db/restore-verify.sh backups/realestate-YYYYmmdd-HHMMSS.dump
 - **Ежедневный дамп** в `BACKUP_AT` (по умолчанию 03:00, `TZ=Europe/Minsk`
   по ТЗ 3.2) + манифест `tbl|rows` — тот же формат, что у
   `scripts/db/backup.sh`.
-- **Retention**: 7 последних дневных + по воскресеньям копия
-  `realestate-weekly-*.dump`, хранится 4.
+- **Retention**: хранятся `RETENTION_DAILY` последних дневных дампов
+  (по умолчанию 7) + по воскресеньям копия `realestate-weekly-*.dump`,
+  хранится `RETENTION_WEEKLY` (4) штук.
 - **Проверка восстановления**: в `BACKUP_VERIFY_DAY` (по умолчанию 7 = вс)
   последний дамп восстанавливается во временный кластер **внутри самого
   контейнера** (`initdb` + `pg_restore`), число строк каждой таблицы
@@ -88,6 +89,11 @@ scripts/db/restore-verify.sh backups/realestate-YYYYmmdd-HHMMSS.dump
   docker compose exec db-backup ls -l /backups/.last-success /backups/.last-verify
   docker compose logs db-backup --tail 20
   ```
+
+  Рядом с маркерами скрипт пишет textfile-совместимые
+  `backup_last_success_timestamp_seconds` / `backup_last_verify_timestamp_seconds`
+  (строка вида `backup_last_success_timestamp_seconds <unix>`) — задел под
+  node-exporter textfile-collector (карточка 03).
 
 - Параметры: `BACKUP_AT`, `BACKUP_VERIFY_DAY`, `BACKUP_ON_START` (1 — дамп
   сразу на старте, удобно для приёмки), `RETENTION_DAILY`,

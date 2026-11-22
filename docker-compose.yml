@@ -170,6 +170,10 @@ services:
       BACKUP_AT: ${BACKUP_AT:-03:00}
       BACKUP_VERIFY_DAY: ${BACKUP_VERIFY_DAY:-7}
       BACKUP_ON_START: ${BACKUP_ON_START:-1}
+      # Ретеншн дампов: сколько последних дневных и weekly-копий хранить
+      # (прокидывается из .env; дефолты совпадают с шапкой backup-loop.sh)
+      RETENTION_DAILY: ${RETENTION_DAILY:-7}
+      RETENTION_WEEKLY: ${RETENTION_WEEKLY:-4}
       TZ: Europe/Minsk
     volumes:
       - backups:/backups

@@ -99,3 +99,24 @@ jobs:
         run: docker compose config -q
       - name: docker compose build
         run: docker compose build
+      # bash -n по всем shell-скриптам: синтаксис ловим до рантайма, когда
+      # скрипт уже смонтирован в контейнер db-backup (backup-loop.sh, ro)
+      - name: bash -n (все scripts/**/*.sh)
+        run: |
+          status=0
+          while IFS= read -r -d '' f; do
+            echo "bash -n $f"
+            bash -n "$f" || status=1
+          done < <(find scripts -type f -name '*.sh' -print0)
+          exit $status
+      # shellcheck по скриптам бэкапов и ops-утилит (в ubuntu-latest входит);
+      # nullglob — шаг не должен падать при отсутствии каталога/файлов
+      - name: shellcheck (scripts/db/*.sh, scripts/ops/*.sh)
+        run: |
+          shopt -s nullglob
+          files=(scripts/db/*.sh scripts/ops/*.sh)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "нет *.sh в scripts/db и scripts/ops — нечего проверять"
+          else
+            shellcheck "${files[@]}"
+          fi
