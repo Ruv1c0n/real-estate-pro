@@ -137,6 +137,9 @@ class PostgresListingStore:
         self._engine = engine
 
     async def get(self, listing_id: int) -> StoredListing | None:
+        if not 1 <= listing_id < 2 ** 63:
+            return None
+
         async with self._engine.connect() as connection:
             return await _get_listing(connection, listing_id)
 

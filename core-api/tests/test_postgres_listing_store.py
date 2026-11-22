@@ -371,3 +371,10 @@ async def test_search_applies_sql_filters(search_store, criteria, expected):
 
     assert [item.external_id for item in result.items] == expected
     assert result.total == len(expected)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("listing_id", [0, -(2**63) - 1, 2**63])
+async def test_get_out_of_range_listing_id(pg_engine, listing_id):
+    store = PostgresListingStore(pg_engine)
+    assert await store.get(listing_id) is None
