@@ -58,8 +58,7 @@ fi
 # wait_for_pg — стартовый дозор: postgres ещё поднимается (depends_on
 # service_healthy снимает большую часть гонки, но re-подключение — НФТ-8).
 wait_for_pg() {
-    local i
-    for i in $(seq 1 60); do
+    for _ in $(seq 1 60); do
         if PGPASSWORD="$PG_PASSWORD" pg_isready -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" >/dev/null 2>&1; then
             return 0
         fi
@@ -130,7 +129,8 @@ verify_last_dump() (
     # 0700 и gosu postgres туда не доходит, а кластер пишет под postgres.
     tmpdir=$(mktemp -d)
     chmod 777 "$tmpdir" # postgres'у нужны запись/траверс; каталог одноразовый
-    # shellcheck disable=SC2329 — функция вызывается непрямым путём: trap cleanup EXIT ниже
+    # Функция вызывается непрямым путём: trap cleanup EXIT ниже.
+    # shellcheck disable=SC2329
     cleanup() {
         [ -n "$pgpid" ] && kill "$pgpid" 2>/dev/null
         rm -rf "$tmpdir"
