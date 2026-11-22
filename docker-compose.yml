@@ -5,6 +5,12 @@ x-logging: &default-logging
   options:
     max-size: "10m"
     max-file: "3"
+x-core-postgres: &core-postgres
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: "${POSTGRES_USER:-app}"
+  POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-app}"
+  POSTGRES_DB: "${POSTGRES_DB:-realestate}"
 
 services:
   postgres:
@@ -52,7 +58,14 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
-
+  core-migrations:
+    build: ./core-api
+    environment: *core-postgres
+    command: ["python", "-m", "alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
   core-api:
     build: ./core-api
     restart: unless-stopped
@@ -60,19 +73,12 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # Данные для подключения передаются отдельными переменными:
-      # core-api сам собирает адрес и экранирует спецсимволы пароля,
-      # поэтому знак @ и другие в POSTGRES_PASSWORD не ломают URL.
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: "5432"
-      POSTGRES_USER: "${POSTGRES_USER:-app}"
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-app}"
-      POSTGRES_DB: "${POSTGRES_DB:-realestate}"
+      <<: *core-postgres
       REDIS_URL: redis://redis:6379/0
       CORE_API_LOG_LEVEL: "${CORE_API_LOG_LEVEL:-INFO}"
     depends_on:
-      postgres:
-        condition: service_healthy
+      core-migrations:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
     # В образе python-slim нет wget/curl — проверяем /health/ready
