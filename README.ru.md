@@ -215,7 +215,10 @@ docker compose down
   пользователь увидел бы повторные сообщения.
 - **core-api** — outbox-воркер использует `FOR UPDATE SKIP LOCKED` (пережил
   бы N воркеров), но рассчитан на один; сам дедуп объявлений — на уровне
-  БД и от числа инстансов не зависит.
+  БД и от числа инстансов не зависит. Кэш справочников (когда включён) —
+  in-process на каждый инстанс: при N инстансах путь инвалидации
+  `cache:version` в Redis нужно проверить и задокументировать
+  (доработка карточки 08-А, ФТ-2.4).
 - **collector** — «параллельные циклы одного источника не допускаются»
   (ФТ-1.4) обеспечивается в-process.
 - **Telegram** — long polling предполагает одного потребителя; путь к
@@ -239,6 +242,7 @@ docker compose down
 - [Real_Estate_Pro_TZ.pdf](docs/Real_Estate_Pro_TZ.pdf) — ТЗ (требования пронумерованы: ФТ-x.x функциональные, НФТ-x нефункциональные).
 - [docs/contracts.md](docs/contracts.md) — актуальные контракты между сервисами (Redis Streams, справочники, outbox). При расхождении с этим README приоритет у contracts.md.
 - [Contributing](CONTRIBUTING.ru.md) — правила веток и коммитов, CI и требования ТЗ к изменению контрактов.
+- [docs/incident-runbook.md](docs/incident-runbook.md) — runbook для дежурного: симптом → диагноз → действия (карточка 09).
 - Доки сервисов: [notifier](notifier/README.md), [core-api](core-api/README.md), [collector](collector/README.md).
 
 ### Архитектура и диаграммы (GitHub Pages)

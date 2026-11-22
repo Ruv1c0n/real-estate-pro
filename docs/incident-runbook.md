@@ -5,9 +5,12 @@
 > чтения исходников на 3 часа ночи.
 >
 > **Корреляция**: сквозной путь объявления — по `event_id` (поле контракта
-> listings.new, ТЗ 4.3; логируется во всех сервисах после PR #124).
+> listings.new, ТЗ 4.3). В notifier `event_id` в логах — после PR #124;
+> в core-api логирование event_id ещё не реализовано (core-часть карточки 02
+> — отдельный PR), поэтому grep по event_id в core-логах вернёт пусто —
+> в §5 трассировка core-стороны идёт через SQL по outbox.
 > HTTP-запросы — по `X-Request-ID` (в логах `request_id`, ответ отдаёт
-> заголовок). Метрики — `GET :8080/metrics` (после PR #125).
+> заголовок; после PR #124). Метрики — `GET :8080/metrics` (после PR #125).
 
 Общие команды:
 
@@ -35,8 +38,8 @@ docker compose exec redis redis-cli XPENDING listings.new notifier
 # 1. Жив ли postgres и что в логах notifier
 docker compose ps
 docker compose logs notifier --tail 50 | grep -E '"level":"ERROR"'
-# 2. Кто держит pending
-docker compose exec redis redis-cli XPENDING listings.new notifier - IDLE 30000
+# 2. Кто давний (idle) держит pending — форма IDLE + диапазон + count
+docker compose exec redis redis-cli XPENDING listings.new notifier IDLE 30000 - + 20
 # 3. Точные причины по последним event_id
 docker compose logs notifier --tail 200 | grep handle
 ```
@@ -64,7 +67,8 @@ docker compose exec redis redis-cli XRANGE listings.dead - +
 
 ## 3. Отложенные задания копятся (deferred растёт)
 
-**Симптом**: `notifier_deferred_jobs` растёт и не дренажируется.
+**Симптом**: `notifier_deferred_jobs` растёт и не дренажируется
+(в db-режиме; в memory-режиме гейдж не обновляется — смотри SQL ниже).
 
 **Вероятные причины**:
 1. Честный лимит 30/час на активного пользователя — временно, дренаж
@@ -93,11 +97,14 @@ issue #111, причина будет в колонке `reason`).
 
 **Шаги**:
 ```bash
-docker compose logs core-api --tail 50 | grep -E '"level":"(ERROR|WARNING)"'
+docker compose logs core-api --tail 50 | grep -iE 'error|warning'
+# (core-api пока пишет plain-text логи; JSON-формат появится с core-частью
+# карточки 02 — до того паттерн "level":"ERROR" вернёт пусто)
 # Частая причина на чистом volume: схема core не накатилась.
-# (после мержа PR #115 миграции в compose автоматические; до того — вручную)
+# Миграции в compose станут автоматическими с issue #115 (one-shot
+# сервис db-migrate); до того — вручную:
 docker compose exec postgres psql -U app -d realestate -c \
-  "SELECT version_num FROM core.alembic_version;"
+  "SELECT version_num FROM public.alembic_version;"
 cd core-api && alembic current && alembic upgrade head
 ```
 Если `relation ... does not exist` — это схема; если 422 — это валидация,
@@ -107,18 +114,25 @@ cd core-api && alembic current && alembic upgrade head
 
 **Шаги**: трассировка по event_id от публикации до доставки:
 ```bash
-# 1. Событие вообще опубликовано?
-docker compose logs core-api | grep <event_id>
-# 2.Notifier его взял и обработал?
+# 1. Событие опубликовано outbox'ом? (core-api event_id в логах не пишет,
+#    смотрим напрямую в БД — после мержа #96; до него outbox in-memory
+#    и трассировка начинается с notifier-стороны)
+docker compose exec postgres psql -U app -d realestate -c \
+  "SELECT id, published_at FROM core.outbox_events
+   WHERE payload->>'event_id' = '<event_id>';"
+# 2. Notifier его взял и обработал? (после PR #124)
 docker compose logs notifier | grep <event_id>
 # 3. Совпадение по подпискам было? Что решил dispatcher?
 # ищем match/deferred/rate limited/unknown по этому event_id
 ```
-Ветвление: нет в core-логах → outbox не опубликовал (см. backlog-метрику,
-после мержа #96); есть в notifier, нет match → подписки не совпали (проверить
-`/list` у пользователя); есть match, статус `unknown` в журнале → ошибка
-Telegram, авто-повтора нет по contracts.md §2 (повтор — явной повторной
-публикацией); статус `deferred` → лимит 30/час, ждём флешер (§3).
+Ветвление: пусто в `outbox_events` → событие не дошло до outbox (проблема
+POST-пути, см. §4); строка есть, `published_at IS NULL` → outbox не
+опубликовал в Redis (backlog считается тем же SQL; метрики outbox —
+отдельный PR, core-часть карточки 01); есть в notifier, нет match →
+подписки не совпали (проверить `/list` у пользователя); есть match,
+статус `unknown` в журнале → ошибка Telegram, авто-повтора нет по
+contracts.md §2 (повтор — явной повторной публикацией); статус
+`deferred` → лимит 30/час, ждём флешер (§3).
 
 ## 6. Notifier unhealthy / /health/ready 503
 
@@ -154,9 +168,13 @@ outbox-ретраи в core.
 docker compose exec db-backup ls -l /backups/.last-success
 docker compose logs db-backup --tail 30
 ```
-Частые причины: postgres unhealthy (см. §6-команды для него), volume
-`backups` переполнен (retention чистит сам — проверить права), пароль
-PO не совпал после ротации (см. docs/db-backup-restore.md).
+Частые причины: postgres unhealthy (команды — §1: `docker compose ps`,
+`docker compose logs postgres`), volume `backups` переполнен (retention
+чистит сам — проверить права), пароль `POSTGRES_PASSWORD` не совпал после
+ротации (см. docs/db-backup-restore.md).
+
+Автоматического алерта по маркеру пока нет — он появится с карточкой 03;
+до того проверять вручную командой выше.
 
 ## Что НЕ является инцидентом
 
