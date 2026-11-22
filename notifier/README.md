@@ -51,7 +51,7 @@ cd notifier && go run .
 
 ## Миграции
 
-SQL-миграции схемы `notifier` — [migrations/](migrations/) (`0001_init.sql`, `0002_available_at.sql`). Готовит Илья; применение при деплое — зона Даниила. `embed.go` вшивает каталог в бинарник.
+SQL-миграции схемы `notifier` — [migrations/](migrations/) (`0001_init.sql`, `0002_available_at.sql`, `0003_reason.sql`). Готовит Илья; применение при деплое — зона Даниила. `embed.go` вшивает каталог в бинарник.
 
 ## Тесты
 
