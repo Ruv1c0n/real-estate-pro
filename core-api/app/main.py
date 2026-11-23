@@ -9,10 +9,11 @@ from app.config import settings
 from app.database import create_db_engine
 from app.error_handlers import register_error_handlers
 from app.health import router as health_router
-from app.in_memory_listing_store import InMemoryListingStore
+from app.listing_body_limit import ListingBodyLimit
 from app.listings import router as listings_router
 from app.logging_setup import setup_logging
 from app.outbox import run_outbox_worker
+from app.postgres_listing_store import PostgresListingStore
 from app.redis_client import create_redis_client
 
 logger = logging.getLogger(__name__)
@@ -29,7 +30,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         redis_client = create_redis_client(settings.redis_url)
         stack.push_async_callback(redis_client.aclose)
 
-        store = InMemoryListingStore()
+        store = PostgresListingStore(db_engine)
         application.state.db_engine = db_engine
         application.state.redis = redis_client
         application.state.listing_store = store
@@ -56,6 +57,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(ListingBodyLimit)
 register_error_handlers(app)
 app.include_router(health_router)
 app.include_router(listings_router)

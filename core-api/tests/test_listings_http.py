@@ -5,6 +5,8 @@ from threading import Event
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from app.in_memory_listing_store import InMemoryListingStore
+from app.listing_store import UnknownListingReferenceError
 from app.main import app
 from fastapi.testclient import TestClient
 
@@ -19,7 +21,11 @@ def redis_client(monkeypatch):
 
 
 @pytest.fixture
-def client(redis_client):
+def client(redis_client, monkeypatch):
+    monkeypatch.setattr(
+        "app.main.PostgresListingStore",
+        lambda engine: InMemoryListingStore(),
+    )
     with TestClient(app) as test_client:
         yield test_client
 
@@ -217,3 +223,41 @@ def test_created_listing_is_published_by_worker(client, redis_client, payload):
     event = json.loads(fields["data"], parse_float=Decimal)
     assert event["id"] == response.json()["id"]
     assert event["price"] == Decimal("380.25")
+
+
+def test_create_returns_422_for_unknown_reference(client, payload, monkeypatch):
+    message = "Неизвестный источник, город для указанной страны или валюта"
+    monkeypatch.setattr(
+        app.state.listing_store,
+        "create_or_get",
+        AsyncMock(side_effect=UnknownListingReferenceError(message)),
+    )
+
+    response = client.post(URL, json=payload)
+
+    assert response.status_code == 422, response.text
+    body = response.json()
+    assert body["error"]
+    assert body["message"] == message
+
+
+def test_post_body_limit_in_bytes(client, payload, monkeypatch):
+    body = json.dumps({**payload, "title": "Квартира"}, ensure_ascii=False).encode(
+        "utf-8"
+    )
+    monkeypatch.setattr("app.listing_body_limit.MAX_LISTING_BODY_BYTES", len(body))
+    headers = {"Content-Type": "application/json"}
+
+    allowed = client.post(URL, content=body, headers=headers)
+    assert allowed.status_code == 201, allowed.text
+
+    rejected = client.post(URL, content=body + b" ", headers=headers)
+    assert rejected.status_code == 413, rejected.text
+    assert rejected.json()["error"] == "payload_too_large"
+
+
+def test_post_field_limit_returns_422(client, payload):
+    response = client.post(URL, json={**payload, "title": "я" * 257})
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"] == "validation_error"
