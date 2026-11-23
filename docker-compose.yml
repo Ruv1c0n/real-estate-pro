@@ -97,11 +97,31 @@ services:
       CORE_API_URL: http://core-api:8000
       REDIS_URL: redis://redis:6379/0
       MOCK_MODE: "true"
+      # ФТ-1.8: stream — новая запись раз в 5–30 с (планировщик пакетного
+      # сбора отключается), batch (по умолчанию) — дамп по расписанию
+      # COLLECT_INTERVAL_SECONDS (15 мин по умолчанию).
+      MOCK_PUBLISH_MODE: "${MOCK_PUBLISH_MODE:-batch}"
+      ADMIN_KEY: ${ADMIN_KEY:-}
+      # Реквизиты внешнего источника при MOCK_MODE=false (НФТ-1): задаются
+      # в .env; без них collector сообщит об ошибке и перейдёт на mock
+      # (ФТ-1.2). Пока не заданы, значения пустые и не читаются.
+      SOURCE_API_URL: ${SOURCE_API_URL:-}
+      SOURCE_API_TOKEN: ${SOURCE_API_TOKEN:-}
     depends_on:
       core-api:
         condition: service_healthy
-    # TODO(#17): healthcheck добавим вместе с реализацией collector
-    # (сейчас в образе только Dockerfile-заглушка — проверять нечего).
+      redis:
+        condition: service_healthy
+    # /health/ready отвечает 200 только при доступных Core API и Redis;
+    # справочники (dicts) отражаются в ответе, но готовность не валят —
+    # нормализация деградирует, а не останавливается. В образе
+    # python-slim нет wget/curl — проверяем средствами python (как core-api).
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://127.0.0.1:8001/health/ready', timeout=2)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   notifier:
     build: ./notifier

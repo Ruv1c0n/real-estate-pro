@@ -81,12 +81,12 @@ TELEGRAM_BOT_TOKEN=your_token
 ADMIN_KEY=key_for_debug_event
 ```
 
-Without a token, notifier writes matches to stdout. In the current Compose, `MOCK_MODE` is set directly to `true`; the Python mock logic does not exist yet. Adding the variable to `.env` by itself does not change the value hardcoded in Compose.
+Without a token, notifier writes matches to stdout. In the current Compose, `MOCK_MODE` is set directly to `true` and collector reads it from its configuration; other collector variables (`MOCK_PUBLISH_MODE`, source credentials) can be set in `.env`.
 
 Once the skeleton is up:
 
 - `http://localhost:8000` — core-api skeleton: `/health`, `/health/live` and `/health/ready` endpoints are served; the listings API and reference data are not implemented yet.
-- `http://localhost:8001` — collector placeholder: an HTTP server is running; the real application is not implemented yet.
+- `http://localhost:8001` — collector: listings UI (list with filters + card page), admin endpoints `POST /collect/run` / `GET /collect/runs/{run_id}` behind `X-Admin-Key`, and `/health`, `/health/ready`.
 - `http://localhost:8080/health` — notifier health check: Redis and Core API reference data availability, delivery mode (telegram/log).
 - `http://localhost:8080/health/ready` — readiness check: 200 only when Redis, Core API reference data and, in db mode, PostgreSQL are available; otherwise 503 with the same JSON body.
 - `POST http://localhost:8080/debug/event` with the `X-Admin-Key` header — a demo event: the body is validated and published to the `listings.new` stream, going through the regular delivery path. If `ADMIN_KEY` is not set, the endpoint responds with 404.
@@ -120,9 +120,9 @@ With `.env` filled in, startup is a single `docker compose up --build`.
 | `NOTIFIER_WORKERS` | Worker pool size for the `listings.new` consumer (spec 3.6; default matches the spec — 8) |
 | `NOTIFIER_STREAM_LEN_THRESHOLD` | Soft WARN threshold for `listings.new` stream length (a sign of consumer lag; default 10000); the WARN does not affect delivery and does not trim the stream |
 | `NOTIFIER_STREAM_CLEANUP_INTERVAL` | Period of the safe stream cleanup — only confirmed records behind the min-pending boundary are deleted (spec 4.3; default 5m) |
-| `MOCK_MODE` | `true` by default; still needs to be wired into collector configuration |
-| `MOCK_PUBLISH_MODE` | `batch` by default or `stream`; to be implemented |
-| Admin key | Variable `ADMIN_KEY`, header `X-Admin-Key`; an empty value disables `/debug/event` |
+| `MOCK_MODE` | `true` by default; wired into collector configuration (local mock source) |
+| `MOCK_PUBLISH_MODE` | `batch` by default (dump on schedule) or `stream` (a new record every 5–30 s; the batch scheduler is disabled in stream mode) |
+| Admin key | Variable `ADMIN_KEY`, header `X-Admin-Key`; an empty value disables `/debug/event` (notifier) and opens collector `/collect/*` in dev mode |
 | API credentials | The set of variables is determined by the chosen method and its authorization |
 
 Default parameters: cache TTL 600 s, collection every 15 minutes, up to five delivery retries after the first attempt with 1–30 s delays, up to 10 subscriptions and 30 notifications per rolling hour per user, eight notifier workers. Data exchange uses UTC; display and scheduling use Europe/Minsk.
