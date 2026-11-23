@@ -1,3 +1,17 @@
 FROM python:3.15-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /app
-CMD ["python", "-m", "http.server", "8001"]
+
+COPY requirements.txt .
+RUN python -m pip install --no-cache-dir -r requirements.txt
+
+COPY app ./app
+COPY templates ./templates
+COPY data ./data
+
+EXPOSE 8001
+
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001"]

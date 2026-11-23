@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Объявления — collector</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/htmx.min.js" defer></script>
+</head>
+<body>
+<main>
+  <h1>Объявления о недвижимости</h1>
+  <p class="note">
+    Данные отдаёт Core API. Записи с отметкой
+    <span class="badge">синтетические данные (mock)</span> сгенерированы
+    для демонстрации.
+  </p>
+  <form hx-get="/listings" hx-target="#results" class="filters">
+    <label>Сделка
+      <select name="deal_type">
+        <option value="">любая</option>
+        <option value="rent" {% if filters.deal_type == "rent" %}selected{% endif %}>аренда</option>
+        <option value="sale" {% if filters.deal_type == "sale" %}selected{% endif %}>продажа</option>
+      </select>
+    </label>
+    <label>Страна <input name="country" maxlength="2" placeholder="BY" value="{{ filters.country or '' }}"></label>
+    <label>Город <input name="city" placeholder="Minsk" value="{{ filters.city or '' }}"></label>
+    <label>Комнаты <input name="rooms" type="number" min="0" value="{{ filters.rooms or '' }}"></label>
+    <label>Цена от ($) <input name="price_min" type="number" min="0" value="{{ filters.price_min or '' }}"></label>
+    <label>Цена до ($) <input name="price_max" type="number" min="0" value="{{ filters.price_max or '' }}"></label>
+    <label>м² от <input name="area_min" type="number" step="0.1" min="0" value="{{ filters.area_min or '' }}"></label>
+    <label>м² до <input name="area_max" type="number" step="0.1" min="0" value="{{ filters.area_max or '' }}"></label>
+    <label>Источник <input name="source" placeholder="mock" value="{{ filters.source or '' }}"></label>
+    <label>Сортировка
+      <select name="sort">
+        {% for value, label in sort_labels.items() %}
+        <option value="{{ value }}" {% if filters.sort == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <button type="submit">Показать</button>
+    <a href="/listings" class="reset">Сбросить</a>
+  </form>
+  {% include "_results.html" %}
+</main>
+</body>
+</html>

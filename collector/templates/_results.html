@@ -1,0 +1,49 @@
+<div id="results">
+{% if error %}
+  <p class="error">{{ error }}</p>
+{% elif items %}
+  <p class="meta">Найдено: {{ total }} · страница {{ page }} из {{ total_pages }}</p>
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th><th>Заголовок</th><th>Сделка</th><th>Страна / город</th>
+        <th>Комнаты</th><th>м²</th><th>Цена</th><th>Источник</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in items %}
+      <tr>
+        <td>{{ item.id }}</td>
+        <td><a href="/listings/{{ item.id }}">{{ item.title or "Без заголовка" }}</a></td>
+        <td>{{ item.deal_type_label }}</td>
+        <td>{{ item.country }} / {{ item.city }}</td>
+        <td>{{ "студия" if item.rooms == 0 else item.rooms }}</td>
+        <td>{{ item.area_m2 if item.area_m2 is not none else "—" }}</td>
+        <td>{{ item.price }} {{ item.currency }} <span class="usd">≈ ${{ item.price_usd }}</span></td>
+        <td>
+          {{ item.source }}
+          {% if item.source == "mock" %}<span class="badge">синтетические данные</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <nav class="pager">
+    {% if page > 1 %}
+    <a href="/listings?page={{ page - 1 }}{% if pager_query %}&{{ pager_query }}{% endif %}"
+       hx-get="/listings?page={{ page - 1 }}{% if pager_query %}&{{ pager_query }}{% endif %}"
+       hx-target="#results">← Назад</a>
+    {% endif %}
+    {% if page < total_pages %}
+    <a href="/listings?page={{ page + 1 }}{% if pager_query %}&{{ pager_query }}{% endif %}"
+       hx-get="/listings?page={{ page + 1 }}{% if pager_query %}&{{ pager_query }}{% endif %}"
+       hx-target="#results">Вперёд →</a>
+    {% endif %}
+  </nav>
+{% else %}
+  <p class="empty">
+    Ничего не найдено. Измените фильтры или запустите сбор:
+    <code>POST /collect/run</code> с заголовком X-Admin-Key.
+  </p>
+{% endif %}
+</div>

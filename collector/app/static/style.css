@@ -1,0 +1,65 @@
+:root {
+  --bg: #f6f7f9;
+  --text: #22262b;
+  --muted: #6b7480;
+  --accent: #2563eb;
+  --border: #d8dde3;
+  --badge-bg: #fff3cd;
+  --error-bg: #fdecec;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+main { max-width: 960px; margin: 0 auto; padding: 24px 16px 64px; }
+h1 { font-size: 1.5rem; }
+.note, .meta { color: var(--muted); font-size: 0.9rem; }
+.filters {
+  display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end;
+  padding: 12px; background: #fff; border: 1px solid var(--border);
+  border-radius: 8px; margin-bottom: 16px;
+}
+.filters label {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 0.8rem; color: var(--muted);
+}
+.filters input, .filters select {
+  padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
+  font-size: 0.9rem; min-width: 90px;
+}
+.filters button {
+  padding: 8px 14px; border: 0; border-radius: 6px;
+  background: var(--accent); color: #fff; cursor: pointer;
+}
+.filters .reset { align-self: center; color: var(--muted); }
+table {
+  width: 100%; border-collapse: collapse; background: #fff;
+  border: 1px solid var(--border); border-radius: 8px;
+}
+th, td {
+  text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border);
+  font-size: 0.9rem; vertical-align: top;
+}
+th { color: var(--muted); font-weight: 600; background: #fbfcfd; }
+td a { color: var(--accent); text-decoration: none; }
+td a:hover { text-decoration: underline; }
+.usd { color: var(--muted); font-size: 0.85em; }
+.badge {
+  display: inline-block; padding: 2px 8px; margin-left: 6px;
+  border-radius: 10px; background: var(--badge-bg); font-size: 0.75rem;
+}
+.error { padding: 10px 12px; border-radius: 8px; background: var(--error-bg); }
+.empty { color: var(--muted); }
+.pager { margin-top: 12px; display: flex; gap: 16px; }
+.pager a { color: var(--accent); text-decoration: none; }
+dl.card {
+  display: grid; grid-template-columns: 160px 1fr; gap: 6px 16px;
+  background: #fff; border: 1px solid var(--border); border-radius: 8px;
+  padding: 16px; margin: 0;
+}
+dl.card dt { color: var(--muted); }
+dl.card dd { margin: 0; }
+code { background: #eceff2; padding: 1px 5px; border-radius: 4px; }

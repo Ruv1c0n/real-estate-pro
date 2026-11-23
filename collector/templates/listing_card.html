@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Объявление — collector</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main>
+  {% if error %}
+    <p class="error">{{ error }}</p>
+    <p><a href="/listings">← К списку</a></p>
+  {% elif item %}
+    <h1>{{ item.title or "Объявление #" ~ item.id }}</h1>
+    {% if item.source == "mock" %}
+    <p><span class="badge">синтетические данные (mock)</span></p>
+    {% endif %}
+    <dl class="card">
+      <dt>Тип сделки</dt><dd>{{ deal_type_label or item.deal_type }}</dd>
+      <dt>Расположение</dt><dd>{{ item.country }} / {{ item.city }}</dd>
+      <dt>Комнаты</dt><dd>{{ "студия (0)" if item.rooms == 0 else item.rooms }}</dd>
+      <dt>Площадь</dt><dd>{{ item.area_m2 if item.area_m2 is not none else "—" }} м²</dd>
+      <dt>Этаж</dt><dd>{{ item.floor if item.floor is not none else "—" }}</dd>
+      <dt>Цена</dt><dd>{{ item.price }} {{ item.currency }} <span class="usd">≈ ${{ item.price_usd }}</span></dd>
+      <dt>Адрес</dt><dd>{{ item.address or "—" }}</dd>
+      <dt>Опубликовано</dt><dd>{{ item.published_at or "—" }}</dd>
+      <dt>Источник</dt><dd>{{ item.source }}</dd>
+      <dt>Фото</dt><dd>{{ item.photos | length if item.photos else "—" }}</dd>
+    </dl>
+    {% if item.description %}
+    <h2>Описание</h2>
+    <p>{{ item.description }}</p>
+    {% endif %}
+    {% if source_url %}
+    <p><a href="{{ source_url }}" target="_blank" rel="noopener">Открыть источник ↗</a></p>
+    {% endif %}
+    <p><a href="/listings">← К списку</a></p>
+  {% endif %}
+</main>
+</body>
+</html>

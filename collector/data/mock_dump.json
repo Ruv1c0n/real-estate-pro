@@ -1,0 +1,642 @@
+[
+ {
+  "source": "mock",
+  "external_id": "seed-000001",
+  "deal_type": "rent",
+  "country": "BY",
+  "city": "Minsk",
+  "rooms": "студия",
+  "area_m2": 86.7,
+  "price": 427,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000001",
+  "title": "Студия, 86.7 м²",
+  "address": "ул. Гагарина, 78",
+  "description": "Удобная транспортная развязка, Светлая квартира после ремонта",
+  "floor": 1,
+  "photos": [
+   "http://mock.example/img/seed-000001_1.jpg"
+  ],
+  "published_at": "2026-11-11T11:15:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000002",
+  "deal_type": "sale",
+  "country": "BY",
+  "city": "Brest",
+  "rooms": 4,
+  "area_m2": 57.8,
+  "price": 717,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000002",
+  "title": "4-к квартира, 57.8 м²",
+  "address": "ул. Независимости, 98",
+  "description": "<b>Рядом школа и детский сад, Балкон с видом на парк</b>",
+  "floor": 6,
+  "photos": [
+   "http://mock.example/img/seed-000002_1.jpg"
+  ],
+  "published_at": "2026-11-15T12:15:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000003",
+  "deal_type": "sale",
+  "country": "BY",
+  "city": "Grodno",
+  "rooms": 3,
+  "area_m2": 28.7,
+  "price": 1283,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000003",
+  "title": "3-к квартира, 28.7 м²",
+  "address": "ул. Гагарина, 47",
+  "description": "Балкон с видом на парк, Светлая квартира после ремонта",
+  "floor": 4,
+  "photos": [
+   "http://mock.example/img/seed-000003_1.jpg"
+  ],
+  "published_at": "2026-11-16T09:30:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000004",
+  "deal_type": "rent",
+  "country": "BY",
+  "city": "Minsk",
+  "rooms": 0,
+  "area_m2": 79.5,
+  "price": 1177,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000004",
+  "title": "Студия, 79.5 м²",
+  "address": "ул. Независимости, 86",
+  "description": "<b>Балкон с видом на парк, Тихий район, зелёный двор</b>",
+  "floor": 5,
+  "photos": [
+   "http://mock.example/img/seed-000004_1.jpg"
+  ],
+  "published_at": "2026-11-12T13:30:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000005",
+  "deal_type": "rent",
+  "country": "BY",
+  "city": "Brest",
+  "rooms": 0,
+  "area_m2": 74.8,
+  "price": 323,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000005",
+  "title": "<b>Студия, 74.8 м²</b>",
+  "address": "ул. Независимости, 5",
+  "description": "<i>Тихий район, зелёный двор, Рядом школа и детский сад</i>",
+  "floor": 6,
+  "photos": [
+   "http://mock.example/img/seed-000005_1.jpg"
+  ],
+  "published_at": "2026-11-22T20:00:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000006",
+  "deal_type": "sale",
+  "country": "BY",
+  "city": "Grodno",
+  "rooms": "студия",
+  "area_m2": 39.0,
+  "price": 1418,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000006",
+  "title": "Студия, 39.0 м²",
+  "address": "ул. Гагарина, 55",
+  "description": "<i>Балкон с видом на парк, Удобная транспортная развязка</i>",
+  "floor": 7,
+  "photos": [
+   "http://mock.example/img/seed-000006_1.jpg"
+  ],
+  "published_at": "2026-11-12T11:30:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000007",
+  "deal_type": "rent",
+  "country": "BY",
+  "city": "Minsk",
+  "rooms": 1,
+  "area_m2": 65.9,
+  "price": 209,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000007",
+  "title": "1-к квартира, 65.9 м²",
+  "address": "ул. Гагарина, 33",
+  "description": "<b>Рядом школа и детский сад, Балкон с видом на парк</b>",
+  "floor": 9,
+  "photos": [
+   "http://mock.example/img/seed-000007_1.jpg"
+  ],
+  "published_at": "2026-11-16T14:45:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000008",
+  "deal_type": "sale",
+  "country": "BY",
+  "city": "Brest",
+  "rooms": "студия",
+  "area_m2": 81.2,
+  "price": 735,
+  "currency": "BYN",
+  "url": "http://mock.example/listing/seed-000008",
+  "title": "Студия, 81.2 м²",
+  "address": "ул. Гагарина, 98",
+  "description": "<i>Светлая квартира после ремонта, Тихий район, зелёный двор</i>",
+  "floor": 3,
+  "photos": [
+   "http://mock.example/img/seed-000008_1.jpg"
+  ],
+  "published_at": "2026-11-17T08:30:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000009",
+  "deal_type": "rent",
+  "country": "BY",
+  "city": "Grodno",
+  "rooms": 0,
+  "area_m2": 98.3,
+  "price": 503,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000009",
+  "title": "<b>Студия, 98.3 м²</b>",
+  "address": "ул. Садовая, 40",
+  "description": "<b>Удобная транспортная развязка, Светлая квартира после ремонта</b>",
+  "floor": 4,
+  "photos": [
+   "http://mock.example/img/seed-000009_1.jpg"
+  ],
+  "published_at": "2026-11-17T08:00:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000010",
+  "deal_type": "sale",
+  "country": "BY",
+  "city": "Minsk",
+  "rooms": 4,
+  "area_m2": 105.2,
+  "price": 201,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000010",
+  "title": "4-к квартира, 105.2 м²",
+  "address": "ул. Гагарина, 78",
+  "description": "Рядом школа и детский сад, Удобная транспортная развязка",
+  "floor": 7,
+  "photos": [
+   "http://mock.example/img/seed-000010_1.jpg"
+  ],
+  "published_at": "2026-11-18T10:30:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000011",
+  "deal_type": "sale",
+  "country": "BY",
+  "city": "Brest",
+  "rooms": 4,
+  "area_m2": 88.0,
+  "price": 3210,
+  "currency": "BYN",
+  "url": "http://mock.example/listing/seed-000011",
+  "title": "4-к квартира, 88.0 м²",
+  "address": "ул. Независимости, 29",
+  "description": "Тихий район, зелёный двор, Балкон с видом на парк",
+  "floor": 2,
+  "photos": [
+   "http://mock.example/img/seed-000011_1.jpg"
+  ],
+  "published_at": "2026-11-18T15:00:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000012",
+  "deal_type": "rent",
+  "country": "BY",
+  "city": "Grodno",
+  "rooms": 4,
+  "area_m2": 69.9,
+  "price": 915,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000012",
+  "title": "<b>4-к квартира, 69.9 м²</b>",
+  "address": "ул. Притыцкого, 66",
+  "description": "Светлая квартира после ремонта, Рядом школа и детский сад",
+  "floor": 4,
+  "photos": [
+   "http://mock.example/img/seed-000012_1.jpg"
+  ],
+  "published_at": "2026-11-11T08:30:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000013",
+  "deal_type": "sale",
+  "country": "BY",
+  "city": "Минск",
+  "rooms": 3,
+  "area_m2": 39.3,
+  "price": 267,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000013",
+  "title": "3-к квартира, 39.3 м²",
+  "address": "ул. Мира, 53",
+  "description": "<i>Балкон с видом на парк, Рядом школа и детский сад</i>",
+  "floor": 8,
+  "photos": [
+   "http://mock.example/img/seed-000013_1.jpg"
+  ],
+  "published_at": "2026-11-20T14:30:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000014",
+  "deal_type": "rent",
+  "country": "BY",
+  "city": "Brest",
+  "rooms": "студия",
+  "area_m2": 80.6,
+  "price": 4477,
+  "currency": "BYN",
+  "url": "http://mock.example/listing/seed-000014",
+  "title": "<b>Студия, 80.6 м²</b>",
+  "address": "ул. Независимости, 55",
+  "description": "Тихий район, зелёный двор, Светлая квартира после ремонта",
+  "floor": 3,
+  "photos": [
+   "http://mock.example/img/seed-000014_1.jpg"
+  ],
+  "published_at": "2026-11-13T16:45:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000015",
+  "deal_type": "rent",
+  "country": "BY",
+  "city": "Grodno",
+  "rooms": 1,
+  "area_m2": 98.7,
+  "price": 187,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000015",
+  "title": "<b>1-к квартира, 98.7 м²</b>",
+  "address": "ул. Мира, 63",
+  "description": "Светлая квартира после ремонта, Удобная транспортная развязка",
+  "floor": 8,
+  "photos": [
+   "http://mock.example/img/seed-000015_1.jpg"
+  ],
+  "published_at": "2026-11-22T11:15:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000016",
+  "deal_type": "rent",
+  "country": "RU",
+  "city": "Moscow",
+  "rooms": 3,
+  "area_m2": 101.2,
+  "price": 313,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000016",
+  "title": "3-к квартира, 101.2 м²",
+  "address": "ул. Независимости, 25",
+  "description": "<i>Балкон с видом на парк, Тихий район, зелёный двор</i>",
+  "floor": 5,
+  "photos": [
+   "http://mock.example/img/seed-000016_1.jpg"
+  ],
+  "published_at": "2026-11-21T20:45:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000017",
+  "deal_type": "sale",
+  "country": "RU",
+  "city": "Kazan",
+  "rooms": "студия",
+  "area_m2": 72.1,
+  "price": 849,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000017",
+  "title": "<b>Студия, 72.1 м²</b>",
+  "address": "ул. Притыцкого, 77",
+  "description": "Балкон с видом на парк, Рядом школа и детский сад",
+  "floor": 2,
+  "photos": [
+   "http://mock.example/img/seed-000017_1.jpg"
+  ],
+  "published_at": "2026-11-18T09:15:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000018",
+  "deal_type": "rent",
+  "country": "RU",
+  "city": "Saint Petersburg",
+  "rooms": 1,
+  "area_m2": 56.3,
+  "price": 1417,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000018",
+  "title": "1-к квартира, 56.3 м²",
+  "address": "ул. Садовая, 27",
+  "description": "<b>Удобная транспортная развязка, Светлая квартира после ремонта</b>",
+  "floor": 6,
+  "photos": [
+   "http://mock.example/img/seed-000018_1.jpg"
+  ],
+  "published_at": "2026-11-16T18:30:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000019",
+  "deal_type": "sale",
+  "country": "RU",
+  "city": "Moscow",
+  "rooms": 3,
+  "area_m2": 31.8,
+  "price": 996,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000019",
+  "title": "3-к квартира, 31.8 м²",
+  "address": "ул. Гагарина, 28",
+  "description": "<b>Светлая квартира после ремонта, Балкон с видом на парк</b>",
+  "floor": 9,
+  "photos": [
+   "http://mock.example/img/seed-000019_1.jpg"
+  ],
+  "published_at": "2026-11-19T09:00:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000020",
+  "deal_type": "sale",
+  "country": "RU",
+  "city": "Kazan",
+  "rooms": 2,
+  "area_m2": 99.3,
+  "price": 1328,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000020",
+  "title": "2-к квартира, 99.3 м²",
+  "address": "ул. Гагарина, 39",
+  "description": "<i>Удобная транспортная развязка, Тихий район, зелёный двор</i>",
+  "floor": 2,
+  "photos": [
+   "http://mock.example/img/seed-000020_1.jpg"
+  ],
+  "published_at": "2026-11-19T20:00:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000021",
+  "deal_type": "rent",
+  "country": "RU",
+  "city": "Saint Petersburg",
+  "rooms": 1,
+  "area_m2": 43.8,
+  "price": 134339,
+  "currency": "RUB",
+  "url": "http://mock.example/listing/seed-000021",
+  "title": "1-к квартира, 43.8 м²",
+  "address": "ул. Гагарина, 63",
+  "description": "Рядом школа и детский сад, Тихий район, зелёный двор",
+  "floor": 5,
+  "photos": [
+   "http://mock.example/img/seed-000021_1.jpg"
+  ],
+  "published_at": "2026-11-13T18:30:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000022",
+  "deal_type": "sale",
+  "country": "RU",
+  "city": "Moscow",
+  "rooms": "студия",
+  "area_m2": 28.3,
+  "price": 68147,
+  "currency": "RUB",
+  "url": "http://mock.example/listing/seed-000022",
+  "title": "<b>Студия, 28.3 м²</b>",
+  "address": "ул. Притыцкого, 10",
+  "description": "<i>Рядом школа и детский сад, Тихий район, зелёный двор</i>",
+  "floor": 3,
+  "photos": [
+   "http://mock.example/img/seed-000022_1.jpg"
+  ],
+  "published_at": "2026-11-21T14:00:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000023",
+  "deal_type": "rent",
+  "country": "RU",
+  "city": "Kazan",
+  "rooms": 2,
+  "area_m2": 72.4,
+  "price": 290,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000023",
+  "title": "<b>2-к квартира, 72.4 м²</b>",
+  "address": "ул. Притыцкого, 46",
+  "description": "<i>Светлая квартира после ремонта, Тихий район, зелёный двор</i>",
+  "floor": 9,
+  "photos": [
+   "http://mock.example/img/seed-000023_1.jpg"
+  ],
+  "published_at": "2026-11-13T18:15:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000024",
+  "deal_type": "rent",
+  "country": "RU",
+  "city": "Saint Petersburg",
+  "rooms": 3,
+  "area_m2": 107.6,
+  "price": 114425,
+  "currency": "RUB",
+  "url": "http://mock.example/listing/seed-000024",
+  "title": "3-к квартира, 107.6 м²",
+  "address": "ул. Мира, 86",
+  "description": "<b>Балкон с видом на парк, Светлая квартира после ремонта</b>",
+  "floor": 4,
+  "photos": [
+   "http://mock.example/img/seed-000024_1.jpg"
+  ],
+  "published_at": "2026-11-12T19:30:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000025",
+  "deal_type": "sale",
+  "country": "PL",
+  "city": "Warsaw",
+  "rooms": 0,
+  "area_m2": 54.4,
+  "price": 134,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000025",
+  "title": "Студия, 54.4 м²",
+  "address": "ул. Мира, 43",
+  "description": "<i>Тихий район, зелёный двор, Удобная транспортная развязка</i>",
+  "floor": 5,
+  "photos": [
+   "http://mock.example/img/seed-000025_1.jpg"
+  ],
+  "published_at": "2026-11-13T08:15:00+01:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000026",
+  "deal_type": "sale",
+  "country": "PL",
+  "city": "Krakow",
+  "rooms": 2,
+  "area_m2": 51.6,
+  "price": 3213,
+  "currency": "PLN",
+  "url": "http://mock.example/listing/seed-000026",
+  "title": "2-к квартира, 51.6 м²",
+  "address": "ул. Притыцкого, 77",
+  "description": "<b>Тихий район, зелёный двор, Рядом школа и детский сад</b>",
+  "floor": 7,
+  "photos": [
+   "http://mock.example/img/seed-000026_1.jpg"
+  ],
+  "published_at": "2026-11-19T12:00:00+01:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000027",
+  "deal_type": "rent",
+  "country": "PL",
+  "city": "Gdansk",
+  "rooms": 2,
+  "area_m2": 59.3,
+  "price": 1477,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000027",
+  "title": "2-к квартира, 59.3 м²",
+  "address": "ул. Притыцкого, 67",
+  "description": "Рядом школа и детский сад, Тихий район, зелёный двор",
+  "floor": 9,
+  "photos": [
+   "http://mock.example/img/seed-000027_1.jpg"
+  ],
+  "published_at": "2026-11-10T19:45:00+01:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000028",
+  "deal_type": "sale",
+  "country": "PL",
+  "city": "Warsaw",
+  "rooms": 1,
+  "area_m2": 52.8,
+  "price": 179,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000028",
+  "title": "1-к квартира, 52.8 м²",
+  "address": "ул. Мира, 90",
+  "description": "Светлая квартира после ремонта, Тихий район, зелёный двор",
+  "floor": 5,
+  "photos": [
+   "http://mock.example/img/seed-000028_1.jpg"
+  ],
+  "published_at": "2026-11-20T14:30:00+01:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000029",
+  "deal_type": "rent",
+  "country": "PL",
+  "city": "Krakow",
+  "rooms": 1,
+  "area_m2": 57.8,
+  "price": 1415,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000029",
+  "title": "1-к квартира, 57.8 м²",
+  "address": "ул. Мира, 75",
+  "description": "<i>Балкон с видом на парк, Светлая квартира после ремонта</i>",
+  "floor": 6,
+  "photos": [
+   "http://mock.example/img/seed-000029_1.jpg"
+  ],
+  "published_at": "2026-11-14T12:15:00+01:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000030",
+  "deal_type": "rent",
+  "country": "PL",
+  "city": "Gdansk",
+  "rooms": 3,
+  "area_m2": 80.8,
+  "price": 805,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000030",
+  "title": "3-к квартира, 80.8 м²",
+  "address": "ул. Садовая, 29",
+  "description": "<i>Удобная транспортная развязка, Тихий район, зелёный двор</i>",
+  "floor": 4,
+  "photos": [
+   "http://mock.example/img/seed-000030_1.jpg"
+  ],
+  "published_at": "2026-11-11T20:15:00+01:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000101",
+  "deal_type": "rent",
+  "country": "BY",
+  "city": "Minsk",
+  "rooms": "студия",
+  "area_m2": 86.7,
+  "price": 0,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000001",
+  "title": "Студия, 86.7 м²",
+  "address": "ул. Гагарина, 78",
+  "description": "Удобная транспортная развязка, Светлая квартира после ремонта",
+  "floor": 1,
+  "photos": [
+   "http://mock.example/img/seed-000001_1.jpg"
+  ],
+  "published_at": "2026-11-11T11:15:00+03:00"
+ },
+ {
+  "source": "mock",
+  "external_id": "seed-000102",
+  "deal_type": "exchange",
+  "country": "BY",
+  "city": "Brest",
+  "rooms": 4,
+  "area_m2": 57.8,
+  "price": 717,
+  "currency": "USD",
+  "url": "http://mock.example/listing/seed-000002",
+  "title": "4-к квартира, 57.8 м²",
+  "address": "ул. Независимости, 98",
+  "description": "<b>Рядом школа и детский сад, Балкон с видом на парк</b>",
+  "floor": 6,
+  "photos": [
+   "http://mock.example/img/seed-000002_1.jpg"
+  ],
+  "published_at": "2026-11-15T12:15:00+03:00"
+ }
+]
