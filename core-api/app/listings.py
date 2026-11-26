@@ -7,7 +7,7 @@ from pydantic import BaseModel, WithJsonSchema
 
 from app.listing_filters import ListingFilters
 from app.listing_models import ListingCreate
-from app.listing_store import ListingStore, StoredListing
+from app.listing_store import ListingStore, StoredListing, UnknownListingReferenceError
 
 router = APIRouter(prefix="/api/v1/listings", tags=["listings"])
 
@@ -54,6 +54,7 @@ async def get_listing_store(request: Request) -> ListingStore:
             "model": ListingCreateResponse,
             "description": "Объявление с таким source и external_id уже существует",
         },
+        413: {"description": "Тело запроса превышает 128 КиБ"},
         422: {
             "description": "Ошибка валидации объявления",
             "content": {
@@ -76,7 +77,13 @@ async def create_listing(
     response: Response,
     store: Annotated[ListingStore, Depends(get_listing_store)],
 ) -> ListingCreateResponse:
-    result = await store.create_or_get(listing)
+    try:
+        result = await store.create_or_get(listing)
+    except UnknownListingReferenceError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
 
     if not result.created:
         response.status_code = status.HTTP_200_OK
