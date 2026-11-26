@@ -9,6 +9,11 @@ from fastapi.testclient import TestClient
 @pytest.fixture
 def clients(monkeypatch):
     engine = SimpleNamespace(dispose=AsyncMock())
+    monkeypatch.setattr(
+        main.PostgresListingStore,
+        "publish_next",
+        AsyncMock(return_value=False),
+    )
     redis_client = SimpleNamespace(aclose=AsyncMock())
 
     db_factory = MagicMock(return_value=engine)
@@ -30,6 +35,7 @@ def test_clients_lifecycle(clients):
         redis_factory.assert_called_once_with(main.settings.redis_url)
 
         assert main.app.state.db_engine is engine
+        assert isinstance(main.app.state.listing_store, main.PostgresListingStore)
         assert main.app.state.redis is redis_client
 
         engine.dispose.assert_not_awaited()
@@ -71,3 +77,27 @@ def test_db_closed_when_redis_cleanup_fails(clients):
 
     redis_client.aclose.assert_awaited_once()
     engine.dispose.assert_awaited_once()
+
+
+def test_outbox_worker_stops_before_redis_closes(clients, monkeypatch):
+    _, redis_client, _, _ = clients
+    events = []
+
+    async def worker(store, redis, stop):
+        assert store is main.app.state.listing_store
+        assert redis is redis_client
+        events.append("worker_started")
+        await stop.wait()
+        events.append("worker_stopped")
+
+    async def close_redis():
+        events.append("redis_closed")
+
+    monkeypatch.setattr(main, "run_outbox_worker", worker)
+    redis_client.aclose.side_effect = close_redis
+
+    with TestClient(main.app) as client:
+        assert client.get("/health/live").status_code == 200
+        assert events == ["worker_started"]
+
+    assert events == ["worker_started", "worker_stopped", "redis_closed"]
