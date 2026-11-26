@@ -1,17 +1,18 @@
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import (
     AnyHttpUrl,
     AwareDatetime,
     BaseModel,
     Field,
+    UrlConstraints,
     field_validator,
 )
 
 
-class ListingCreate(BaseModel):
+class ListingFields(BaseModel):
     source: str = Field(pattern=r"\S")
     external_id: str = Field(pattern=r"\S")
     url: AnyHttpUrl
@@ -70,3 +71,17 @@ class ListingCreate(BaseModel):
         if value is None:
             return None
         return value.astimezone(UTC)
+
+
+ListingURL = Annotated[AnyHttpUrl, UrlConstraints(max_length=2048)]
+
+
+class ListingCreate(ListingFields):
+    source: str = Field(pattern=r"\S", max_length=64)
+    external_id: str = Field(pattern=r"\S", max_length=256)
+    city: str = Field(pattern=r"\S", max_length=128)
+    url: ListingURL
+    title: str | None = Field(default=None, max_length=256)
+    address: str | None = Field(default=None, max_length=512)
+    description: str | None = Field(default=None, max_length=10_000)
+    photos: list[ListingURL] | None = Field(default=None, max_length=10)
