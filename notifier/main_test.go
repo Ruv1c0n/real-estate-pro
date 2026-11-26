@@ -8,11 +8,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -96,7 +100,7 @@ func TestHealthAlwaysOkWithDbField(t *testing.T) {
 		t.Fatal("заглушка Core API должна быть здорова при прогреве кэша")
 	}
 
-	mux := newMux(rdb, dictsClient, nil, notify.ModeLog) // memory-режим: pool == nil
+	mux := newMux(rdb, dictsClient, nil, notify.ModeLog, defaultDebugRateLimitPerMin) // memory-режим: pool == nil
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
 
@@ -131,7 +135,7 @@ func TestHealthLivenessNoNetwork(t *testing.T) {
 	t.Cleanup(srv.Close)
 	dictsClient := dicts.New(srv.URL) // кэш не прогрет: CachedHealthy() == false
 
-	mux := newMux(rdb, dictsClient, nil, notify.ModeLog)
+	mux := newMux(rdb, dictsClient, nil, notify.ModeLog, defaultDebugRateLimitPerMin)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
 
@@ -151,7 +155,7 @@ func TestHealthReadyMemoryModeOk(t *testing.T) {
 	rdb := testRedisAddr(t)
 	dictsClient := newDictsFake(t)
 
-	mux := newMux(rdb, dictsClient, nil, notify.ModeLog)
+	mux := newMux(rdb, dictsClient, nil, notify.ModeLog, defaultDebugRateLimitPerMin)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
 
@@ -171,7 +175,7 @@ func TestHealthReadyDbModeOk(t *testing.T) {
 	pool := testPool(t)
 	defer pool.Close()
 
-	mux := newMux(rdb, dictsClient, pool, notify.ModeLog)
+	mux := newMux(rdb, dictsClient, pool, notify.ModeLog, defaultDebugRateLimitPerMin)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
 
@@ -192,7 +196,7 @@ func TestHealthReadyDbDown(t *testing.T) {
 	pool := testPool(t)
 	pool.Close()
 
-	mux := newMux(rdb, dictsClient, pool, notify.ModeLog)
+	mux := newMux(rdb, dictsClient, pool, notify.ModeLog, defaultDebugRateLimitPerMin)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
 
@@ -213,7 +217,7 @@ func TestHealthReadyRedisDown(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
 	t.Cleanup(func() { rdb.Close() })
 
-	mux := newMux(rdb, dictsClient, nil, notify.ModeLog)
+	mux := newMux(rdb, dictsClient, nil, notify.ModeLog, defaultDebugRateLimitPerMin)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
 
@@ -319,5 +323,128 @@ func TestEnvPositiveDuration(t *testing.T) {
 	t.Setenv("NOTIFIER_JUNK", "five")
 	if _, err := envPositiveDuration("NOTIFIER_JUNK", 5*time.Minute); err == nil {
 		t.Fatal("мусорное значение должно давать ошибку (fail-fast)")
+	}
+}
+
+// Тесты /debug/event (НФТ-3): fail-closed без ключа, логирование отказов
+// авторизации, rate limit per-IP до авторизации (аудит 20.11, P2-25 —
+// брутфорс X-Admin-Key раньше был бесплатным и молчаливым) и прогрессивный
+// бан за перебор ключа. Publish-путь эндпоинта здесь не проверяется —
+// он не менялся этим PR и покрыт своими интеграционными тестами.
+
+func TestDebugEventDisabledWithoutAdminKey(t *testing.T) {
+	t.Setenv("ADMIN_KEY", "")
+	dictsClient := newDictsFake(t)
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	t.Cleanup(func() { rdb.Close() })
+
+	mux := newMux(rdb, dictsClient, nil, notify.ModeLog, defaultDebugRateLimitPerMin)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/debug/event", nil))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("пустой ADMIN_KEY выключает эндпоинт: %d, ожидается 404", rec.Code)
+	}
+}
+
+func TestDebugEventUnauthorizedAttemptIsLogged(t *testing.T) {
+	t.Setenv("ADMIN_KEY", "correct-key")
+	dictsClient := newDictsFake(t)
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	t.Cleanup(func() { rdb.Close() })
+
+	mux := newMux(rdb, dictsClient, nil, notify.ModeLog, defaultDebugRateLimitPerMin)
+
+	// Захват стандартного логера: смысл правки в том, что отказ
+	// авторизации больше не молчаливый — проверяем содержимое лога.
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	req := httptest.NewRequest(http.MethodPost, "/debug/event", nil)
+	req.Header.Set("X-Admin-Key", "wrong-key")
+	req.RemoteAddr = "192.0.2.33:4444"
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("неверный ключ: %d, ожидается 401", rec.Code)
+	}
+	if !strings.Contains(buf.String(), "unauthorized attempt") || !strings.Contains(buf.String(), "192.0.2.33") {
+		t.Fatalf("отказ авторизации не в логе или без IP: %q", buf.String())
+	}
+}
+
+func TestDebugEventRateLimitedBeforeAuth(t *testing.T) {
+	t.Setenv("ADMIN_KEY", "correct-key")
+	dictsClient := newDictsFake(t)
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	t.Cleanup(func() { rdb.Close() })
+
+	// Лимит 2/мин на IP: первые два запроса доходят до авторизации (401 —
+	// ключ неверный), третий упирается в bucket ещё до constant-time
+	// compare. Заодно фиксируем, что неудачные авторизации не обходят
+	// лимит — они тратят те же токены.
+	mux := newMux(rdb, dictsClient, nil, notify.ModeLog, 2)
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/debug/event", nil)
+		req.Header.Set("X-Admin-Key", "wrong")
+		req.RemoteAddr = "192.0.2.44:1000"
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("запрос %d: %d, ожидается 401 (bucket ещё не пуст)", i+1, rec.Code)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/debug/event", nil)
+	req.Header.Set("X-Admin-Key", "wrong")
+	req.RemoteAddr = "192.0.2.44:1000"
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("третий запрос: %d, ожидается 429 (лимит 2/мин)", rec.Code)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra != "30" {
+		t.Fatalf("Retry-After = %q, ожидается 30 (ceil(60/2): лимит 2/мин)", ra)
+	}
+}
+
+// Прогрессивный бан за брутфорс (п.1 ревью #123): 5 неудач авторизации
+// подряд от одного IP — и шестая попытка получает 429 раньше токен-бакета
+// и авторизации. Лимит 100/мин гарантирует, что bucket не пуст: отказ
+// может быть только баном, а Retry-After — оставшееся время свежего
+// 5-минутного бана.
+func TestDebugEventBruteForceTriggersBan(t *testing.T) {
+	t.Setenv("ADMIN_KEY", "correct-key")
+	dictsClient := newDictsFake(t)
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	t.Cleanup(func() { rdb.Close() })
+
+	mux := newMux(rdb, dictsClient, nil, notify.ModeLog, 100)
+
+	for i := 0; i < 5; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/debug/event", nil)
+		req.Header.Set("X-Admin-Key", "wrong")
+		req.RemoteAddr = "192.0.2.90:1000"
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("попытка %d: %d, ожидается 401 (бан включается на 5-й)", i+1, rec.Code)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/debug/event", nil)
+	req.Header.Set("X-Admin-Key", "wrong")
+	req.RemoteAddr = "192.0.2.90:1000"
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("шестая попытка после 5 неудач: %d, ожидается 429 (прогрессивный бан)", rec.Code)
+	}
+	ra, err := strconv.Atoi(rec.Header().Get("Retry-After"))
+	if err != nil || ra < 250 || ra > 301 {
+		t.Fatalf("Retry-After = %q (%d, %v), ожидается оставшееся время 5-минутного бана", rec.Header().Get("Retry-After"), ra, err)
 	}
 }
