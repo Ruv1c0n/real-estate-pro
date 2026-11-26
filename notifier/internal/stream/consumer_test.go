@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -437,10 +438,13 @@ func TestStreamLenWarnStateHysteresis(t *testing.T) {
 // Redis, длина стрима за мягким порогом (ТЗ 3.6) — в логе появляется WARN
 // с текущим значением и именем consumer'а, обработка при этом не ломается.
 func TestConsumerWarnsOnStreamLenThreshold(t *testing.T) {
+	// Захват slog-логера через прод-JSON-хендлер (карточка 02): тест
+	// фиксирует прод-формат WARN, а не fallback-рендеринг дефолтного
+	// хендлера. syncBuf обязателен — readLoop пишет из своей горутины.
 	sbuf := &syncBuf{}
-	old := log.Writer()
-	log.SetOutput(sbuf)
-	defer log.SetOutput(old)
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(sbuf, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
 
 	rdb := &fakeRedis{streamLen: lenWarnThreshold + 1}
 	err := runConsumer(t, rdb, func(context.Context, model.Event) error { return nil },
@@ -449,10 +453,12 @@ func TestConsumerWarnsOnStreamLenThreshold(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	logged := sbuf.String()
-	if !strings.Contains(logged, fmt.Sprintf("length %d", lenWarnThreshold+1)) {
+	// JSON-формат WARN (card 02 prod-10of10): поле length — текущая длина
+	// стрима за мягким порогом (значения как в прежней проверке).
+	if !strings.Contains(logged, fmt.Sprintf(`"length":%d`, lenWarnThreshold+1)) {
 		t.Errorf("в логе нет текущей длины стрима: %q", logged)
 	}
-	if !strings.Contains(logged, "test-1") {
+	if !strings.Contains(logged, `"consumer":"test-1"`) {
 		t.Errorf("в логе нет ID воркера: %q", logged)
 	}
 	if strings.Contains(logged, "XLEN") || strings.Contains(logged, "xlen") {

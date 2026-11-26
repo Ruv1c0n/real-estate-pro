@@ -25,6 +25,7 @@ Go-сервис уведомлений: Telegram-бот, consumer Redis Streams 
 | `GET /health` | Liveness: `db`, `redis`, `dicts`, режим доставки |
 | `GET /health/ready` | Readiness: 200 только при доступных Redis, справочниках и (в db-режиме) PostgreSQL; иначе 503 |
 | `POST /debug/event` | Демо-событие в `listings.new`; заголовок `X-Admin-Key` (без ключа — 404) |
+| заголовок `X-Request-ID` | На любой путь: эхо входящего или сгенерированный 16-hex id; возвращается в ответе и попадает в лог запроса (вход длиннее 64 символов или с непечатаемыми ASCII/кавычками заменяется сгенерированным) |
 
 ## Переменные окружения
 
@@ -36,6 +37,16 @@ Go-сервис уведомлений: Telegram-бот, consumer Redis Streams 
 | `POSTGRES_SSLMODE` | `sslmode` в собираемом DSN; пусто = `disable` |
 | `DATABASE_URL` | Legacy-вариант целиком (проверяется первым; только форматы, парсируемые pgx) |
 | `ADMIN_KEY` | Ключ `/debug/event`; пусто — эндпоинт отвечает 404 |
+| `NOTIFIER_LOG_LEVEL` | Уровень лога: `DEBUG`/`INFO`/`WARN`/`ERROR` (регистр не важен, дефолт `INFO`); мусорное значение — fail-fast при старте |
+
+## Логи
+
+JSON-структура в stdout (`log/slog`, карточка плана prod-10of10); уровень — `NOTIFIER_LOG_LEVEL`. Сквозная корреляция — по `event_id` (контракт `listings.new`), она проходит consumer → dispatch → flush; HTTP-запросы коррелируются по `request_id`.
+
+- `event_id` — событие из стрима; `chat_id`, `listing_id` — адресат и объявление; `stream_msg_id` — запись в `listings.new`;
+- `request_id`, `client_ip` — HTTP-запрос и его клиент; `status`, `duration_ms` — код и длительность; `error` — ошибка;
+- `/health*` и `/metrics` (healthcheck compose, скрейп) пишутся на `DEBUG` — INFO не засоряется регулярным шумом;
+- входящий `X-Request-ID` принимается только печатным ASCII без кавычек до 64 символов, иначе заменяется сгенерированным.
 
 ## Запуск
 

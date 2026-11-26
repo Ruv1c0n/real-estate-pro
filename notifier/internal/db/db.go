@@ -4,7 +4,7 @@ package db
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -30,7 +30,7 @@ const pingAttempts = 3
 // (nil, nil) возвращается только когда БД не сконфигурирована (ни одной
 // переменной POSTGRES_*): сервис продолжает работать на in-memory хранилище —
 // так живут CI и локальные тесты без Docker. Сконфигурированная, но
-// недоступная БД — ошибка старта (fail-fast, main.go делает log.Fatal):
+// недоступная БД — ошибка старта (fail-fast, main.go делает fatal()):
 // тихий уход в memory-режим маскировал бы проблему окружения весь аптайм.
 // Частичная конфигурация (задана часть POSTGRES_* без user/password) — тоже
 // ошибка: иначе misconfig молча превращается в подключение app/app@127.0.0.1.
@@ -41,7 +41,7 @@ func Connect(ctx context.Context) (*pgxpool.Pool, error) {
 		return nil, err
 	}
 	if dsn == "" {
-		log.Println("DB disabled: running in memory mode")
+		slog.Info("db: disabled — running in memory mode")
 		return nil, nil
 	}
 
@@ -90,7 +90,7 @@ func Connect(ctx context.Context) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("db: ping: %w", pingErr)
 	}
 
-	log.Println("DB connected")
+	slog.Info("db: connected")
 	return pool, nil
 }
 
