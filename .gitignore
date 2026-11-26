@@ -228,6 +228,10 @@ AGENTS.md
 # В репо живут только graphify-out/{graph.json, manifest.json, .graphify_labels.json, GRAPH_REPORT.md};
 # финальные HTML раздаются через GitHub Pages.
 .archify/
+
+# Локальные артефакты AI-инструментов (trail-граф, состояние ассистентов)
+.trail/
+.claude/
 graphify-out/cache/
 graphify-out/cost.json
 graphify-out/.graphify_python

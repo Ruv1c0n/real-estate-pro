@@ -25,38 +25,69 @@ const (
 	// DeadStream — стрим для некорректных payload'ов.
 	DeadStream = "listings.dead"
 
-	workerCount = 8                // пул воркеров, ТЗ 3.6
-	minIdle     = 30 * time.Second // pending старше этого срока забирает XAUTOCLAIM
-	claimEvery  = 15 * time.Second // период обхода pending
-	readBlock   = 5 * time.Second  // блокирующее чтение XREADGROUP
-	readCount   = int64(16)        // сообщений за одно чтение
-	retryDelay  = 3 * time.Second  // пауза при ошибке Redis
+	workerCount      = 8                // пул воркеров, ТЗ 3.6 (дефолт NOTIFIER_WORKERS)
+	lenWarnThreshold = int64(10000)     // мягкий порог WARN длины стрима (дефолт NOTIFIER_STREAM_LEN_THRESHOLD)
+	minIdle          = 30 * time.Second // pending старше этого срока забирает XAUTOCLAIM
+	claimEvery       = 15 * time.Second // период обхода pending
+	readBlock        = 5 * time.Second  // блокирующее чтение XREADGROUP
+	readCount        = int64(16)        // сообщений за одно чтение
+	retryDelay       = 3 * time.Second  // пауза при ошибке Redis
+
+	// ТЗ 3.6: «Порог контроля длины stream 10 000 событий; мягкий порог,
+	// без удаления необработанных». Мягкость — в том, что записи никогда
+	// не удаляются: превышение порога только логируется (WARN).
+	streamLenWarnReset = 9_000       // гистерезис: WARN снова активен ниже этого
+	lenCheckEvery      = time.Minute // период проверки XLEN (не каждый проход)
 )
 
 // Handler обрабатывает одно событие. Обработка фиксирует доставку
 // (журнал/отложенные задания), после чего консьюмер подтверждает запись.
-type Handler func(ctx context.Context, e model.Event)
+// Ошибка возвращается ТОЛЬКО при временной инфраструктурной сбое (Postgres,
+// Redis) — ТЗ 4.3 «Временные ошибки БД/Redis повторяются»: консьюмер не
+// выполняет XACK, запись остаётся в pending и повторяется через XAUTOCLAIM.
+// Ошибки, обработанные внутри (отказ Telegram 429/сеть, статус unknown
+// после отправки), ошибкой события не являются.
+type Handler func(ctx context.Context, e model.Event) error
 
-// Redis — операции go-redis, нужные консьюмеру; UniversalClient их удовлетворяет.
+// Redis — операции go-redis, нужные консьюмеру и очистителю (reaper.go);
+// UniversalClient их удовлетворяет.
 type Redis interface {
 	XGroupCreateMkStream(ctx context.Context, stream, group, start string) *redis.StatusCmd
 	XReadGroup(ctx context.Context, a *redis.XReadGroupArgs) *redis.XStreamSliceCmd
 	XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimCmd
 	XAck(ctx context.Context, stream, group string, ids ...string) *redis.IntCmd
 	XAdd(ctx context.Context, a *redis.XAddArgs) *redis.StringCmd
+	// Операции безопасной очистки стрима (reaper.go, ТЗ 4.3).
+	XPending(ctx context.Context, stream, group string) *redis.XPendingCmd
+	XInfoGroups(ctx context.Context, stream string) *redis.XInfoGroupsCmd
+	XRange(ctx context.Context, stream, start, stop string) *redis.XMessageSliceCmd
+	XDel(ctx context.Context, stream string, ids ...string) *redis.IntCmd
+	XLen(ctx context.Context, stream string) *redis.IntCmd
 }
 
 // Consumer читает стрим группой notifier: цикл XREADGROUP раздаёт записи
 // пулу воркеров, фоновый XAUTOCLAIM забирает зависшие pending-записи.
+// Число воркеров и мягкий порог WARN длины стрима настраиваются из main
+// (NOTIFIER_WORKERS, NOTIFIER_STREAM_LEN_THRESHOLD; ТЗ 3.6), дефолты —
+// константы workerCount и lenWarnThreshold.
 type Consumer struct {
-	rdb    Redis
-	name   string
-	handle Handler
+	rdb     Redis
+	name    string
+	handle  Handler
+	workers int
+	lenWarn int64 // мягкий порог: длина стрима больше него — WARN, не фатально
 }
 
-func NewConsumer(rdb Redis, consumerName string, handle Handler) *Consumer {
-	return &Consumer{rdb: rdb, name: consumerName, handle: handle}
+// NewConsumer создаёт консьюмер: workers — размер пула воркеров, lenWarn —
+// порог WARN длины стрима.
+func NewConsumer(rdb Redis, consumerName string, workers int, lenWarn int64, handle Handler) *Consumer {
+	return &Consumer{rdb: rdb, name: consumerName, handle: handle, workers: workers, lenWarn: lenWarn}
 }
+
+// DefaultWorkers и DefaultLenWarnThreshold — дефолты по ТЗ 3.6 для параметров,
+// читаемых из окружения в main.
+func DefaultWorkers() int            { return workerCount }
+func DefaultLenWarnThreshold() int64 { return lenWarnThreshold }
 
 // ConsumerName делает имя consumer'а уникальным для экземпляра (contracts.md §2).
 func ConsumerName() string {
@@ -79,7 +110,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 	jobs := make(chan redis.XMessage, readCount)
 
 	var wg sync.WaitGroup
-	for i := 0; i < workerCount; i++ {
+	for i := 0; i < c.workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -106,7 +137,15 @@ func (c *Consumer) Run(ctx context.Context) error {
 
 // readLoop читает новые записи (">") и раздаёт их воркерам.
 func (c *Consumer) readLoop(ctx context.Context, jobs chan<- redis.XMessage) error {
+	var (
+		lastLenCheck time.Time // XLEN проверяется не каждый проход, а раз в lenCheckEvery
+		lenWarned    bool      // гистерезис WARN: не спамить, пока стрим длинный
+	)
 	for {
+		if time.Since(lastLenCheck) >= lenCheckEvery {
+			lastLenCheck = time.Now()
+			lenWarned = c.warnStreamLen(ctx, lenWarned)
+		}
 		res, err := c.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group:    GroupName,
 			Consumer: c.name,
@@ -142,6 +181,41 @@ func (c *Consumer) readLoop(ctx context.Context, jobs chan<- redis.XMessage) err
 	}
 }
 
+// streamLenWarnState решает, пора ли логировать WARN по длине стрима, и
+// возвращает новое состояние гистерезиса. WARN выдаётся, когда длина впервые
+// достигает threshold (настроенный мягкий порог, c.lenWarn); пока длина не
+// упадёт ниже streamLenWarnReset, повторных WARN не будет — при стабильно
+// длинном стриме лог не заспамивается каждым проходом чтения (после сброса
+// следующий выход за порог снова предупредит).
+func streamLenWarnState(length int64, warned bool, threshold int64) (warn, newWarned bool) {
+	if warned {
+		return false, length >= streamLenWarnReset // ниже reset — гистерезис снят
+	}
+	if length >= threshold {
+		return true, true
+	}
+	return false, false
+}
+
+// warnStreamLen проверяет XLEN стрима и логирует WARN при превышении мягкого
+// порога (ТЗ 3.6: «Порог контроля длины stream 10 000 событий; мягкий порог,
+// без удаления необработанных»). Ничего не удаляет и не обрезает (MAXLEN
+// в XADD запрещён ТЗ 4.3) — только сигнал оператору. Ошибка Redis
+// игнорируется: это телеметрия рядом с горячим циклом чтения, сбой XLEN
+// не должен мешать обработке (состояние гистерезиса не меняется).
+func (c *Consumer) warnStreamLen(ctx context.Context, warned bool) bool {
+	n, err := c.rdb.XLen(ctx, StreamName).Result()
+	if err != nil {
+		return warned
+	}
+	warn, state := streamLenWarnState(n, warned, c.lenWarn)
+	if warn {
+		log.Printf("WARN: stream %s length %d >= soft threshold %d (consumer %s) — необработанные записи не удаляются (ТЗ 3.6)",
+			StreamName, n, c.lenWarn, c.name)
+	}
+	return state
+}
+
 // claimLoop забирает pending-записи, зависшие дольше 30 с (упавший воркер
 // или перезапуск экземпляра), и возвращает их в обработку.
 func (c *Consumer) claimLoop(ctx context.Context, jobs chan<- redis.XMessage) {
@@ -152,6 +226,15 @@ func (c *Consumer) claimLoop(ctx context.Context, jobs chan<- redis.XMessage) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+		}
+		// Мягкий порог длины стрима (ТЗ 3.6, порог настраивается): рост
+		// длины — симптом отставания группы от публикации (события копятся
+		// непрочитанными). Это WARN-телеметрия: доставку не прерывает и
+		// обрезку не запускает — до безопасной границы стрим не режется.
+		if l, err := c.rdb.XLen(context.WithoutCancel(ctx), StreamName).Result(); err != nil {
+			log.Printf("xlen: %v", err)
+		} else if l > c.lenWarn {
+			log.Printf("WARN: stream %s length %d exceeds threshold %d — consumer may be lagging", StreamName, l, c.lenWarn)
 		}
 		cursor := "0-0"
 		for {
@@ -215,11 +298,18 @@ func (c *Consumer) process(ctx context.Context, msg redis.XMessage) {
 	// получателей уходит в deferred-очередь (потери нет), продлевать владение
 	// не требуется. От зависшей обработки защиту даёт тот же eventBudget +
 	// XAUTOCLAIM; конкурентный повтор гасит дедуп по журналу (ФТ-3.5).
-	c.handle(ctx, event)
+	// Ошибка хендлера — временный инфраструктурный сбой (Postgres/Redis),
+	// ТЗ 4.3: подтверждать нельзя — запись остаётся в pending и будет
+	// подхвачена XAUTOCLAIM (minIdle 30 с; eventBudget 25 с меньше порога,
+	// поэтому живой воркер не перезабирается — см. notify.eventBudget).
+	if err := c.handle(ctx, event); err != nil {
+		log.Printf("handle %s (event %s): %v — не подтверждено, запись остаётся в pending", msg.ID, event.EventID, err)
+		return
+	}
 
-	// XACK — только после обработки; redis-операции не должны зависеть от
-	// отмены контекста обработки (в т.ч. при остановке сервиса), поэтому
-	// отдельный контекст.
+	// XACK — только после успешной обработки; redis-операции не должны
+	// зависеть от отмены контекста обработки (в т.ч. при остановке сервиса),
+	// поэтому отдельный контекст.
 	if err := c.rdb.XAck(context.WithoutCancel(ctx), StreamName, GroupName, msg.ID).Err(); err != nil {
 		// Не подтверждено: запись останется в pending, XAUTOCLAIM вернёт её.
 		log.Printf("xack %s: %v", msg.ID, err)
