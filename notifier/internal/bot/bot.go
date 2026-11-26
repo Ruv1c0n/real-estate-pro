@@ -5,7 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -76,7 +76,7 @@ const helpText = `Я присылаю новые объявления о нед�
 
 // Run крутит long polling до отмены контекста.
 func (b *Bot) Run(ctx context.Context) {
-	log.Println("telegram bot: polling started")
+	slog.Info("telegram bot: polling started")
 	var offset int64
 	for ctx.Err() == nil {
 		updates, err := b.api.GetUpdates(ctx, offset)
@@ -84,7 +84,7 @@ func (b *Bot) Run(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("telegram getUpdates: %v", err)
+			slog.Warn("telegram: getUpdates failed", "error", err)
 			select {
 			case <-ctx.Done():
 				return
@@ -139,7 +139,7 @@ func (b *Bot) handle(ctx context.Context, chatID int64, text string) {
 func (b *Bot) subscribe(ctx context.Context, chatID int64, args []string) string {
 	n, err := b.subs.CountForChat(ctx, chatID)
 	if err != nil {
-		log.Printf("bot: count subscriptions (chat %d): %v", chatID, err)
+		slog.Error("bot: count subscriptions", "chat_id", chatID, "error", err)
 		return msgUnavailable
 	}
 	if n >= MaxSubscriptionsPerUser {
@@ -155,7 +155,7 @@ func (b *Bot) subscribe(ctx context.Context, chatID int64, args []string) string
 		// идёт нейтральный текст (L6). Ошибки валидации («неизвестный город»)
 		// — пользовательские, их показываем как есть.
 		if errors.Is(err, dicts.ErrUnavailable) {
-			log.Printf("bot: validate subscription (chat %d): %v", chatID, err)
+			slog.Error("bot: validate subscription", "chat_id", chatID, "error", err)
 			return msgUnavailable
 		}
 		return "Не получилось: " + err.Error()
@@ -163,7 +163,7 @@ func (b *Bot) subscribe(ctx context.Context, chatID int64, args []string) string
 	s.ChatID = chatID
 	s, err = b.subs.Add(ctx, s)
 	if err != nil {
-		log.Printf("bot: add subscription (chat %d): %v", chatID, err)
+		slog.Error("bot: add subscription", "chat_id", chatID, "error", err)
 		return msgUnavailable
 	}
 	return fmt.Sprintf("Подписка #%d создана: %s", s.ID, Describe(s))
@@ -172,7 +172,7 @@ func (b *Bot) subscribe(ctx context.Context, chatID int64, args []string) string
 func (b *Bot) list(ctx context.Context, chatID int64) string {
 	subs, err := b.subs.ByChat(ctx, chatID)
 	if err != nil {
-		log.Printf("bot: list subscriptions (chat %d): %v", chatID, err)
+		slog.Error("bot: list subscriptions", "chat_id", chatID, "error", err)
 		return msgUnavailable
 	}
 	if len(subs) == 0 {
@@ -195,7 +195,7 @@ func (b *Bot) unsubscribe(ctx context.Context, chatID int64, args []string) stri
 	}
 	ok, err := b.subs.Delete(ctx, chatID, id)
 	if err != nil {
-		log.Printf("bot: delete subscription %d (chat %d): %v", id, chatID, err)
+		slog.Error("bot: delete subscription", "subscription_id", id, "chat_id", chatID, "error", err)
 		return msgUnavailable
 	}
 	if !ok {
@@ -208,7 +208,7 @@ func (b *Bot) unsubscribe(ctx context.Context, chatID int64, args []string) stri
 // показывает помощь. Повторный /start идемпотентен.
 func (b *Bot) start(ctx context.Context, chatID int64) string {
 	if err := b.subs.EnsureUser(ctx, chatID); err != nil {
-		log.Printf("bot: ensure user (chat %d): %v", chatID, err)
+		slog.Error("bot: ensure user", "chat_id", chatID, "error", err)
 		return msgUnavailable
 	}
 	return helpText
@@ -219,7 +219,7 @@ func (b *Bot) start(ctx context.Context, chatID int64) string {
 func (b *Bot) stop(ctx context.Context, chatID int64) string {
 	n, err := b.subs.DeleteUser(ctx, chatID)
 	if err != nil {
-		log.Printf("bot: delete user (chat %d): %v", chatID, err)
+		slog.Error("bot: delete user", "chat_id", chatID, "error", err)
 		return msgUnavailable
 	}
 	// ТЗ 4.2: «/stop удаляет и отложенные задания». В db-режиме каскад FK
@@ -230,7 +230,7 @@ func (b *Bot) stop(ctx context.Context, chatID int64) string {
 	// отвечаем как обычно.
 	if b.cleaner != nil {
 		if err := b.cleaner.DropChatJobs(ctx, chatID); err != nil {
-			log.Printf("bot: drop deferred jobs (chat %d): %v", chatID, err)
+			slog.Error("bot: drop deferred jobs", "chat_id", chatID, "error", err)
 		}
 	}
 	return fmt.Sprintf("Готово: удалено подписок — %d. Вы больше не будете получать уведомления. /subscribe вернёт их в любой момент.", n)
@@ -238,7 +238,7 @@ func (b *Bot) stop(ctx context.Context, chatID int64) string {
 
 func (b *Bot) send(ctx context.Context, chatID int64, text string) {
 	if err := b.api.SendMessage(ctx, chatID, text); err != nil {
-		log.Printf("telegram send to %d: %v", chatID, err)
+		slog.Error("telegram: send failed", "chat_id", chatID, "error", err)
 	}
 }
 

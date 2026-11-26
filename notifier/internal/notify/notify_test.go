@@ -4,10 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"notifier/internal/metrics"
 	"notifier/internal/model"
 	"notifier/internal/store"
 	"notifier/internal/telegram"
@@ -388,6 +394,15 @@ func TestFlushDeliversAndMarksSent(t *testing.T) {
 	}
 	if n := journal.records["sent/telegram"]; n != 1 {
 		t.Fatalf("записей журнала sent/telegram = %d, want 1", n)
+	}
+	// Телеметрия доставки (п.7c ревью #125): успешный flush создаёт серию
+	// outcome=sent в гистограмме DeliveryDuration. Проверяем по экспозиции
+	// /metrics: Observer от WithLabelValues — не Collector, testutil-счётчик
+	// на него не вешается.
+	rec := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if !strings.Contains(rec.Body.String(), `notifier_delivery_duration_seconds_bucket{outcome="sent"`) {
+		t.Fatalf("серия outcome=sent в DeliveryDuration не собрана в /metrics: %s", rec.Body.String())
 	}
 }
 
@@ -832,6 +847,10 @@ func TestHandleRateLimitedReturnsToQueue(t *testing.T) {
 	}
 	if len(queue.postponed) != 1 || queue.postponed[0].ChatID != 10 || queue.postponed[0].Event.ID != 1 {
 		t.Fatalf("postponed = %+v, want задание 10:1 в очереди отложенных", queue.postponed)
+	}
+	// Телеметрия 429 (п.7b ревью #125): счётчик Retry-After растёт на отказе.
+	if got := testutil.ToFloat64(metrics.TelegramRetryAfter); got < 1 {
+		t.Fatalf("TelegramRetryAfter = %v, want > 0 (429 зафиксирован в телеметрии)", got)
 	}
 }
 

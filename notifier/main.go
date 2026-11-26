@@ -2,29 +2,37 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 
 	"notifier/internal/bot"
 	"notifier/internal/db"
 	"notifier/internal/dicts"
+	"notifier/internal/httpx"
+	"notifier/internal/metrics"
 	"notifier/internal/migrate"
 	"notifier/internal/model"
 	"notifier/internal/notify"
+	"notifier/internal/ratelimit"
 	"notifier/internal/store"
 	"notifier/internal/stream"
 	"notifier/internal/telegram"
@@ -37,6 +45,18 @@ const (
 	defaultNotificationsPerHour = 30
 	flushInterval               = 30 * time.Second
 	debugBodyLimit              = 1 << 20 // 1 МБ на демо-событие
+	// Лимит /debug/event на клиентский IP (аудит 20.11, P2-25: без него
+	// X-Admin-Key брутфорсится с LAN бесплатно). Демо-сценарий отправляет
+	// событие раз в несколько секунд, поэтому 30/мин с запасом покрывают
+	// честное использование и режут перебор.
+	defaultDebugRateLimitPerMin = 30
+	// Интервал поллера гейджей Prometheus: скрейп в Redis/PG не ходит
+	// (карточка 01 плана prod-10of10), поэтому частота определяется здесь,
+	// а не нагрузкой от Prometheus.
+	metricsPollEvery = 15 * time.Second
+	// Дедлайн одного прохода поллера гейджей (п.5 ревью #125): «чёрная дыра»
+	// Redis/PG иначе замораживала бы горутину поллера навсегда.
+	metricsPollTimeout = 5 * time.Second
 )
 
 // Тайминги health-проверок: у каждой проверки свой дедлайн, сбор результатов
@@ -49,6 +69,18 @@ const (
 )
 
 func main() {
+	// Уровень лога и формат до всего остального: мусорный уровень —
+	// fail-fast через обычный log (slog ещё не установлен — начало
+	// chicken-and-egg; единственное место, где JSON-структуры ещё нет).
+	level, err := parseLevel(env("NOTIFIER_LOG_LEVEL", "info"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	// JSON-логи (карточка 02 плана prod-10of10): единая структура для
+	// сбора и алертов. Корреляция сквозного пути — по event_id, он и так
+	// в контракте listings.new (ТЗ 4.3): контракт не меняется.
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})))
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -56,28 +88,36 @@ func main() {
 	// значениями ТЗ, мусорные значения — fail-fast до поднятия компонентов.
 	perHour, err := envPositiveInt("NOTIFIER_NOTIFICATIONS_PER_HOUR", defaultNotificationsPerHour)
 	if err != nil {
-		log.Fatal(err)
+		fatal("config: notifications per hour", "error", err)
 	}
 	workers, err := envPositiveInt("NOTIFIER_WORKERS", stream.DefaultWorkers())
 	if err != nil {
-		log.Fatal(err)
+		fatal("config: workers", "error", err)
 	}
 	lenWarn, err := envPositiveInt64("NOTIFIER_STREAM_LEN_THRESHOLD", stream.DefaultLenWarnThreshold())
 	if err != nil {
-		log.Fatal(err)
+		fatal("config: stream len warn threshold", "error", err)
 	}
 	cleanupEvery, err := envPositiveDuration("NOTIFIER_STREAM_CLEANUP_INTERVAL", stream.DefaultCleanupInterval())
 	if err != nil {
-		log.Fatal(err)
+		fatal("config: stream cleanup interval", "error", err)
 	}
-	log.Printf("config: notifications/hour=%d, workers=%d, stream len warn threshold=%d, stream cleanup interval=%s",
-		perHour, workers, lenWarn, cleanupEvery)
+	debugRatePerMin, err := envPositiveInt("NOTIFIER_DEBUG_RATE_LIMIT_PER_MIN", defaultDebugRateLimitPerMin)
+	if err != nil {
+		fatal("config: debug rate limit", "error", err)
+	}
+	slog.Info("config",
+		"notifications_per_hour", perHour,
+		"workers", workers,
+		"stream_len_warn_threshold", lenWarn,
+		"stream_cleanup_interval", cleanupEvery.String(),
+		"debug_rate_limit_per_min", debugRatePerMin)
 
 	// Пул БД создаётся первым и передаётся компонентам по мере перевода
 	// хранилищ на Postgres (issue #31, этап 2).
 	pool, err := db.Connect(ctx)
 	if err != nil {
-		log.Fatal(err)
+		fatal("db: connect failed", "error", err)
 	}
 
 	// Миграции накатываются до всего остального: consumer, бот и HTTP-сервер
@@ -86,20 +126,20 @@ func main() {
 	// Даниила, раннер схему не меняет).
 	if pool != nil {
 		if err := migrate.Apply(ctx, pool); err != nil {
-			log.Fatal(err)
+			fatal("migrate: apply failed", "error", err)
 		}
 	}
 
 	opt, err := redis.ParseURL(env("REDIS_URL", "redis://localhost:6379/0"))
 	if err != nil {
-		log.Fatal(err)
+		fatal("config: REDIS_URL invalid", "error", err)
 	}
 	redisClient := redis.NewClient(opt)
 	defer redisClient.Close()
 
 	dictsClient := dicts.New(env("CORE_API_URL", "http://localhost:8000"))
 
-	subs, journal, limiter, queue := buildStores(pool, perHour)
+	subs, journal, limiter, queue, gauges := buildStores(pool, perHour)
 
 	// /stop чистит отложенные задания чата (ТЗ 4.2), если очередь реализует
 	// ChatCleaner (MemoryQueue и PgQueue реализуют); боту передаётся
@@ -119,10 +159,15 @@ func main() {
 		sender = tgBot.Send
 	} else {
 		// Режим «лог» (ФТ-3.6): совпадения пишутся в stdout, без Telegram.
-		log.Println("TELEGRAM_BOT_TOKEN is empty: log mode, bot disabled")
+		slog.Info("telegram token is empty: log mode, bot disabled")
 		mode = notify.ModeLog
 		sender = func(_ context.Context, chatID int64, e model.Event) error {
-			log.Printf("MATCH: chat %d <- listing %d (%s, $%d) %s", chatID, e.ID, e.City, e.PriceUSD, e.URL)
+			slog.Info("match: listing delivered in log mode",
+				"chat_id", chatID,
+				"listing_id", e.ID,
+				"city", e.City,
+				"price_usd", e.PriceUSD,
+				"url", e.URL)
 			return nil
 		}
 	}
@@ -151,9 +196,14 @@ func main() {
 	// не фатальны — без очистки стрим просто не режется.
 	go stream.NewReaper(redisClient, cleanupEvery).Run(ctx)
 
+	// Гейджи Prometheus (карточка 01): pending/длина стрима/отложенные и
+	// карантин обновляются раз в metricsPollEvery — скрейп в Redis/PG не ходит.
+	go pollGauges(ctx, redisClient, gauges, metricsPollEvery)
+
 	srv := &http.Server{
-		Addr:              ":8080",
-		Handler:           newMux(redisClient, dictsClient, pool, mode),
+		Addr: ":8080",
+		// Обвязка снаружи внутрь: slog-лог → HTTP-метрики Prometheus → mux.
+		Handler:           requestLogger(instrument(newMux(redisClient, dictsClient, pool, mode, debugRatePerMin))),
 		ReadHeaderTimeout: 5 * time.Second, // медленные заголовки не держат коннект (slowloris)
 	}
 	srvErr := make(chan error, 1)
@@ -185,39 +235,46 @@ func main() {
 	if pool != nil {
 		pool.Close()
 	}
-	// redisClient.Close() дублируется с defer: log.Fatal ниже обходит defer,
+	// redisClient.Close() дублируется с defer: fatal ниже обходит defer,
 	// поэтому при фатальном выходе закрываем клиент явно.
 	redisClient.Close()
 	if fatalErr != nil {
-		log.Fatal(fatalErr)
+		slog.Error("fatal: shutting down", "error", fatalErr)
+		os.Exit(1)
 	}
-	log.Println("stopped")
+	slog.Info("stopped")
 }
 
 // buildStores — точка wiring хранилищ: db-режим (pool != nil) обязан
 // использовать Pg-стек (подписки и users — ФТ-3.1, ФТ-3.2; журнал, лимит
 // 30/час и очередь отложенных — ФТ-3.5, ТЗ 3.6), memory-режим — in-memory
 // реализации. perHour — лимит уведомлений за скользящий час, читаемый
-// из NOTIFIER_NOTIFICATIONS_PER_HOUR. Класс бага #51: wiring в main
-// разъезжается с ветками db/memory, и db-режим молча работает in-memory —
-// уехало на e2e-прогоне. Вынесено из main, чтобы обе ветки wiring
-// проверялись тестами напрямую.
+// из NOTIFIER_NOTIFICATIONS_PER_HOUR. Пятый возврат — gauges: узкий
+// интерфейс счётчиков для поллера гейджей (gaugeCounters); в db-режиме это
+// PgJournal, в memory-режиме nil — deferred/quarantined не экспонируются
+// (п.4 ревью #125). Класс бага #51: wiring в main разъезжается с ветками
+// db/memory, и db-режим молча работает in-memory — уехало на e2e-прогоне.
+// Вынесено из main, чтобы обе ветки wiring проверялись тестами напрямую.
 func buildStores(pool *pgxpool.Pool, perHour int) (
 	subs store.Store,
 	journal notify.Journal,
 	limiter notify.Limiter,
 	queue notify.DeferredQueue,
+	gauges gaugeCounters,
 ) {
 	if pool != nil {
+		pgJournal := notify.NewPgJournal(pool)
 		return store.NewPostgres(pool),
-			notify.NewPgJournal(pool),
+			pgJournal,
 			notify.NewPgLimiter(pool, perHour),
-			notify.NewPgQueue(pool)
+			notify.NewPgQueue(pool),
+			pgJournal
 	}
 	return store.NewMemory(),
 		notify.NewMemoryJournal(),
 		notify.NewMemoryLimiter(perHour, time.Hour),
-		notify.NewMemoryQueue()
+		notify.NewMemoryQueue(),
+		nil
 }
 
 // probeResult — снимок состояния зависимостей для тела health-ответов.
@@ -361,8 +418,10 @@ func parallelProbe(ctx context.Context, checks []func(context.Context) bool) []b
 
 // newMux собирает HTTP-обработчики: /health и /health/ready (ФТ-3.7) и
 // /debug/event (НФТ-3). mode — режим доставки (notify.ModeLog / ModeTelegram),
-// вычисленный в main.
-func newMux(rdb *redis.Client, dictsClient *dicts.Client, pool *pgxpool.Pool, mode string) *http.ServeMux {
+// вычисленный в main. debugRatePerMin — лимит /debug/event на клиентский IP
+// в минуту (аудит 20.11, P2-25); 0 и отрицательные сюда не попадают —
+// main фейлит старт раньше.
+func newMux(rdb *redis.Client, dictsClient *dicts.Client, pool *pgxpool.Pool, mode string, debugRatePerMin int) *http.ServeMux {
 	adminKey := os.Getenv("ADMIN_KEY")
 
 	prober := &healthProber{rdb: rdb, dicts: dictsClient, pool: pool}
@@ -407,18 +466,43 @@ func newMux(rdb *redis.Client, dictsClient *dicts.Client, pool *pgxpool.Pool, mo
 		})
 	})
 
+	// /metrics — Prometheus (карточка 01 плана prod-10of10). Публичный на
+	// mux: значений секретов и PII не содержит. Гейджи обновляются фоновым
+	// поллером — скрейп в Redis/PG не ходит (см. internal/metrics).
+	mux.Handle("/metrics", metrics.Handler())
+
 	// POST /debug/event кладёт демо-событие в стрим — оно проходит весь
 	// обычный путь через consumer group. Без ADMIN_KEY эндпоинт выключен.
-	mux.HandleFunc("/debug/event", func(w http.ResponseWriter, r *http.Request) {
+	// Rate limit per-IP (аудит 20.11, P2-25) режет частоту ДО авторизации:
+	// брутфорс X-Admin-Key упирается в bucket, а каждая неудачная попытка
+	// остаётся в логах — раньше она молча терялась в 401. Неудачи копятся
+	// в прогрессивный бан: после 5 подряд IP получает 429 с оставшимся
+	// сроком блокировки (см. ratelimit.NoteAuthFailure).
+	// Лимитер создаётся только для включённого эндпоинта: выключенный
+	// (пустой ключ) отвечает 404 как факт конфигурации, а не попытка
+	// авторизации, и bucket для него не нужен.
+	var debugLimiter *ratelimit.PerIP
+	if adminKey != "" {
+		debugLimiter = ratelimit.NewPerMinute(debugRatePerMin)
+	}
+	debugEvent := func(w http.ResponseWriter, r *http.Request) {
 		if adminKey == "" {
 			http.NotFound(w, r)
 			return
 		}
+		ip := httpx.ClientIP(r)
 		got := r.Header.Get("X-Admin-Key")
 		if subtle.ConstantTimeCompare([]byte(got), []byte(adminKey)) != 1 {
+			// Прогрессивный бан за перебор ключа: после 5 неудач подряд
+			// admit начнёт отвечать 429 раньше авторизации. Сюда возможно
+			// попасть только при непустом ADMIN_KEY — debugLimiter не nil.
+			debugLimiter.NoteAuthFailure(ip)
+			slog.Warn("debug event: unauthorized attempt", "client_ip", ip)
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
+		// Верный ключ обнуляет счётчик неудач и активный бан.
+		debugLimiter.NoteAuthSuccess(ip)
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
 			http.Error(w, `{"error":"method_not_allowed"}`, http.StatusMethodNotAllowed)
@@ -446,7 +530,13 @@ func newMux(rdb *redis.Client, dictsClient *dicts.Client, pool *pgxpool.Pool, mo
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
 		json.NewEncoder(w).Encode(map[string]string{"published": "true", "stream_id": id})
-	})
+	}
+	// Лимит вешается только на включённый эндпоинт (см. создание
+	// debugLimiter выше).
+	if adminKey != "" {
+		debugEvent = debugLimiter.Middleware(debugEvent)
+	}
+	mux.HandleFunc("/debug/event", debugEvent)
 
 	return mux
 }
@@ -500,4 +590,197 @@ func envPositiveInt64(key string, fallback int64) (int64, error) {
 		return 0, fmt.Errorf("%s: %q должно быть положительным", key, raw)
 	}
 	return v, nil
+}
+
+// parseLevel разбирает NOTIFIER_LOG_LEVEL (debug/info/warn/error, регистр
+// не важен). Список намеренно без уровней вроде TRACE: это та гранулярность,
+// которую мы реально алертим и фильтруем.
+func parseLevel(raw string) (slog.Level, error) {
+	switch strings.ToLower(raw) {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info", "":
+		return slog.LevelInfo, nil
+	case "warn", "warning":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return 0, fmt.Errorf("NOTIFIER_LOG_LEVEL: %q — не уровень (debug|info|warn|error)", raw)
+	}
+}
+
+// fatal — slog.Error + os.Exit(1): замена log.Fatal для стартовых ошибок,
+// чтобы они шли в ту же JSON-структуру. Как и log.Fatal, обходит defer —
+// вызвать только до/после участков с defer-очисткой (main закрывает redis
+// явно перед fatal-выходом).
+func fatal(msg string, args ...any) {
+	slog.Error(msg, args...)
+	os.Exit(1)
+}
+
+// requestLogger — request-id middleware (карточка 02 плана prod-10of10):
+// входящий X-Request-ID сохраняется, если «безопасен» (validRequestID —
+// чтобы сквозной trace можно было начать с клиента), иначе генерируется
+// 16-hex; id возвращается в ответе и попадает в JSON-лог завершения запроса.
+func requestLogger(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rid := r.Header.Get("X-Request-ID")
+		if !validRequestID(rid) {
+			rid = newRequestID()
+		}
+		w.Header().Set("X-Request-ID", rid)
+
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
+		next.ServeHTTP(rec, r)
+		// Healthcheck compose (каждые 10 с) и скрейп /metrics (каждые 15 с,
+		// #125) бьют постоянно: на INFO такой регулярный шум топит полезные
+		// записи, для этих путей уровень — Debug.
+		logFn := slog.Info
+		if strings.HasPrefix(r.URL.Path, "/health") || strings.HasPrefix(r.URL.Path, "/metrics") {
+			logFn = slog.Debug
+		}
+		logFn("http request",
+			"request_id", rid,
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", rec.status,
+			"client_ip", httpx.ClientIP(r),
+			"duration_ms", time.Since(start).Milliseconds())
+	})
+}
+
+// maxRequestIDLen — потолок длины входящего X-Request-ID: длиннее — не id,
+// а попытка раздуть строку лога (её размер ограничен 1 МБ).
+const maxRequestIDLen = 64
+
+// validRequestID принимает входящий id только в «безопасном» виде: печатный
+// ASCII без кавычек и управляющих символов и не длиннее maxRequestIDLen.
+// Всё остальное (мусор, перебор, инъекция управляющих символов в лог)
+// заменяется сгенерированным id; пустой заголовок тоже даёт генерацию.
+func validRequestID(rid string) bool {
+	if rid == "" || len(rid) > maxRequestIDLen {
+		return false
+	}
+	for i := 0; i < len(rid); i++ {
+		c := rid[i]
+		if c < 0x20 || c > 0x7E || c == '"' || c == '\'' {
+			return false
+		}
+	}
+	return true
+}
+
+// statusRecorder ловит статус для лога: WriteHeader может не вызываться
+// для пустых ответов — дефолт 200 проставлен при создании.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+// newRequestID — 8 случайных байт в hex: 64 бита энтропии хватает для
+// корреляции запросов одного стенда, полный UUID тут избыточен.
+func newRequestID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand отказал — аномалия, но HTTP-запрос всё равно надо
+		// обработать: fallback на время достаточен для корреляции одной
+		// пачки логов.
+		return fmt.Sprintf("t%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// instrument — HTTP-обвязка метрик Prometheus (п.7d ревью #125): вынесена
+// из main, чтобы тесты гоняли тот же chain, что и прод (раньше обвязка
+// выполнялась только в живом процессе, и регрессию «счётчики не растут»
+// поймать было нечем).
+func instrument(next http.Handler) http.Handler {
+	return promhttp.InstrumentHandlerInFlight(metrics.HTTPInFlight,
+		promhttp.InstrumentHandlerDuration(metrics.HTTPDuration,
+			promhttp.InstrumentHandlerCounter(metrics.HTTPRequests, next)))
+}
+
+// gaugeCounters — узкий интерфейс счётчиков для поллера гейджей: только
+// подсчёты строк notifications_log для гейджей deferred/quarantined.
+// Реализует PgJournal; MemoryJournal не поддерживает — в memory-режиме
+// гейджи не экспонируются, чтобы Set(0) не выглядел как «очередь пуста»
+// (ложный негатив, п.4 ревью #125). Отдельно от notify.Journal: контракт
+// журнала не расширяется подсчётами, нужными только телеметрии (п.6
+// ревью #125).
+type gaugeCounters interface {
+	CountDeferred(ctx context.Context) (int, error)
+	CountQuarantined(ctx context.Context) (int, error)
+}
+
+// pollGauges обновляет гейджи internal/metrics раз в every: pending и
+// длина стрима — из Redis, отложенные и карантин — из notifications_log
+// (только db-режим; в memory-режиме counters == nil и гейджи не
+// экспонируются — п.4 ревью #125). Ошибки прохода не фатальны: гейдж
+// остаётся с прошлым значением, а неудачный проход фиксируется счётчиком
+// notifier_gauge_poll_errors_total (п.3 ревью #125) — WARN раз в 15 с
+// алерт не отличит, счётчик даст.
+func pollGauges(ctx context.Context, rdb *redis.Client, counters gaugeCounters, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			pollOnce(ctx, rdb, counters)
+		}
+	}
+}
+
+// pollOnce — один проход поллера гейджей. Весь проход под дедлайном
+// metricsPollTimeout (п.5 ревью #125): XPending/XLen/SQL иначе могли бы
+// зависнуть навсегда на «чёрной дыре» Redis/PG.
+func pollOnce(ctx context.Context, rdb *redis.Client, counters gaugeCounters) {
+	ctx, cancel := context.WithTimeout(ctx, metricsPollTimeout)
+	defer cancel()
+
+	// failed — признак ошибочной ветки прохода. Счётчик notifier_gauge_poll_errors_total
+	// инкрементируется один раз на неудачный проход: при недоступном Redis
+	// падают и XPending, и XLen — инкремент в каждой ветке удваивал бы
+	// частоту ошибки для алерта (п.3 ревью #125, тест = +1 за проход).
+	failed := false
+	if pending, err := rdb.XPending(ctx, stream.StreamName, stream.GroupName).Result(); err != nil {
+		slog.Warn("metrics: xpending failed", "error", err)
+		failed = true
+	} else {
+		metrics.StreamPending.Set(float64(pending.Count))
+	}
+	if n, err := rdb.XLen(ctx, stream.StreamName).Result(); err != nil {
+		slog.Warn("metrics: xlen failed", "error", err)
+		failed = true
+	} else {
+		metrics.StreamLength.Set(float64(n))
+	}
+	// deferred/quarantined — только db-режим: в memory-режиме counters == nil
+	// и гейджи не экспонируются (Set(0) выглядел бы как «всё чисто» — ложный
+	// негатив, п.4 ревью #125).
+	if counters != nil {
+		if n, err := counters.CountDeferred(ctx); err != nil {
+			slog.Warn("metrics: deferred count failed", "error", err)
+			failed = true
+		} else {
+			metrics.DeferredJobs.Set(float64(n))
+		}
+		if n, err := counters.CountQuarantined(ctx); err != nil {
+			slog.Warn("metrics: quarantined count failed", "error", err)
+			failed = true
+		} else {
+			metrics.QuarantinedJobs.Set(float64(n))
+		}
+	}
+	if failed {
+		metrics.GaugePollErrors.Inc()
+	}
 }
