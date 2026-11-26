@@ -28,6 +28,10 @@ HAS_0002 = (
     CORE_API_DIR / "alembic" / "versions" / "0002_roles_per_service.py"
 ).exists()
 
+HAS_0003 = (
+    CORE_API_DIR / "alembic" / "versions" / "0003_fk_indexes_checks.py"
+).exists()
+
 
 async def _verify_schema(dsn: str, head: str, *, expect_seeded: bool) -> None:
     conn = await asyncpg.connect(dsn)
@@ -56,6 +60,24 @@ async def _verify_schema(dsn: str, head: str, *, expect_seeded: bool) -> None:
             assert not await conn.fetchval(
                 "SELECT has_schema_privilege('core_api', 'notifier', 'USAGE')"
             )
+        if HAS_0003:
+            indexes = await conn.fetch(
+                "SELECT indexname FROM pg_indexes WHERE schemaname = 'core'"
+                " AND indexname IN ('listing_photos_listing_id_idx',"
+                " 'listing_duplicates_listing_b_id_idx',"
+                " 'outbox_events_listing_id_idx',"
+                " 'city_name_aliases_city_id_idx')"
+            )
+            assert len(indexes) == 4, "индексы FK-колонок не созданы"
+            checks = await conn.fetch(
+                "SELECT conname FROM pg_constraint WHERE conname IN"
+                " ('outbox_events_kind_listing_chk',"
+                " 'city_name_aliases_alias_norm_chk',"
+                " 'countries_code_upper_chk', 'currencies_code_upper_chk',"
+                " 'listings_url_hash_len_chk', 'listings_content_hash_len_chk',"
+                " 'listing_duplicates_content_hash_len_chk')"
+            )
+            assert len(checks) == 7, "CHECK-доки 0003 не созданы"
         if expect_seeded:
             assert await conn.fetchval("SELECT count(*) FROM core.countries") == 5
             assert (
