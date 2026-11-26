@@ -9,6 +9,7 @@ from app.config import settings
 from app.database import create_db_engine
 from app.error_handlers import register_error_handlers
 from app.health import router as health_router
+from app.listing_body_limit import ListingBodyLimit
 from app.listings import router as listings_router
 from app.logging_setup import setup_logging
 from app.outbox import run_outbox_worker
@@ -57,6 +58,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(ListingBodyLimit)
 register_error_handlers(app)
 app.include_router(health_router)
 app.include_router(listings_router)

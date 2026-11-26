@@ -3,10 +3,10 @@ from datetime import datetime
 from typing import Protocol
 
 from app.listing_filters import ListingFilters
-from app.listing_models import ListingCreate
+from app.listing_models import ListingCreate, ListingFields
 
 
-class StoredListing(ListingCreate):
+class StoredListing(ListingFields):
     """Сохранённое объявление с полями, назначенными Core API."""
 
     id: int

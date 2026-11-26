@@ -239,3 +239,25 @@ def test_create_returns_422_for_unknown_reference(client, payload, monkeypatch):
     body = response.json()
     assert body["error"]
     assert body["message"] == message
+
+
+def test_post_body_limit_in_bytes(client, payload, monkeypatch):
+    body = json.dumps({**payload, "title": "Квартира"}, ensure_ascii=False).encode(
+        "utf-8"
+    )
+    monkeypatch.setattr("app.listing_body_limit.MAX_LISTING_BODY_BYTES", len(body))
+    headers = {"Content-Type": "application/json"}
+
+    allowed = client.post(URL, content=body, headers=headers)
+    assert allowed.status_code == 201, allowed.text
+
+    rejected = client.post(URL, content=body + b" ", headers=headers)
+    assert rejected.status_code == 413, rejected.text
+    assert rejected.json()["error"] == "payload_too_large"
+
+
+def test_post_field_limit_returns_422(client, payload):
+    response = client.post(URL, json={**payload, "title": "я" * 257})
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"] == "validation_error"
