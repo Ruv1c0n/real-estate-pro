@@ -6,6 +6,9 @@
 # scripts/db/restore-verify.sh проверяет, что дамп восстанавливается
 # полностью, а не «файл на месте, внутри пусто».
 #
+# ВНИМАНИЕ: формат манифеста обязан совпадать в обоих скриптах:
+# scripts/db/backup.sh ↔ scripts/db/backup-loop.sh — правь синхронно.
+#
 # Использование (из корня репо):
 #   scripts/db/backup.sh                     # backups/realestate-YYYYmmdd-HHMMSS.dump
 #   scripts/db/backup.sh path/to/dump.dump   # произвольный путь

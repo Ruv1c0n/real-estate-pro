@@ -34,6 +34,8 @@ fi
 
 CONTAINER="restore-verify-$$"
 COMPUTED=$(mktemp)
+# Функция вызывается непрямым путём: trap cleanup EXIT ниже.
+# shellcheck disable=SC2329
 cleanup() {
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
     rm -f "$COMPUTED"
