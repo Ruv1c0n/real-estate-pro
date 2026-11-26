@@ -46,8 +46,7 @@ jobs:
 
   pytest:
     runs-on: ubuntu-latest
-    # services для будущих интеграционных тестов core-api; сейчас тесты без БД
-    # проходят и с ними (env ниже просто доступен, ничего не ломается).
+    # Тесты миграций и хранилища core-api используют PostgreSQL из этого задания.
     services:
       postgres:
         image: postgres:16
@@ -83,10 +82,10 @@ jobs:
       # Используем зависимости разработки, если файл существует.
       # Для сервисов без тестов пропускаем запуск pytest.
       - name: pytest (если есть тесты)
-        # env задан обоим сервисам матрицы (core-api и collector) — безвредно для
-        # collector; core-api config.py читает их без префикса (validation_alias).
+        # Интеграционные тесты core-api используют PostgreSQL для миграций и хранилища.
         env:
           DATABASE_URL: postgresql+asyncpg://app:app@127.0.0.1:5432/realestate
+          MIGRATION_TEST_DSN: postgresql://app:app@127.0.0.1:5432/postgres
           REDIS_URL: redis://127.0.0.1:6379/0
         run: |
           svc="${{ matrix.service }}"

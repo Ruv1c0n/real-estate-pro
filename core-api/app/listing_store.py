@@ -3,10 +3,10 @@ from datetime import datetime
 from typing import Protocol
 
 from app.listing_filters import ListingFilters
-from app.listing_models import ListingCreate
+from app.listing_models import ListingCreate, ListingFields
 
 
-class StoredListing(ListingCreate):
+class StoredListing(ListingFields):
     """Сохранённое объявление с полями, назначенными Core API."""
 
     id: int
@@ -23,6 +23,10 @@ class CreateListingResult:
 class ListingSearchResult:
     items: list[StoredListing]
     total: int
+
+
+class UnknownListingReferenceError(ValueError):
+    """Значение из объявления отсутствует в справочниках Core API."""
 
 
 class ListingStore(Protocol):
