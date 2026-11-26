@@ -73,7 +73,7 @@ alias это страхует).
 | price_usd | BIGINT | NOT NULL CHECK > 0 — ROUND_HALF_UP до целого USD (ТЗ 3.2) |
 | rooms | INT | NOT NULL CHECK >= 0 — студия = 0, NULL запрещён (ТЗ 3.1) |
 | floor | INT | NULL — этаж числом (ревью Даниила), не текст |
-| title, address, description | TEXT | NULL — лимиты длины валидирует Pydantic, в БД без VARCHAR(n) |
+| title, address, description | TEXT | NULL — ограничения длины для входного POST заданы в [контракте Core API](./contracts.md) и проверяются Pydantic |
 | area_m2 | NUMERIC(8,2) | CHECK NULL OR > 0 |
 | published_at | TIMESTAMPTZ | NULL |
 | content_hash | CHAR(64) | NOT NULL — SHA-256(city+country+address+rooms+area+deal_type), считает Core API при вставке (ТЗ 3.3) |
