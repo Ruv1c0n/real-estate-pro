@@ -102,7 +102,7 @@ docker compose down
 
 ## Целевая конфигурация по ТЗ
 
-Добавлены `.env.example`, Redis volume/AOF/noeviction и проверки готовности notifier. Этап 2 notifier реализован: встроенный раннер автоматически применяет при старте SQL-миграции схемы `notifier` из `notifier/migrations/` (готовит Илья; сейчас `0001`, `0002`), а подписки, журнал уведомлений, счётчики лимита 30/час и отложенные задания хранятся в PostgreSQL. Если не заданы ни `DATABASE_URL`, ни переменные `POSTGRES_*`, notifier работает в memory-режиме (fallback: подписки живут до рестарта); если переменные заданы, но PostgreSQL недоступен на старте, сервис завершается фатальной ошибкой (fail-fast).
+Добавлены `.env.example`, Redis volume/AOF/noeviction и проверки готовности notifier. Этап 2 notifier реализован: встроенный раннер автоматически применяет при старте SQL-миграции схемы `notifier` из `notifier/migrations/` (готовит Илья; сейчас `0001`, `0002`, `0003`), а подписки, журнал уведомлений, счётчики лимита 30/час и отложенные задания хранятся в PostgreSQL. Если не заданы ни `DATABASE_URL`, ни переменные `POSTGRES_*`, notifier работает в memory-режиме (fallback: подписки живут до рестарта); если переменные заданы, но PostgreSQL недоступен на старте, сервис завершается фатальной ошибкой (fail-fast).
 
 Как понять режим: при старте в memory-режиме notifier пишет в лог `DB disabled: running in memory mode`, а поле `db` в телах `GET /health` и `GET /health/ready` отражает наличие пула PostgreSQL. `db: false` при отсутствии пула (`nil`) — это memory-режим, а не авария, и readiness он не понижает.
 
@@ -244,6 +244,7 @@ docker compose down
 - [Contributing](CONTRIBUTING.ru.md) — правила веток и коммитов, CI и требования ТЗ к изменению контрактов.
 - [docs/incident-runbook.md](docs/incident-runbook.md) — runbook для дежурного: симптом → диагноз → действия (карточка 09).
 - Доки сервисов: [notifier](notifier/README.md), [core-api](core-api/README.md), [collector](collector/README.md).
+- CI/CD репозитория: [.github/CICD.md](.github/CICD.md) — workflows, гвард ссылок, шаблон PR, Dependabot.
 
 ### Архитектура и диаграммы (GitHub Pages)
 

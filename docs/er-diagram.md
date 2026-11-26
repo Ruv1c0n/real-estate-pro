@@ -118,44 +118,8 @@ python -I scripts/tools/sql-to-er.py core-schema.sql
 
 ## Схема notifier
 
-Таблицы из SQL-миграций notifier (0001/0002, в main). Сгенерирована тем же
-конвейером `sql-to-er.py` (без корректировок).
+Диаграмма notifier вынесена в отдельный файл —
+[er-diagram-notifier.md](er-diagram-notifier.md): миграции notifier
+меняются независимо от core, отдельный файл обновляется вместе с ними,
+не трогая этот.
 
-```mermaid
-erDiagram
-    users {
-        BIGINT chat_id PK
-        TIMESTAMPTZ created_at
-    }
-    subscriptions {
-        BIGINT id PK
-        BIGINT chat_id FK
-        TEXT deal_type
-        TEXT country
-        TEXT city
-        INTEGER rooms
-        BIGINT min_price_usd
-        BIGINT max_price_usd
-        TIMESTAMPTZ created_at
-    }
-    notifications_log {
-        BIGINT id PK
-        BIGINT chat_id FK
-        BIGINT listing_id UK
-        UUID event_id
-        TEXT status
-        TEXT mode
-        JSONB payload
-        TIMESTAMPTZ created_at
-        TIMESTAMPTZ sent_at
-        TIMESTAMPTZ available_at
-    }
-
-    users ||--o{ subscriptions : chat_id
-    users ||--o{ notifications_log : chat_id
-```
-
-Примечание: `notifications_log.listing_id` помечен `UK` условно — реальная
-уникальность составная `UNIQUE (chat_id, listing_id)` (одна запись на пару
-«пользователь × объявление»). `listing_id` — ID объявления из core **без
-межсхемного FK** (ТЗ 6.5).

@@ -102,7 +102,7 @@ docker compose down
 
 ## Target configuration (per the spec)
 
-`.env.example`, Redis volume/AOF/noeviction and notifier readiness checks have been added. Notifier stage 2 is in place: the embedded runner applies the SQL migrations of the `notifier` schema from `notifier/migrations/` (prepared by Ilya; currently `0001`, `0002`) automatically at startup, and subscriptions, the notification journal, the 30-per-hour limit counters and deferred jobs are stored in PostgreSQL. If neither `DATABASE_URL` nor the `POSTGRES_*` variables are set, notifier runs in memory mode (fallback: subscriptions survive only until restart); if the variables are set but PostgreSQL is unreachable at startup, the service exits with a fatal error (fail-fast).
+`.env.example`, Redis volume/AOF/noeviction and notifier readiness checks have been added. Notifier stage 2 is in place: the embedded runner applies the SQL migrations of the `notifier` schema from `notifier/migrations/` (prepared by Ilya; currently `0001`, `0002`, `0003`) automatically at startup, and subscriptions, the notification journal, the 30-per-hour limit counters and deferred jobs are stored in PostgreSQL. If neither `DATABASE_URL` nor the `POSTGRES_*` variables are set, notifier runs in memory mode (fallback: subscriptions survive only until restart); if the variables are set but PostgreSQL is unreachable at startup, the service exits with a fatal error (fail-fast).
 
 How to tell the modes apart: at startup in memory mode notifier logs `DB disabled: running in memory mode`, and the `db` field in the `GET /health` and `GET /health/ready` response bodies reflects the PostgreSQL pool. `db: false` with no pool (`nil`) is memory mode, not an outage, and does not degrade readiness.
 
@@ -244,6 +244,7 @@ cycles.
 - [Contributing](CONTRIBUTING.md) — branch/commit conventions, CI and the spec's change-control rules.
 - [docs/incident-runbook.md](docs/incident-runbook.md) — symptom → diagnosis → action playbook for on-call (card 09).
 - Per-service docs: [notifier](notifier/README.md), [core-api](core-api/README.md), [collector](collector/README.md).
+- Repo-level CI/CD: [.github/CICD.md](.github/CICD.md) — workflows, link guard, PR template, Dependabot.
 
 ### Architecture and diagrams (GitHub Pages)
 

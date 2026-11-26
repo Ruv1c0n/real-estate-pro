@@ -9,6 +9,8 @@
 | [core-schema-draft.md](core-schema-draft.md) | Дизайн-док схемы `core` (согласована, смержена в PR #66). Alembic-миграция влита (PR #81): источник правды по схеме — миграция `core-api/alembic/`, этот документ остаётся историческим обоснованием решений. |
 | [db-backup-restore.md](db-backup-restore.md) | Регламент бэкапа/восстановления PostgreSQL: «дамп без успешной restore-verify бэкапом не считается» (PR #83). |
 | [db-quickstart-for-devs.md](db-quickstart-for-devs.md) | Быстрый старт разработчика с PostgreSQL (PR #83). |
+| [er-diagram.md](er-diagram.md) | ER-диаграмма схемы `core` (ТЗ 6.1, PR #86): сущности и связи по Alembic-миграциям. |
+| [er-diagram-notifier.md](er-diagram-notifier.md) | ER-диаграмма схемы `notifier` (ТЗ 6.1, issue #120): сущности и связи по SQL-миграциям notifier. |
 | [incident-runbook.md](incident-runbook.md) | Runbook инцидентов: симптом → диагноз → действия → «починилось, если». Корреляция по `event_id`/`X-Request-ID`. |
 
 ## Правила изменений (ТЗ 6.5, кратко)
