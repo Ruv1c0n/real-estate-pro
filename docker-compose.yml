@@ -34,6 +34,38 @@ services:
       timeout: 3s
       retries: 10
 
+  # Одноразовая выдача паролей сервисным ролям (миграция 0002, PR #82).
+  # Без заданных пар — no-op: стек работает под общей ролью app, как раньше.
+  # Неполная пара (user без password) валит стек на старте с явной ошибкой
+  # (both-or-neither), а не в рантайме через /health/ready.
+  # Порядок: роли создаёт миграция 0002, её применяет core-migrations —
+  # выдача пар идёт строго после него, вручную ничего вызывать не нужно.
+  db-roles-setup:
+    image: postgres:16
+    restart: "no"
+    logging: *default-logging
+    environment:
+      PGHOST: postgres
+      # admin-роль, от которой выдаются пароли (ALTER ROLE), — это app,
+      # не сервисные роли.
+      POSTGRES_USER: "${POSTGRES_USER:-app}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-app}"
+      POSTGRES_DB: "${POSTGRES_DB:-realestate}"
+      CORE_API_DB_USER: "${CORE_API_DB_USER:-}"
+      CORE_API_DB_PASSWORD: "${CORE_API_DB_PASSWORD:-}"
+      NOTIFIER_DB_USER: "${NOTIFIER_DB_USER:-}"
+      NOTIFIER_DB_PASSWORD: "${NOTIFIER_DB_PASSWORD:-}"
+    volumes:
+      # Скрипт монтируется только на чтение: содержимое не зависит от окружения.
+      - ./scripts/ops/db-roles-setup.sh:/setup.sh:ro
+    entrypoint: ["bash", "/setup.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # Роли создаёт миграция 0002 — выдача пар без неё невозможна.
+      core-migrations:
+        condition: service_completed_successfully
+
   redis:
     image: redis:7
     restart: unless-stopped
@@ -58,6 +90,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
   core-migrations:
     build: ./core-api
     environment: *core-postgres
@@ -74,10 +107,18 @@ services:
       - "8000:8000"
     environment:
       <<: *core-postgres
+      # Per-service роль (PR #82): переопределяем анкер; дефолт — общая пара
+      # POSTGRES_USER/PASSWORD, чтобы кастомизация общего пароля в .env
+      # не терялась, пока сервисные пары *_DB_USER/*_DB_PASSWORD не заданы.
+      POSTGRES_USER: "${CORE_API_DB_USER:-${POSTGRES_USER:-app}}"
+      POSTGRES_PASSWORD: "${CORE_API_DB_PASSWORD:-${POSTGRES_PASSWORD:-app}}"
       REDIS_URL: redis://redis:6379/0
       CORE_API_LOG_LEVEL: "${CORE_API_LOG_LEVEL:-INFO}"
     depends_on:
       core-migrations:
+        condition: service_completed_successfully
+      # Пароль роли должен быть выдан до первого подключения core-api.
+      db-roles-setup:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
@@ -125,8 +166,10 @@ services:
       # переменными, чтобы спецсимволы пароля не ломали подключение.
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
-      POSTGRES_USER: "${POSTGRES_USER:-app}"
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-app}"
+      # Per-service роль (PR #82): notifier не получает доступ к схеме core;
+      # дефолт — общая пара POSTGRES_USER/PASSWORD (аналогично core-api выше).
+      POSTGRES_USER: "${NOTIFIER_DB_USER:-${POSTGRES_USER:-app}}"
+      POSTGRES_PASSWORD: "${NOTIFIER_DB_PASSWORD:-${POSTGRES_PASSWORD:-app}}"
       POSTGRES_DB: "${POSTGRES_DB:-realestate}"
       # Пустое значение допустимо: dsnFromEnv считает незаданный sslmode
       # пустым и подставляет дефолт disable (notifier/internal/db/db.go).
@@ -137,6 +180,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      # Пароль роли должен быть выдан до первого подключения notifier.
+      db-roles-setup:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
       # notifier ходит в справочники Core API — ждём его готовности.
