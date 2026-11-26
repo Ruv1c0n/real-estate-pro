@@ -105,6 +105,7 @@ async def get_listing(
             "model": ListingCreateResponse,
             "description": "Объявление с таким source и external_id уже существует",
         },
+        413: {"description": "Тело запроса превышает 128 КиБ"},
         422: {
             "description": "Ошибка валидации объявления",
             "content": {
