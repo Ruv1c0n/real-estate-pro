@@ -1,17 +1,17 @@
 # Graph Report - real-estate-pro  (2026-11-26)
 
 ## Corpus Check
-- 120 files · ~83,612 words
+- 121 files · ~83,864 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 13 file(s) not represented in the graph (top: (none) 10, .example 1, .ini 1)
 
 ## Summary
-- 1642 nodes · 3958 edges · 128 communities (96 shown, 32 thin omitted)
+- 1643 nodes · 3958 edges · 129 communities (96 shown, 33 thin omitted)
 - Extraction: 85% EXTRACTED · 15% INFERRED · 0% AMBIGUOUS · INFERRED: 595 edges (avg confidence: 0.85)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `719483c5`
+- Built from commit: `dc793308`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -175,7 +175,7 @@
 - **Required CI checks for merge (require-ci ruleset)** — contributing_ci_checks, contributing_require_ci, contributing_gitleaks, contributing_python_ci [EXTRACTED 1.00]
 - **Многоуровневая дедупликация: Redis-хэш Collector → уникальность PostgreSQL → журнал уведомлений notifier** — docs_contracts_dedup_source_external_id, docs_real_estate_pro_tz_url_hash, docs_real_estate_pro_tz_dedup_urls, docs_real_estate_pro_tz_фт_3_5, docs_real_estate_pro_tz_exactly_once [INFERRED 0.85]
 
-## Communities (128 total, 32 thin omitted)
+## Communities (129 total, 33 thin omitted)
 
 ### Community 0 - "model_test.go"
 Cohesion: 0.16
@@ -563,14 +563,14 @@ Nodes (3): isAlphaUpper2(), isHexDigit(), validUUID()
 
 ## Knowledge Gaps
 - **62 isolated node(s):** `notifier`, `PGPASSWORD`, `4.6 Необязательный mock-сервер источника`, `НФТ-3: X-Admin-Key для /debug/*, /collect/run и статусов`, `ФТ-1.7: Веб-интерфейс Jinja2 + HTMX` (+57 more)
-  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 482 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
-- **32 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 483 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
+- **33 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
 - **Why does `content_hash()` connect `sql-to-er.py` to `2. Сценарии`, `Быстрый старт по схеме core — для разработчиков`?**
-  _High betweenness centrality (0.324) - this node is a cross-community bridge._
+  _High betweenness centrality (0.320) - this node is a cross-community bridge._
 - **Are the 12 inferred relationships involving `testEvent()` (e.g. with `TestPgDispatcherRedeliveredOnceAfterDBFailure()` and `TestPgDispatcherDoubleDelivery()`) actually correct?**
   _`testEvent()` has 12 INFERRED edges - model-reasoned connections that need verification._
 - **What connects `notifier`, `PGPASSWORD`, `4.6 Необязательный mock-сервер источника` to the rest of the system?**
@@ -578,7 +578,7 @@ _Questions this graph is uniquely positioned to answer:_
 - **Should `Event` be split into smaller, more focused modules?**
   _Cohesion score 0.1126984126984127 - nodes in this community are weakly interconnected._
 - **Why does `Схема notifier — анализ запросов (дополнение)` connect `sql-to-er.py` to `Subscription`?**
-  _High betweenness centrality (0.320) - this node is a cross-community bridge._
+  _High betweenness centrality (0.317) - this node is a cross-community bridge._
 - **Are the 7 inferred relationships involving `ListingFilters` (e.g. with `InMemoryListingStore` and `_matches_filters()`) actually correct?**
   _`ListingFilters` has 7 INFERRED edges - model-reasoned connections that need verification._
 - **Should `main.py` be split into smaller, more focused modules?**
