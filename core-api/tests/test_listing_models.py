@@ -145,3 +145,36 @@ def test_published_at_is_converted_to_utc(payload):
 
     assert listing.published_at == datetime(2026, 11, 18, 0, 30, tzinfo=UTC)
     assert listing.published_at.tzinfo is UTC
+
+
+@pytest.mark.parametrize(
+    ("field", "limit"),
+    [
+        ("source", 64),
+        ("external_id", 256),
+        ("city", 128),
+        ("title", 256),
+        ("address", 512),
+        ("description", 10_000),
+    ],
+)
+def test_listing_text_limits(payload, field, limit):
+    ListingCreate.model_validate({**payload, field: "я" * limit})
+
+    with pytest.raises(ValidationError):
+        ListingCreate.model_validate({**payload, field: "я" * (limit + 1)})
+
+
+def test_listing_photo_and_url_limits(payload):
+    prefix = "https://example.org/"
+    url = prefix + "a" * (2048 - len(prefix))
+
+    ListingCreate.model_validate({**payload, "url": url, "photos": [url] * 10})
+
+    for changes in (
+        {"url": url + "x"},
+        {"photos": [url + "x"]},
+        {"photos": [url] * 11},
+    ):
+        with pytest.raises(ValidationError):
+            ListingCreate.model_validate({**payload, **changes})
