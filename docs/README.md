@@ -11,6 +11,7 @@
 | [db-quickstart-for-devs.md](db-quickstart-for-devs.md) | Быстрый старт разработчика с PostgreSQL (PR #83). |
 | [er-diagram.md](er-diagram.md) | ER-диаграмма схемы `core` (ТЗ 6.1, PR #86): сущности и связи по Alembic-миграциям. |
 | [er-diagram-notifier.md](er-diagram-notifier.md) | ER-диаграмма схемы `notifier` (ТЗ 6.1, issue #120): сущности и связи по SQL-миграциям notifier. |
+| [incident-runbook.md](incident-runbook.md) | Runbook инцидентов: симптом → диагноз → действия → «починилось, если». Корреляция по `event_id`/`X-Request-ID`. |
 
 ## Правила изменений (ТЗ 6.5, кратко)
 
