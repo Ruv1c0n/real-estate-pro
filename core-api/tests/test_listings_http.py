@@ -6,9 +6,12 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from app.in_memory_listing_store import InMemoryListingStore
+from app.listing_cache import listing_cache_key
+from app.listing_filters import ListingFilters
 from app.listing_store import UnknownListingReferenceError
 from app.main import app
 from fastapi.testclient import TestClient
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 URL = "/api/v1/listings"
 
@@ -16,16 +19,26 @@ URL = "/api/v1/listings"
 @pytest.fixture
 def redis_client(monkeypatch):
     redis = AsyncMock()
+    redis.get.return_value = None
+    redis.set.return_value = False
     monkeypatch.setattr("app.main.create_redis_client", lambda url: redis)
     return redis
 
 
 @pytest.fixture
 def client(redis_client, monkeypatch):
+    store = InMemoryListingStore()
     monkeypatch.setattr(
-        "app.main.PostgresListingStore",
-        lambda engine: InMemoryListingStore(),
+        store,
+        "has_pending_cache_invalidation",
+        AsyncMock(return_value=False),
+        raising=False,
     )
+    monkeypatch.setattr(
+        store, "invalidate_next", AsyncMock(return_value=False), raising=False
+    )
+    monkeypatch.setattr("app.main.PostgresListingStore", lambda engine: store)
+
     with TestClient(app) as test_client:
         yield test_client
 
@@ -261,3 +274,70 @@ def test_post_field_limit_returns_422(client, payload):
 
     assert response.status_code == 422, response.text
     assert response.json()["error"] == "validation_error"
+
+
+def test_listings_cache_hit_keeps_exact_json(
+    client, redis_client, payload, monkeypatch
+):
+    search = AsyncMock(wraps=app.state.listing_store.search)
+    monkeypatch.setattr(app.state.listing_store, "search", search)
+
+    assert client.post(URL, json=payload).status_code == 201
+    redis_client.get.side_effect = ["7", None]
+    first = client.get(URL)
+    assert first.status_code == 200, first.text
+
+    redis_client.get.side_effect = ["7", first.text]
+    second = client.get(URL)
+    assert second.status_code == 200, second.text
+    assert second.content == first.content
+    items = json.loads(second.content, parse_float=Decimal)["items"]
+    assert items[0]["price"] == Decimal("380.25")
+
+    search.assert_awaited_once()
+    key = redis_client.get.await_args.args[0]
+    redis_client.set.assert_awaited_once_with(key, first.text, ex=600)
+
+
+@pytest.mark.parametrize("operation", ["get", "set"])
+def test_listings_fall_back_when_redis_fails(client, redis_client, payload, operation):
+    if operation == "set":
+        redis_client.get.side_effect = ["7", None]
+    getattr(redis_client, operation).side_effect = RedisConnectionError(
+        "Redis unavailable"
+    )
+
+    assert client.post(URL, json=payload).status_code == 201
+    response = client.get(URL)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["total"] == 1
+
+
+def test_listings_skip_cache_until_invalidation_is_processed(
+    client, redis_client, payload
+):
+    store = app.state.listing_store
+    redis_client.get.side_effect = ["7", None]
+    stale = client.get(URL)
+    assert stale.json()["total"] == 0
+
+    assert client.post(URL, json=payload).status_code == 201
+    store.has_pending_cache_invalidation.return_value = True
+    redis_client.get.reset_mock()
+    redis_client.get.side_effect = ["7", stale.text]
+
+    fresh = client.get(URL)
+    assert fresh.status_code == 200, fresh.text
+    assert fresh.json()["total"] == 1
+    redis_client.get.assert_not_awaited()
+
+    store.has_pending_cache_invalidation.return_value = False
+    redis_client.get.side_effect = ["8", None]
+    updated = client.get(URL)
+    assert updated.content == fresh.content
+    key = listing_cache_key(ListingFilters(), 8)
+    redis_client.set.assert_awaited_with(key, updated.text, ex=600)
+
+    redis_client.get.side_effect = ["8", updated.text]
+    assert client.get(URL).content == fresh.content

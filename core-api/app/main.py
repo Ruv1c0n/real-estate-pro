@@ -10,6 +10,7 @@ from app.database import create_db_engine
 from app.error_handlers import register_error_handlers
 from app.health import router as health_router
 from app.listing_body_limit import ListingBodyLimit
+from app.listing_cache import ListingPageCache
 from app.listings import router as listings_router
 from app.logging_setup import setup_logging
 from app.outbox import run_outbox_worker
@@ -35,11 +36,18 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         application.state.db_engine = db_engine
         application.state.redis = redis_client
         application.state.listing_store = store
+        application.state.listing_page_cache = ListingPageCache(
+            redis_client,
+            settings.cache_ttl_seconds,
+            store.has_pending_cache_invalidation,
+        )
 
         stop = asyncio.Event()
         async with asyncio.TaskGroup() as tasks:
             tasks.create_task(
-                run_outbox_worker(store, redis_client, stop),
+                run_outbox_worker(
+                    store, redis_client, stop, invalidate_next=store.invalidate_next
+                ),
                 name="outbox-worker",
             )
             logger.info("Core API started")

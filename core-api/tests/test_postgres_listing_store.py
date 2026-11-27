@@ -9,10 +9,15 @@ from uuid import uuid4
 
 import pytest
 from app.database import create_db_engine
+from app.listing_cache import CACHE_VERSION_KEY
 from app.listing_filters import ListingFilters
 from app.listing_models import ListingCreate
 from app.listing_store import UnknownListingReferenceError
-from app.outbox import publish_listing_event
+from app.outbox import (
+    invalidate_listings_cache,
+    publish_listing_event,
+    run_outbox_worker,
+)
 from app.postgres_listing_store import PostgresListingStore
 from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import text
@@ -378,3 +383,41 @@ async def test_search_applies_sql_filters(search_store, criteria, expected):
 async def test_get_out_of_range_listing_id(pg_engine, listing_id):
     store = PostgresListingStore(pg_engine)
     assert await store.get(listing_id) is None
+
+
+@pytest.mark.anyio
+async def test_cache_invalidation_retries_after_redis_failure(outbox_listing):
+    engine, store, _ = outbox_listing
+    redis = AsyncMock()
+    redis.incr.side_effect = RedisConnectionError("Redis unavailable")
+    statement = text("""
+        SELECT published_at
+        FROM core.outbox_events
+        WHERE kind = 'cache_invalidate'
+    """)
+
+    with pytest.raises(RedisConnectionError):
+        await store.invalidate_next(partial(invalidate_listings_cache, redis))
+
+    assert await store.has_pending_cache_invalidation()
+
+    async with engine.connect() as connection:
+        assert (await connection.execute(statement)).scalar_one() is None
+
+    stop = asyncio.Event()
+
+    async def increment_version(key):
+        assert key == CACHE_VERSION_KEY
+        stop.set()
+        return 1
+
+    redis.incr.side_effect = increment_version
+    async with asyncio.timeout(5):
+        await run_outbox_worker(
+            store, redis, stop, invalidate_next=store.invalidate_next
+        )
+
+    async with engine.connect() as connection:
+        assert (await connection.execute(statement)).scalar_one() is not None
+    assert redis.incr.await_count == 2
+    redis.xadd.assert_awaited_once()

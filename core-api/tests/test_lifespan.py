@@ -14,6 +14,9 @@ def clients(monkeypatch):
         "publish_next",
         AsyncMock(return_value=False),
     )
+    monkeypatch.setattr(
+        main.PostgresListingStore, "invalidate_next", AsyncMock(return_value=False)
+    )
     redis_client = SimpleNamespace(aclose=AsyncMock())
 
     db_factory = MagicMock(return_value=engine)
@@ -83,9 +86,10 @@ def test_outbox_worker_stops_before_redis_closes(clients, monkeypatch):
     _, redis_client, _, _ = clients
     events = []
 
-    async def worker(store, redis, stop):
+    async def worker(store, redis, stop, *, invalidate_next):
         assert store is main.app.state.listing_store
         assert redis is redis_client
+        assert invalidate_next == store.invalidate_next
         events.append("worker_started")
         await stop.wait()
         events.append("worker_stopped")
