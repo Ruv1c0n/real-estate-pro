@@ -121,10 +121,13 @@ async def _verify_schema(dsn: str, head: str, *, expect_seeded: bool) -> None:
             assert probe_owner == "notifier", (
                 f"владение probe-таблицей не перенесено (получено: {probe_owner})"
             )
-            assert await conn.fetchval(
-                "SELECT pg_get_userbyid(c.relowner) FROM pg_class c"
-                " WHERE c.oid = 'notifier.migration_probe_ownership_id_seq'::regclass"
-            ) == "notifier", "владение identity-последовательностью не перенесено"
+            assert (
+                await conn.fetchval(
+                    "SELECT pg_get_userbyid(c.relowner) FROM pg_class c"
+                    " WHERE c.oid = 'notifier.migration_probe_ownership_id_seq'::regclass"
+                )
+                == "notifier"
+            ), "владение identity-последовательностью не перенесено"
             # эмуляция раннера notifier под сервисной ролью: создаёт и удаляет
             # таблицу своей схемы (на 0002 без 0004 падало с permission denied)
             probe_conn = await asyncpg.connect(dsn)
