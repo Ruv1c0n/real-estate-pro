@@ -378,3 +378,62 @@ async def test_search_applies_sql_filters(search_store, criteria, expected):
 async def test_get_out_of_range_listing_id(pg_engine, listing_id):
     store = PostgresListingStore(pg_engine)
     assert await store.get(listing_id) is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("second_source", "changes", "second_changes", "expected_pairs"),
+    [
+        ("mock", {}, {}, 1),
+        ("avito", {}, {}, 0),
+        ("mock", {"area_m2": None}, {}, 0),
+        ("mock", {"address": None}, {}, 0),
+        ("mock", {"address": " \t "}, {}, 0),
+        ("mock", {"address": None}, {"address": ""}, 0),
+    ],
+)
+async def test_possible_duplicates(
+    pg_engine, listing_data, second_source, changes, second_changes, expected_pairs
+):
+    store = PostgresListingStore(pg_engine)
+    payload = {
+        **listing_data,
+        "source": "avito",
+        "address": f"Тестовый адрес {listing_data['external_id']}",
+        "area_m2": Decimal("45.50"),
+        **changes,
+    }
+    first_listing = ListingCreate.model_validate(payload)
+    second_listing = ListingCreate.model_validate(
+        {
+            **payload,
+            "source": second_source,
+            "external_id": f"{payload['external_id']}-second",
+            **second_changes,
+        }
+    )
+
+    first, second = await asyncio.gather(
+        store.create_or_get(first_listing),
+        store.create_or_get(second_listing),
+    )
+    assert first.created and second.created
+    assert first.listing.id != second.listing.id
+
+    repeat = await store.create_or_get(first_listing)
+    assert not repeat.created
+    assert repeat.listing.id == first.listing.id
+
+    listing_a_id, listing_b_id = sorted((first.listing.id, second.listing.id))
+    async with pg_engine.connect() as connection:
+        pair_count = await connection.scalar(
+            text("""
+                SELECT count(*)
+                FROM core.listing_duplicates
+                WHERE listing_a_id = :listing_a_id
+                  AND listing_b_id = :listing_b_id
+            """),
+            {"listing_a_id": listing_a_id, "listing_b_id": listing_b_id},
+        )
+
+    assert pair_count == expected_pairs
