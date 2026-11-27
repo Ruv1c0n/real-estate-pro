@@ -80,6 +80,28 @@ _INSERT_PHOTO = text("""
     VALUES (:listing_id, :url, :sort)
 """)
 
+_LOCK_DUPLICATE_MATCH = text("SELECT pg_advisory_xact_lock(CAST(:lock_key AS bigint))")
+
+_INSERT_POSSIBLE_DUPLICATES = text("""
+    INSERT INTO core.listing_duplicates (listing_a_id, listing_b_id, content_hash)
+    SELECT
+        LEAST(incoming.id, candidate.id),
+        GREATEST(incoming.id, candidate.id),
+        incoming.content_hash
+    FROM core.listings AS incoming
+    JOIN core.listings AS candidate
+      ON candidate.content_hash = incoming.content_hash
+     AND candidate.source_id <> incoming.source_id
+     AND candidate.city_id = incoming.city_id
+     AND candidate.country_code = incoming.country_code
+     AND candidate.address = incoming.address
+     AND candidate.rooms = incoming.rooms
+     AND candidate.area_m2 = incoming.area_m2
+     AND candidate.deal_type = incoming.deal_type
+    WHERE incoming.id = :listing_id
+    ON CONFLICT (listing_a_id, listing_b_id) DO NOTHING
+""")
+
 _INSERT_EVENT = text("""
     INSERT INTO core.outbox_events (event_id, kind, listing_id, payload)
     VALUES (:event_id, :kind, :listing_id, CAST(CAST(:payload AS text) AS jsonb))
@@ -164,7 +186,8 @@ class PostgresListingStore:
             )
         )
         params["url_hash"] = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-        params["content_hash"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        params["content_hash"] = content_hash
 
         async with self._engine.begin() as connection:
             inserted = await connection.execute(_INSERT_LISTING, params)
@@ -181,6 +204,20 @@ class PostgresListingStore:
                     raise UnknownListingReferenceError(
                         "Неизвестный источник, город для указанной страны или валюта"
                     )
+
+            if (
+                created
+                and listing.area_m2 is not None
+                and (listing.address or "").strip()
+            ):
+                lock_key = int.from_bytes(
+                    bytes.fromhex(content_hash[:16]), byteorder="big", signed=True
+                )
+                # Запрос поиска после блокировки увидит уже завершённую вставку.
+                await connection.execute(_LOCK_DUPLICATE_MATCH, {"lock_key": lock_key})
+                await connection.execute(
+                    _INSERT_POSSIBLE_DUPLICATES, {"listing_id": listing_id}
+                )
 
             if created and listing.photos:
                 await connection.execute(
