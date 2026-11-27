@@ -9,7 +9,21 @@
 
 BEGIN;
 
-CREATE SCHEMA IF NOT EXISTS notifier;
+-- Схема создаётся только когда её нет. Прямой CREATE SCHEMA IF NOT EXISTS
+-- здесь не годится: PostgreSQL проверяет право CREATE на БАЗЕ до проверки
+-- «уже существует» даже с IF NOT EXISTS, а роль notifier (per-service,
+-- alembic 0004_roles_notifier_ddl) права на базу сознательно не имеет
+-- (ТЗ 6.5). На стенде схему к моменту 0001 уже создал alembic-0002 под
+-- общей ролью — DO-блок молча пропускает создание; на чистой БД без
+-- alembic (CI-джоба notifier-sql, ручной прогон администратором) CREATE
+-- выполняется. Идемпотентность: повторный прогон — no-op.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'notifier') THEN
+        CREATE SCHEMA notifier;
+    END IF;
+END
+$$;
 
 -- Пользователи Telegram-бота. /start создаёт запись, /stop удаляет её
 -- вместе с подписками и журналом (ON DELETE CASCADE), ФТ-3.1.

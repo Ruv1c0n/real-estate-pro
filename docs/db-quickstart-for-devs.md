@@ -13,8 +13,9 @@
 ```bash
 docker compose up -d postgres          # БД (учётка из .env / .env.example)
 cd core-api
-alembic upgrade head                   # применить миграции (0001 схема, 0002 роли)
-alembic current                        # текущая версия (0002)
+alembic upgrade head                   # применить миграции (0001 схема, 0002 роли,
+                                       # 0003 FK-индексы/CHECK, 0004 DDL notifier)
+alembic current                        # текущая версия (0004)
 alembic downgrade 0001                 # откат (роли удалятся, таблицы останутся)
 alembic upgrade head                   # и вернуть
 ```
@@ -109,15 +110,21 @@ WHERE content_hash = :content_hash;
 `(deal_type, city_id, price_usd)`, `(created_at DESC)`, `(rooms)`, `(area_m2)`,
 `(content_hash)`. Пустая страница — валидный `200` (контракт), запросы работают.
 
-## Роли (миграция 0002)
+## Роли (миграции 0002 и 0004)
 
 Созданы роли `core_api` (только схема `core`) и `notifier` (только `notifier`),
 без паролей — пароли выдаются при депое (см. план координации в PR #82).
-Пока переключение не выполнено, сервисы ходят под `app`. Права сервисов:
+Миграция 0004 добавила роли `notifier` DDL её схемы (CREATE) и владение её
+таблицами: встроенный раннер SQL-миграций notifier работает под сервисной
+ролью, пары `NOTIFIER_DB_USER/NOTIFIER_DB_PASSWORD` включать можно. Пока
+переключение не выполнено, сервисы ходят под `app`; дефолтный режим 0004 не
+затронут — `app` сохраняет DML на таблицы notifier. Права сервисов:
 
 ```sql
 SELECT has_table_privilege('core_api', 'core.listings', 'SELECT');   -- true
 SELECT has_schema_privilege('notifier', 'core', 'USAGE');            -- false
+SELECT has_schema_privilege('notifier', 'notifier', 'CREATE');       -- true (0004)
+SELECT has_database_privilege('notifier', current_database(), 'CREATE'); -- false
 ```
 
 ## Частые грабли
