@@ -48,12 +48,6 @@ _LISTING_SELECT = """
 
 _GET_LISTING = text(_LISTING_SELECT + "\nWHERE l.id = :listing_id")
 
-_EXPECTED_PRICE_USD = text("""
-    SELECT round(CAST(:price AS numeric) * rate_to_usd)
-    FROM core.currencies
-    WHERE code = :currency
-""")
-
 _INSERT_LISTING = text("""
     INSERT INTO core.listings (
         source_id, external_id, url_hash, url, deal_type, country_code,
@@ -72,7 +66,12 @@ _INSERT_LISTING = text("""
       AND c.name = :city
       AND cur.code = :currency
     ON CONFLICT (source_id, external_id) DO NOTHING
-    RETURNING id
+    RETURNING id, (
+        -- Для положительных NUMERIC round соответствует ROUND_HALF_UP (ТЗ 3.2).
+        SELECT round(core.listings.price * cur.rate_to_usd)
+        FROM core.currencies AS cur
+        WHERE cur.code = core.listings.currency_code
+    ) AS expected_usd
 """)
 
 _FIND_EXISTING_ID = text("""
@@ -174,19 +173,18 @@ class PostgresListingStore:
         params["content_hash"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
         async with self._engine.begin() as connection:
-            expected_usd = await connection.scalar(
-                _EXPECTED_PRICE_USD,
-                {"price": listing.price, "currency": listing.currency},
-            )
-            if expected_usd is not None and listing.price_usd != expected_usd:
-                raise ListingPriceMismatchError(
-                    f"price_usd не соответствует курсу {listing.currency}: ожидается {expected_usd}"
-                )
             inserted = await connection.execute(_INSERT_LISTING, params)
-            listing_id = inserted.scalar_one_or_none()
-            created = listing_id is not None
+            row = inserted.mappings().one_or_none()
+            created = row is not None
 
-            if not created:
+            if row is not None:
+                listing_id = row["id"]
+                if listing.price_usd != row["expected_usd"]:
+                    raise ListingPriceMismatchError(
+                        f"price_usd не соответствует курсу {listing.currency}: "
+                        f"ожидается {row['expected_usd']}"
+                    )
+            else:
                 existing = await connection.execute(
                     _FIND_EXISTING_ID,
                     {"source": listing.source, "external_id": listing.external_id},

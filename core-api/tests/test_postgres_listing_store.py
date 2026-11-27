@@ -432,3 +432,55 @@ async def test_price_survives_http_json(price_client, listing_data):
     detail = await price_client.get(f"{url}/{created.json()['id']}")
     assert detail.status_code == 200
     assert json.loads(detail.content, parse_float=Decimal)["price"] == price
+
+
+@pytest.mark.anyio
+async def test_duplicate_after_rate_change(price_client, pg_engine, listing_data):
+    url = "/api/v1/listings"
+    async with pg_engine.begin() as connection:
+        await connection.execute(
+            text("INSERT INTO core.currencies (code, rate_to_usd) VALUES ('TST', 0.25)")
+        )
+
+    payload = {**listing_data, "currency": "TST", "price": 40, "price_usd": 10}
+    created = await price_client.post(url, json=payload)
+    assert created.status_code == 201, created.text
+    listing_id = created.json()["id"]
+
+    async with pg_engine.begin() as connection:
+        await connection.execute(
+            text("UPDATE core.currencies SET rate_to_usd = 0.50 WHERE code = 'TST'")
+        )
+
+    repeat = await price_client.post(url, json=payload)
+    assert repeat.status_code == 200, repeat.text
+    assert repeat.json() == {"id": listing_id, "created": False}
+
+    detail = await price_client.get(f"{url}/{listing_id}")
+    assert detail.status_code == 200
+    assert detail.json()["price_usd"] == 10
+
+    async with pg_engine.connect() as connection:
+        event_count = await connection.scalar(
+            text("""
+                SELECT count(*) FROM core.outbox_events
+                WHERE listing_id = :id AND kind = 'listing_new'
+            """),
+            {"id": listing_id},
+        )
+    assert event_count == 1
+
+    new_listing = {**payload, "external_id": f"{payload['external_id']}-new"}
+    invalid = await price_client.post(url, json=new_listing)
+    assert invalid.status_code == 422, invalid.text
+    assert "price_usd" in invalid.json()["message"]
+
+
+@pytest.mark.anyio
+async def test_unknown_currency_returns_422(price_client, listing_data):
+    response = await price_client.post(
+        "/api/v1/listings", json={**listing_data, "currency": "ZZZ"}
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"] == "validation_error"
+    assert "валют" in response.json()["message"]
