@@ -1,5 +1,6 @@
 import hashlib
 from collections.abc import Awaitable, Callable
+from uuid import uuid4
 
 import simplejson
 from sqlalchemy import text
@@ -89,6 +90,22 @@ _NEXT_PENDING_EVENT = text("""
     SELECT id, CAST(payload AS text) AS payload_json
     FROM core.outbox_events
     WHERE kind = 'listing_new' AND published_at IS NULL
+    ORDER BY id
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED
+""")
+
+_HAS_PENDING_CACHE_INVALIDATION = text("""
+    SELECT EXISTS (
+        SELECT 1 FROM core.outbox_events
+        WHERE kind = 'cache_invalidate' AND published_at IS NULL
+    )
+""")
+
+_NEXT_CACHE_INVALIDATION = text("""
+    SELECT id
+    FROM core.outbox_events
+    WHERE kind = 'cache_invalidate' AND published_at IS NULL
     ORDER BY id
     LIMIT 1
     FOR UPDATE SKIP LOCKED
@@ -199,12 +216,22 @@ class PostgresListingStore:
                 event = build_listing_event(stored)
                 await connection.execute(
                     _INSERT_EVENT,
-                    {
-                        "event_id": event.event_id,
-                        "kind": event.kind,
-                        "listing_id": listing_id,
-                        "payload": simplejson.dumps(event.payload, use_decimal=True),
-                    },
+                    [
+                        {
+                            "event_id": event.event_id,
+                            "kind": event.kind,
+                            "listing_id": listing_id,
+                            "payload": simplejson.dumps(
+                                event.payload, use_decimal=True
+                            ),
+                        },
+                        {
+                            "event_id": uuid4(),
+                            "kind": "cache_invalidate",
+                            "listing_id": None,
+                            "payload": "{}",
+                        },
+                    ],
                 )
 
             return CreateListingResult(listing=stored, created=created)
@@ -223,6 +250,20 @@ class PostgresListingStore:
             await publish(payload)
 
             await connection.execute(_MARK_EVENT_PUBLISHED, {"event_id": row["id"]})
+            return True
+
+    async def has_pending_cache_invalidation(self) -> bool:
+        async with self._engine.connect() as connection:
+            return bool(await connection.scalar(_HAS_PENDING_CACHE_INVALIDATION))
+
+    async def invalidate_next(self, invalidate: Callable[[], Awaitable[None]]) -> bool:
+        async with self._engine.begin() as connection:
+            event_id = await connection.scalar(_NEXT_CACHE_INVALIDATION)
+            if event_id is None:
+                return False
+
+            await invalidate()
+            await connection.execute(_MARK_EVENT_PUBLISHED, {"event_id": event_id})
             return True
 
     async def search(self, filters: ListingFilters) -> ListingSearchResult:

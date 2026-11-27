@@ -39,6 +39,7 @@ class Settings(BaseSettings):
         default="redis://localhost:6379/0",
         validation_alias="REDIS_URL",
     )
+    cache_ttl_seconds: int = Field(default=600, gt=0)
 
     @model_validator(mode="after")
     def assemble_and_validate_database_url(self) -> "Settings":

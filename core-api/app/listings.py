@@ -1,10 +1,12 @@
 from decimal import Decimal
+from functools import partial
 from typing import Annotated
 
 import simplejson
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, WithJsonSchema
 
+from app.listing_cache import ListingPageCache
 from app.listing_filters import ListingFilters
 from app.listing_models import ListingCreate
 from app.listing_store import ListingStore, StoredListing, UnknownListingReferenceError
@@ -115,11 +117,7 @@ async def get_listing(
     )
 
 
-@router.get("", response_model=ListingPage)
-async def list_listings(
-    filters: Annotated[ListingFilters, Query()],
-    store: Annotated[ListingStore, Depends(get_listing_store)],
-) -> Response:
+async def _load_listing_page(store: ListingStore, filters: ListingFilters) -> str:
     result = await store.search(filters)
     data = {
         "items": [_listing_data(listing) for listing in result.items],
@@ -127,7 +125,18 @@ async def list_listings(
         "page": filters.page,
         "size": filters.size,
     }
-    return Response(
-        content=simplejson.dumps(data, use_decimal=True, ensure_ascii=False),
-        media_type="application/json",
+    return simplejson.dumps(data, use_decimal=True, ensure_ascii=False)
+
+
+@router.get("", response_model=ListingPage)
+async def list_listings(
+    request: Request,
+    filters: Annotated[ListingFilters, Query()],
+    store: Annotated[ListingStore, Depends(get_listing_store)],
+) -> Response:
+    cache: ListingPageCache | None = getattr(
+        request.app.state, "listing_page_cache", None
     )
+    load = partial(_load_listing_page, store, filters)
+    body = await load() if cache is None else await cache.get_or_load(filters, load)
+    return Response(content=body, media_type="application/json")
