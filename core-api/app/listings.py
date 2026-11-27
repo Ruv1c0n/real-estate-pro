@@ -1,15 +1,20 @@
+import json
 from decimal import Decimal
 from typing import Annotated
 
 import simplejson
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, WithJsonSchema
 
 from app.listing_filters import ListingFilters
 from app.listing_models import ListingCreate
-from app.listing_store import ListingStore, StoredListing, UnknownListingReferenceError
-
-router = APIRouter(prefix="/api/v1/listings", tags=["listings"])
+from app.listing_store import (
+    ListingPriceMismatchError,
+    ListingStore,
+    StoredListing,
+    UnknownListingReferenceError,
+)
 
 
 class ListingCreateResponse(BaseModel):
@@ -46,6 +51,52 @@ async def get_listing_store(request: Request) -> ListingStore:
     return request.app.state.listing_store
 
 
+class DecimalJSONRequest(Request):
+    async def json(self):
+        return json.loads(await self.body(), parse_float=Decimal)
+
+
+class ListingRoute(APIRoute):
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+        if self.body_field is None:
+            return handler
+
+        async def handle(request: Request) -> Response:
+            return await handler(DecimalJSONRequest(request.scope, request.receive))
+
+        return handle
+
+
+router = APIRouter(
+    prefix="/api/v1/listings", tags=["listings"], route_class=ListingRoute
+)
+
+
+@router.get(
+    "/{listing_id}",
+    response_model=ListingDetail,
+    responses={404: {"description": "Объявление не найдено"}},
+)
+async def get_listing(
+    listing_id: int,
+    store: Annotated[ListingStore, Depends(get_listing_store)],
+) -> Response:
+    listing = await store.get(listing_id)
+    if listing is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Объявление не найдено",
+        )
+
+    return Response(
+        content=simplejson.dumps(
+            _listing_data(listing), use_decimal=True, ensure_ascii=False
+        ),
+        media_type="application/json",
+    )
+
+
 @router.post(
     "",
     status_code=status.HTTP_201_CREATED,
@@ -79,7 +130,7 @@ async def create_listing(
 ) -> ListingCreateResponse:
     try:
         result = await store.create_or_get(listing)
-    except UnknownListingReferenceError as exc:
+    except (UnknownListingReferenceError, ListingPriceMismatchError) as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
@@ -89,30 +140,6 @@ async def create_listing(
         response.status_code = status.HTTP_200_OK
 
     return ListingCreateResponse(id=result.listing.id, created=result.created)
-
-
-@router.get(
-    "/{listing_id}",
-    response_model=ListingDetail,
-    responses={404: {"description": "Объявление не найдено"}},
-)
-async def get_listing(
-    listing_id: int,
-    store: Annotated[ListingStore, Depends(get_listing_store)],
-) -> Response:
-    listing = await store.get(listing_id)
-    if listing is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Объявление не найдено",
-        )
-
-    return Response(
-        content=simplejson.dumps(
-            _listing_data(listing), use_decimal=True, ensure_ascii=False
-        ),
-        media_type="application/json",
-    )
 
 
 @router.get("", response_model=ListingPage)

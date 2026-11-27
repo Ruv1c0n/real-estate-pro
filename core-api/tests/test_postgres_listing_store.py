@@ -7,11 +7,14 @@ from functools import partial
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
+import httpx2
 import pytest
+import simplejson
 from app.database import create_db_engine
 from app.listing_filters import ListingFilters
 from app.listing_models import ListingCreate
 from app.listing_store import UnknownListingReferenceError
+from app.main import app
 from app.outbox import publish_listing_event
 from app.postgres_listing_store import PostgresListingStore
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -378,3 +381,106 @@ async def test_search_applies_sql_filters(search_store, criteria, expected):
 async def test_get_out_of_range_listing_id(pg_engine, listing_id):
     store = PostgresListingStore(pg_engine)
     assert await store.get(listing_id) is None
+
+
+@pytest.fixture
+async def price_client(pg_engine, monkeypatch):
+    monkeypatch.setattr(
+        app.state, "listing_store", PostgresListingStore(pg_engine), raising=False
+    )
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        yield client
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("currency", "price", "expected_usd"),
+    [("USD", 10.49, 10), ("USD", 10.50, 11), ("PLN", 42, 11)],
+)
+async def test_price_usd_validation(
+    price_client, listing_data, currency, price, expected_usd
+):
+    url = "/api/v1/listings"
+    payload = {**listing_data, "currency": currency, "price": price}
+
+    invalid = await price_client.post(
+        url, json={**payload, "price_usd": expected_usd - 1}
+    )
+    assert invalid.status_code == 422, invalid.text
+    assert invalid.json()["error"] == "validation_error"
+    assert "price_usd" in invalid.json()["message"]
+
+    valid = await price_client.post(url, json={**payload, "price_usd": expected_usd})
+    assert valid.status_code == 201, valid.text
+
+
+@pytest.mark.anyio
+async def test_price_survives_http_json(price_client, listing_data):
+    url = "/api/v1/listings"
+    price = Decimal("9007199254740992.25")
+    data = {**listing_data, "price": price, "price_usd": 9007199254740992}
+
+    created = await price_client.post(
+        url,
+        content=simplejson.dumps(data, use_decimal=True),
+        headers={"Content-Type": "application/json"},
+    )
+    assert created.status_code == 201, created.text
+
+    detail = await price_client.get(f"{url}/{created.json()['id']}")
+    assert detail.status_code == 200
+    assert json.loads(detail.content, parse_float=Decimal)["price"] == price
+
+
+@pytest.mark.anyio
+async def test_duplicate_after_rate_change(price_client, pg_engine, listing_data):
+    url = "/api/v1/listings"
+    async with pg_engine.begin() as connection:
+        await connection.execute(
+            text("INSERT INTO core.currencies (code, rate_to_usd) VALUES ('TST', 0.25)")
+        )
+
+    payload = {**listing_data, "currency": "TST", "price": 40, "price_usd": 10}
+    created = await price_client.post(url, json=payload)
+    assert created.status_code == 201, created.text
+    listing_id = created.json()["id"]
+
+    async with pg_engine.begin() as connection:
+        await connection.execute(
+            text("UPDATE core.currencies SET rate_to_usd = 0.50 WHERE code = 'TST'")
+        )
+
+    repeat = await price_client.post(url, json=payload)
+    assert repeat.status_code == 200, repeat.text
+    assert repeat.json() == {"id": listing_id, "created": False}
+
+    detail = await price_client.get(f"{url}/{listing_id}")
+    assert detail.status_code == 200
+    assert detail.json()["price_usd"] == 10
+
+    async with pg_engine.connect() as connection:
+        event_count = await connection.scalar(
+            text("""
+                SELECT count(*) FROM core.outbox_events
+                WHERE listing_id = :id AND kind = 'listing_new'
+            """),
+            {"id": listing_id},
+        )
+    assert event_count == 1
+
+    new_listing = {**payload, "external_id": f"{payload['external_id']}-new"}
+    invalid = await price_client.post(url, json=new_listing)
+    assert invalid.status_code == 422, invalid.text
+    assert "price_usd" in invalid.json()["message"]
+
+
+@pytest.mark.anyio
+async def test_unknown_currency_returns_422(price_client, listing_data):
+    response = await price_client.post(
+        "/api/v1/listings", json={**listing_data, "currency": "ZZZ"}
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"] == "validation_error"
+    assert "валют" in response.json()["message"]
